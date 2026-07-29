@@ -32,6 +32,7 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
 3. **Supervise.** Start the watcher as a background process (Bash tool, `run_in_background: true`):
    `pwsh -NoProfile -File bin/dep-watch.ps1 -Wait`
    Then end your turn or continue conversing. When the watcher exits you are notified with the wake events. If tasks are still active after handling a wake, start the watcher again.
+   Exception: if you are running non-interactively (print mode, one-shot invocation), there is no later turn to notify - run the watcher in the foreground instead and complete the full delivery loop before finishing your reply.
 4. **Handle wakes.**
    - `completed` (ship, no-mistakes delivery): run `dep-validate.ps1 <id>`. On pass, run `dep-publish.ps1 <id>`, then verify with `dep-pr.ps1 checks <id>` and skim `dep-pr.ps1 diff <id>`; present the PR to the Sheriff. On fail, read the recorded `validationError`, respawn the task with the failure output included in an amended briefing (return the old worktree first). After two failed respawns, escalate to the Sheriff with your diagnosis instead of trying again.
    - `completed` (ship, direct-pr delivery): verify the PR is real - `dep-pr.ps1 view <id>` and `dep-pr.ps1 checks <id>`. Skim `dep-pr.ps1 diff <id>` for obvious problems. Present the PR to the Sheriff.
