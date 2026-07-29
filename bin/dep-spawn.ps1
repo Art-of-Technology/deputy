@@ -59,8 +59,29 @@ $slug = ($Task.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
 if ($slug.Length -gt 40) { $slug = $slug.Substring(0, 40).Trim('-') }
 $branch = '{0}{1}' -f $config.branchPrefix, $slug
 
+$projProfile = Get-ProjectProfile $repoPath
+$delivery = if ($Kind -eq 'ship') { $projProfile.delivery } else { $null }
+
 # Briefing prompt, delivered via stdin to avoid argument quoting issues
-if ($Kind -eq 'ship') {
+if ($Kind -eq 'ship' -and $delivery -eq 'no-mistakes') {
+    $briefing = @"
+You are a posse member reporting to the Deputy. Assignment kind: ship (deliver working code).
+
+Task:
+$Task
+
+Ground rules:
+- You are in a leased git worktree at $($lease.path), on a detached HEAD of the default branch. Work only inside this worktree.
+- First create and switch to a branch named: $branch
+- Implement the task with quality. Run the repo's relevant tests and lint before finishing, and fix failures you cause.
+- Commit all your work with clear messages. Never add co-author lines.
+- Do NOT push and do NOT open a pull request. This repo uses the Deputy's no-mistakes gate: after you finish, the Deputy validates your branch and publishes it. Leave the worktree checked out on your branch with a clean status.
+- If you are blocked or the task turns out to be wrong or impossible, stop and say so clearly instead of guessing.
+
+Your final message is your report to the Deputy. Keep it short: what you changed and your test results (or the blocker).
+"@
+}
+elseif ($Kind -eq 'ship') {
     $briefing = @"
 You are a posse member reporting to the Deputy. Assignment kind: ship (deliver working code).
 
@@ -140,6 +161,8 @@ $state = [pscustomobject]@{
     worktree       = $lease.path
     leaseId        = $lease.lease_id
     branch         = if ($Kind -eq 'ship') { $branch } else { $null }
+    delivery       = $delivery
+    validation     = $null
     pid            = $proc.Id
     model          = $Model
     permissionMode = $PermissionMode
@@ -157,7 +180,7 @@ $state = [pscustomobject]@{
 }
 Write-TaskState $state
 
-Write-Output "spawned $id ($Kind) pid=$($proc.Id)"
+Write-Output ("spawned $id ($Kind{0}) pid=$($proc.Id)" -f ($delivery ? ", $delivery" : ''))
 Write-Output "  repo:     $repoPath"
 Write-Output "  worktree: $($lease.path)"
 if ($Kind -eq 'ship') { Write-Output "  branch:   $branch" }

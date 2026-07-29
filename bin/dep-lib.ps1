@@ -43,6 +43,34 @@ function Get-DeputyConfig {
     [pscustomobject]$defaults
 }
 
+function Get-ProjectProfile([string]$RepoPath) {
+    # Delivery profile for a repo, from config\projects.json. Deputy-side by
+    # design: validation commands must never come from the repo being validated.
+    $file = Join-Path (Get-DeputyPaths).Root 'config' 'projects.json'
+    $default = [pscustomobject]@{ delivery = 'direct-pr'; validate = @() }
+    if (-not (Test-Path $file)) { return $default }
+    $cfg = Get-Content $file -Raw | ConvertFrom-Json
+    if ($cfg.PSObject.Properties['default'] -and $cfg.default) { $default = $cfg.default }
+    $leaf = Split-Path -Leaf $RepoPath
+    foreach ($proj in ($cfg.projects ?? @())) {
+        $isPath = $proj.match -match '[\\/]'
+        if (($isPath -and ($proj.match -ieq $RepoPath)) -or (-not $isPath -and ($proj.match -ieq $leaf))) {
+            return $proj
+        }
+    }
+    $default
+}
+
+function Get-DefaultBranch([string]$RepoPath) {
+    $ref = git -C $RepoPath symbolic-ref --short refs/remotes/origin/HEAD 2>$null
+    if ($LASTEXITCODE -eq 0 -and $ref) { return ($ref -replace '^origin/', '') }
+    foreach ($b in 'main', 'master') {
+        git -C $RepoPath show-ref --verify --quiet "refs/remotes/origin/$b" 2>$null
+        if ($LASTEXITCODE -eq 0) { return $b }
+    }
+    (git -C $RepoPath rev-parse --abbrev-ref HEAD).Trim()
+}
+
 function New-TaskId {
     $suffix = -join ((97..122) | Get-Random -Count 3 | ForEach-Object { [char]$_ })
     'posse-{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $suffix

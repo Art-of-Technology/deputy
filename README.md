@@ -23,7 +23,7 @@ dep-watch.ps1 .. polls stream-json logs + process liveness; wakes the
                  Deputy only on: completed / failed / died / stalled
 ```
 
-- **Ship tasks** implement, test, commit, push, and open a PR with `gh`.
+- **Ship tasks** implement, test, and commit; how the PR happens depends on the repo's delivery mode (below).
 - **Scout tasks** investigate and write a markdown report; they change nothing.
 - **Isolation** comes from treehouse's worktree pool: leases are durable (survive crashes and reboots), guarded against races (`--if-lease-id`), and worktrees are recycled between tasks.
 
@@ -66,6 +66,30 @@ pwsh -NoProfile -File bin\dep-pr.ps1 merge posse-20260729-104800-abc
 pwsh -NoProfile -File bin\dep-return.ps1 posse-20260729-104800-abc
 ```
 
+## Delivery modes (no-mistakes gate)
+
+Per-repo delivery is configured in `config\projects.json`:
+
+```json
+{
+  "default": { "delivery": "direct-pr", "validate": [] },
+  "projects": [
+    {
+      "match": "myapp",
+      "delivery": "no-mistakes",
+      "validate": ["npm test", "npm run lint"]
+    }
+  ]
+}
+```
+
+`match` is a repo folder name, or a full path if it contains a slash. Unmatched repos use `default`.
+
+- **direct-pr**: the posse member pushes and opens the PR itself (needs `gh` access).
+- **no-mistakes**: the member's job ends at "implement, test, commit locally". On completion the Deputy runs `dep-validate.ps1` in the worktree - a deterministic gate whose commands come from Deputy's own config, never from the repo being validated. On green, the evidence is committed to the branch (PR-viewable at `.deputy/evidence/<taskId>.md`) and `dep-publish.ps1` pushes and opens the PR. On red, the failure is recorded in task state and the Deputy respawns the member with the failure output in its briefing.
+
+The security property of no-mistakes: the agent that wrote the code never holds the pen on validation or publishing. Members need no `gh` or push access at all (`-AllowedTools "Bash(git *),Bash(npm *)"` suffices), and a branch cannot rubber-stamp its own gate.
+
 ## Configuration
 
 `config\deputy.json`:
@@ -83,8 +107,8 @@ Security note: `bypassPermissions` means posse members run shell commands unatte
 ## Layout
 
 ```
-bin\        toolbelt (dep-spawn, dep-watch, dep-posse, dep-pr, dep-return, dep-lib)
-config\     deputy.json
+bin\        toolbelt (dep-spawn, dep-watch, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-lib)
+config\     deputy.json, projects.json
 state\      one json per task, wake-queue.jsonl, scout reports, archive\   (runtime)
 logs\       <taskId>.jsonl stream logs + stderr                            (runtime)
 CLAUDE.md   the Deputy's operating contract
