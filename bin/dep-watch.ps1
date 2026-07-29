@@ -11,10 +11,13 @@ Designed to run as a background process so the Deputy is woken only when a
 decision is needed.
 #>
 [CmdletBinding()]
+[Diagnostics.CodeAnalysis.SuppressMessage('PSReviewUnusedParameter', 'DeadSeconds',
+    Justification = 'Used inside the nested Invoke-Scan function; the analyzer cannot see through the closure')]
 param(
     [switch]$Wait,
     [int]$IntervalSeconds = 0,   # 0 = use config
     [int]$StallMinutes = 0,      # 0 = use config
+    [int]$DeadSeconds = 90,      # log-silence grace before a dead process counts as died
     [int]$TimeoutMinutes = 0     # with -Wait: 0 = wait forever
 )
 
@@ -35,11 +38,11 @@ function Get-ResultEvent([string]$LogPath) {
     $null
 }
 
-function New-Wake($Task, [string]$Event, [string]$Summary) {
+function New-Wake($Task, [string]$EventName, [string]$Summary) {
     [pscustomobject]@{
         at      = (Get-Date -Format o)
         taskId  = $Task.id
-        event   = $Event
+        event   = $EventName
         kind    = $Task.kind
         repo    = $Task.repo
         prUrl   = $Task.prUrl
@@ -75,7 +78,13 @@ function Invoke-Scan {
             }
             $events += New-Wake $task $task.status (Limit-Text $text 500)
         }
-        elseif (-not $alive) {
+        elseif (-not $alive -and ((Get-Date) - [datetime]$task.lastActivityAt).TotalSeconds -ge $DeadSeconds) {
+            # No process (by pid or worktree occupancy) AND the log has been
+            # silent past the grace period. The grace matters: the recorded pid
+            # can be a short-lived launcher, and treehouse only sees processes
+            # while a tool command runs in the worktree - a healthy member's
+            # log keeps growing (tool_progress events), so silence + no
+            # process is the real death signal.
             Set-TaskField $task 'status' 'died'
             Set-TaskField $task 'endedAt' (Get-Date -Format o)
             $errTail = if (Test-Path $task.stderrLog) {

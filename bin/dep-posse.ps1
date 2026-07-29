@@ -153,13 +153,18 @@ switch ($Action) {
     'kill' {
         if (-not $Id) { throw 'Usage: dep-posse.ps1 kill <taskId>' }
         $task = Read-TaskState $Id
-        if (Test-TaskProcessAlive $task) {
+        $killed = $false
+        if ($task.pid -and (Get-Process -Id $task.pid -ErrorAction SilentlyContinue)) {
             Stop-TaskProcessTree $task.pid
-            Write-Output "killed process tree for $Id (pid $($task.pid))"
+            $killed = $true
         }
-        else {
-            Write-Output "$Id has no live process"
+        # The recorded pid may be a dead launcher; kill by worktree occupancy too
+        foreach ($wtPid in @(Get-WorktreeProcessIds $task.repo $task.worktree)) {
+            Stop-TaskProcessTree $wtPid
+            $killed = $true
         }
+        if ($killed) { Write-Output "killed process tree(s) for $Id" }
+        else { Write-Output "$Id has no live process" }
         Set-TaskField $task 'status' 'killed'
         Set-TaskField $task 'endedAt' (Get-Date -Format o)
         Write-TaskState $task

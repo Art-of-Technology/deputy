@@ -160,14 +160,35 @@ function Get-AllTasks {
         Sort-Object spawnedAt
 }
 
-function Add-WakeEvent($Event) {
+function Add-WakeEvent($WakeEvent) {
     $p = Get-DeputyPaths
-    ($Event | ConvertTo-Json -Compress -Depth 8) | Add-Content -Path $p.WakeQueue -Encoding utf8
+    ($WakeEvent | ConvertTo-Json -Compress -Depth 8) | Add-Content -Path $p.WakeQueue -Encoding utf8
+}
+
+function Get-WorktreeProcessIds([string]$RepoPath, [string]$WorktreePath) {
+    # Processes treehouse sees running inside a worktree (matched by CWD).
+    Push-Location $RepoPath
+    try { $raw = treehouse status --json 2>$null }
+    finally { Pop-Location }
+    if ($LASTEXITCODE -ne 0 -or -not $raw) { return @() }
+    $pool = try { ($raw -join "`n") | ConvertFrom-Json } catch { return @() }
+    $entry = $pool | Where-Object { $_.path -ieq $WorktreePath } | Select-Object -First 1
+    if (-not $entry -or -not $entry.processes) { return @() }
+    @($entry.processes | ForEach-Object {
+        if ($_ -is [string]) { if ($_ -match '\((\d+)\)') { [int]$Matches[1] } }
+        elseif ($_.PSObject.Properties['pid']) { [int]$_.pid }
+        elseif ($_.PSObject.Properties['id']) { [int]$_.id }
+    } | Where-Object { $_ })
 }
 
 function Test-TaskProcessAlive($State) {
-    if (-not $State.pid) { return $false }
-    $null -ne (Get-Process -Id $State.pid -ErrorAction SilentlyContinue)
+    # The recorded pid can be a short-lived launcher (claude shims re-spawn
+    # themselves), so fall back to treehouse's CWD-based process tracking.
+    if ($State.pid -and (Get-Process -Id $State.pid -ErrorAction SilentlyContinue)) { return $true }
+    if ($State.worktree -and (Test-Path $State.worktree) -and (Test-Path $State.repo)) {
+        return @(Get-WorktreeProcessIds $State.repo $State.worktree).Count -gt 0
+    }
+    $false
 }
 
 function Stop-TaskProcessTree([int]$ProcessId) {

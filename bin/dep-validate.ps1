@@ -43,7 +43,7 @@ if ($commands.Count -eq 0) {
 }
 Write-Output "gate ($gateSource): $($commands -join '; ')"
 
-function Fail-Validation([string]$Reason) {
+function Deny-Validation([string]$Reason) {
     Set-TaskField $task 'validation' 'failed'
     Set-TaskField $task 'validationError' $Reason
     Write-TaskState $task
@@ -54,16 +54,16 @@ function Fail-Validation([string]$Reason) {
 # Preconditions: the member must have left a clean, committed branch
 $currentBranch = (git -C $wt rev-parse --abbrev-ref HEAD).Trim()
 if ($currentBranch -ne $task.branch) {
-    Fail-Validation "worktree is on '$currentBranch', expected branch '$($task.branch)'"
+    Deny-Validation "worktree is on '$currentBranch', expected branch '$($task.branch)'"
 }
 $dirty = git -C $wt status --porcelain
 if ($dirty) {
-    Fail-Validation ("working tree is dirty (uncommitted changes): " + (Limit-Text ($dirty -join '; ') 200))
+    Deny-Validation ("working tree is dirty (uncommitted changes): " + (Limit-Text ($dirty -join '; ') 200))
 }
 $defaultBranch = Get-DefaultBranch $wt
 $commits = git -C $wt log "origin/$defaultBranch..HEAD" --oneline 2>$null
 if (-not $commits) {
-    Fail-Validation "no commits on '$($task.branch)' ahead of origin/$defaultBranch"
+    Deny-Validation "no commits on '$($task.branch)' ahead of origin/$defaultBranch"
 }
 
 # Environmental setup: JS gates need node_modules in the (possibly recycled)
@@ -91,7 +91,7 @@ if ($needsNode -and (Test-Path (Join-Path $wt 'package.json')) -and -not (Test-P
         finally { Pop-Location }
         $setupResults += [pscustomobject]@{ command = "(setup) $install"; exit = $setupExit; passed = ($setupExit -eq 0); output = $setupOut.Trim() }
         if ($setupExit -ne 0) {
-            Fail-Validation ("environment setup failed (not a code problem): '$install' exit ${setupExit}: " + (Limit-Text $setupOut 300))
+            Deny-Validation ("environment setup failed (not a code problem): '$install' exit ${setupExit}: " + (Limit-Text $setupOut 300))
         }
     }
 }
@@ -144,7 +144,7 @@ if ($allPassed) {
     Set-Content -Path $evidenceFile -Value $evidence -Encoding utf8
     git -C $wt add '.deputy/evidence' 2>&1 | Out-Null
     git -C $wt commit -m "deputy: validation evidence for $Id" 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail-Validation 'failed to commit validation evidence' }
+    if ($LASTEXITCODE -ne 0) { Deny-Validation 'failed to commit validation evidence' }
 
     Set-TaskField $task 'validation' 'passed'
     Set-TaskField $task 'validationEvidence' ".deputy/evidence/$Id.md"
@@ -158,5 +158,5 @@ else {
     # Keep failure evidence out of the branch; record it deputy-side instead
     $stateEvidence = Join-Path (Get-DeputyPaths).State "$Id-validation.md"
     Set-Content -Path $stateEvidence -Value $evidence -Encoding utf8
-    Fail-Validation $summary
+    Deny-Validation $summary
 }
