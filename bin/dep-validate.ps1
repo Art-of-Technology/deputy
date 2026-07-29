@@ -66,6 +66,36 @@ if (-not $commits) {
     Fail-Validation "no commits on '$($task.branch)' ahead of origin/$defaultBranch"
 }
 
+# Environmental setup: JS gates need node_modules in the (possibly recycled)
+# worktree. Only install when the manifest actually declares dependencies,
+# so bare-bones repos do not grow an unexpected package-lock.json.
+$setupResults = @()
+$needsNode = @($commands | Where-Object { $_ -match '^(npm|pnpm|yarn)\b' }).Count -gt 0
+if ($needsNode -and (Test-Path (Join-Path $wt 'package.json')) -and -not (Test-Path (Join-Path $wt 'node_modules'))) {
+    $pkg = try { Get-Content (Join-Path $wt 'package.json') -Raw | ConvertFrom-Json } catch { $null }
+    $hasDeps = $pkg -and (
+        ($pkg.PSObject.Properties['dependencies'] -and @($pkg.dependencies.PSObject.Properties).Count -gt 0) -or
+        ($pkg.PSObject.Properties['devDependencies'] -and @($pkg.devDependencies.PSObject.Properties).Count -gt 0)
+    )
+    if ($hasDeps) {
+        $install = if (Test-Path (Join-Path $wt 'pnpm-lock.yaml')) { 'pnpm install --frozen-lockfile' }
+                   elseif (Test-Path (Join-Path $wt 'yarn.lock')) { 'yarn install --frozen-lockfile' }
+                   elseif (Test-Path (Join-Path $wt 'package-lock.json')) { 'npm ci' }
+                   else { 'npm install' }
+        Write-Output "setup: $install"
+        Push-Location $wt
+        try {
+            $setupOut = pwsh -NoProfile -Command $install 2>&1 | Out-String
+            $setupExit = $LASTEXITCODE
+        }
+        finally { Pop-Location }
+        $setupResults += [pscustomobject]@{ command = "(setup) $install"; exit = $setupExit; passed = ($setupExit -eq 0); output = $setupOut.Trim() }
+        if ($setupExit -ne 0) {
+            Fail-Validation ("environment setup failed (not a code problem): '$install' exit ${setupExit}: " + (Limit-Text $setupOut 300))
+        }
+    }
+}
+
 # Run the gate
 $results = @()
 $allPassed = $true
@@ -98,10 +128,10 @@ $lines = @(
     '| command | exit | result |'
     '| --- | --- | --- |'
 )
-foreach ($r in $results) {
+foreach ($r in @($setupResults + $results)) {
     $lines += "| ``$($r.command)`` | $($r.exit) | $($r.passed ? 'PASS' : 'FAIL') |"
 }
-foreach ($r in $results) {
+foreach ($r in @($setupResults + $results)) {
     $lines += @('', "## Output: ``$($r.command)``", '', '```', (Limit-Text $r.output 2000), '```')
 }
 $evidence = $lines -join "`n"
