@@ -45,7 +45,7 @@ dep-return.ps1 .... worktree back to the pool, task state archived
 
 ```powershell
 cd C:\apps\deputy
-claude   # this directory's CLAUDE.md makes the session your Deputy
+claude   # AGENTS.md (loaded via CLAUDE.md) makes the session your Deputy
 ```
 
 Then just talk: "Fix the flaky auth test in C:\src\myapp and add dark mode to the settings page." The Deputy spawns two posse members, watches them, and returns with two PRs.
@@ -83,9 +83,9 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | Command | What it does |
 | --- | --- |
 | `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>]` | Lease a worktree, launch a headless posse member, register task state |
-| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-TimeoutMinutes n]` | Scan tasks for wake events; `-Wait` blocks until one fires (exit 0) or timeout (exit 2) |
-| `dep-posse.ps1 status` | Fleet table: status, liveness, age, PR |
-| `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw]` | Human-readable log tail (or raw stream-json) |
+| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n]` | Scan tasks for wake events; `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90) |
+| `dep-posse.ps1 status [-Watch]` | Fleet table: status, liveness, age, PR; `-Watch` auto-refreshes with recent wakes |
+| `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw] [-Follow]` | Human-readable log tail (or raw stream-json); `-Follow` live-tails |
 | `dep-posse.ps1 result <taskId>` | Final report text, scout report path, PR URL |
 | `dep-posse.ps1 kill <taskId>` | Stop a runaway member's process tree (lease kept for inspection) |
 | `dep-validate.ps1 <taskId>` | Run the no-mistakes gate in the task's worktree; commits evidence on pass |
@@ -168,8 +168,13 @@ bin\        toolbelt (dep-spawn, dep-watch, dep-posse, dep-validate, dep-publish
 config\     deputy.json, projects.json
 state\      one json per task, wake-queue.jsonl, scout reports, validation records, archive\   (runtime)
 logs\       <taskId>.jsonl stream logs + stderr                                                (runtime)
-CLAUDE.md   the Deputy's operating contract
+AGENTS.md   the Deputy's operating contract (harness-neutral)
+CLAUDE.md   loads AGENTS.md into Claude Code sessions
+ONBOARDING.md   first 10 minutes for new users
+PSScriptAnalyzerSettings.psd1   lint gate for bin\
 ```
+
+Lint gate: `Invoke-ScriptAnalyzer -Path bin\*.ps1 -Settings PSScriptAnalyzerSettings.psd1` (bin\ is kept clean).
 
 ## Credits
 

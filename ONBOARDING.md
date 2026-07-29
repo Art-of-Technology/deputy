@@ -28,7 +28,7 @@ cd C:\apps\deputy
 claude
 ```
 
-That's it. The `CLAUDE.md` in this directory turns the session into your Deputy. You are the Sheriff.
+That's it. The operating contract in this directory (`AGENTS.md`, loaded via `CLAUDE.md`) turns the session into your Deputy. You are the Sheriff.
 
 ## 4. Give it work
 
