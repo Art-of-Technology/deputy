@@ -130,6 +130,18 @@ function Read-TaskState([string]$Id) {
     Get-Content $path -Raw | ConvertFrom-Json
 }
 
+function Read-TaskStateAny([string]$Id) {
+    # Like Read-TaskState but also finds archived (returned) tasks
+    $path = Get-TaskStatePath $Id
+    if (-not (Test-Path $path)) {
+        $path = Join-Path (Get-DeputyPaths).Archive "$Id.json"
+    }
+    if (-not (Test-Path $path)) {
+        throw "No task state (active or archived) for '$Id'."
+    }
+    Get-Content $path -Raw | ConvertFrom-Json
+}
+
 function Write-TaskState($State) {
     $path = Get-TaskStatePath $State.id
     $tmp = "$path.tmp"

@@ -5,7 +5,9 @@ Fleet operations over posse tasks.
 
 .EXAMPLE
 .\dep-posse.ps1                       # status table
+.\dep-posse.ps1 status -Watch         # live-refreshing status (dashboard pane)
 .\dep-posse.ps1 logs posse-...        # readable log tail (-Raw for raw jsonl)
+.\dep-posse.ps1 logs posse-... -Follow # live-tail a member's log (dashboard pane)
 .\dep-posse.ps1 result posse-...      # full final report of a finished task
 .\dep-posse.ps1 kill posse-...        # stop a runaway task (lease kept; use dep-return to release)
 #>
@@ -19,7 +21,9 @@ param(
     [string]$Id,
 
     [int]$Tail = 40,
-    [switch]$Raw
+    [switch]$Raw,
+    [switch]$Follow,
+    [switch]$Watch
 )
 
 . "$PSScriptRoot\dep-lib.ps1"
@@ -58,30 +62,65 @@ function Format-StreamLine($obj) {
     }
 }
 
+function Show-Status {
+    $tasks = @(Get-AllTasks)
+    if ($tasks.Count -eq 0) {
+        Write-Output 'No active posse tasks. (Archived tasks live in state\archive.)'
+        return
+    }
+    $tasks | ForEach-Object {
+        [pscustomobject]@{
+            Id     = $_.id
+            Kind   = $_.kind
+            Status = $_.status
+            Alive  = Test-TaskProcessAlive $_
+            Age    = Format-Age $_.spawnedAt $_.endedAt
+            Repo   = Split-Path -Leaf $_.repo
+            Pr     = $_.prUrl
+            Task   = Limit-Text $_.task 60
+        }
+    } | Format-Table -AutoSize
+}
+
 switch ($Action) {
     'status' {
-        $tasks = @(Get-AllTasks)
-        if ($tasks.Count -eq 0) {
-            Write-Output 'No active posse tasks. (Archived tasks live in state\archive.)'
-            break
-        }
-        $tasks | ForEach-Object {
-            [pscustomobject]@{
-                Id     = $_.id
-                Kind   = $_.kind
-                Status = $_.status
-                Alive  = Test-TaskProcessAlive $_
-                Age    = Format-Age $_.spawnedAt $_.endedAt
-                Repo   = Split-Path -Leaf $_.repo
-                Pr     = $_.prUrl
-                Task   = Limit-Text $_.task 60
+        if ($Watch) {
+            while ($true) {
+                Clear-Host
+                Write-Output ("DEPUTY FLEET  {0}  (refreshes every 5s, Ctrl+C to exit)" -f (Get-Date -Format 'HH:mm:ss'))
+                Show-Status
+                $queue = (Get-DeputyPaths).WakeQueue
+                if (Test-Path $queue) {
+                    Write-Output '--- recent wakes ---'
+                    Get-Content $queue -Tail 5 | ForEach-Object {
+                        $w = try { $_ | ConvertFrom-Json } catch { $null }
+                        if ($w) { '{0}  {1}: {2}' -f ([datetime]$w.at).ToString('HH:mm:ss'), $w.taskId, $w.event }
+                    }
+                }
+                Start-Sleep -Seconds 5
             }
-        } | Format-Table -AutoSize
+        }
+        Show-Status
     }
     'logs' {
         if (-not $Id) { throw 'Usage: dep-posse.ps1 logs <taskId>' }
-        $task = Read-TaskState $Id
+        $task = Read-TaskStateAny $Id
         if (-not (Test-Path $task.stdoutLog)) { throw "No log yet at $($task.stdoutLog)" }
+        if ($Follow) {
+            Write-Output "following $Id ($(Limit-Text $task.task 80))  Ctrl+C to exit"
+            if ($Raw) {
+                Get-Content $task.stdoutLog -Wait -Tail $Tail
+            }
+            else {
+                Get-Content $task.stdoutLog -Wait -Tail $Tail | ForEach-Object {
+                    if ($_) {
+                        $obj = try { $_ | ConvertFrom-Json } catch { $null }
+                        if ($obj) { Format-StreamLine $obj }
+                    }
+                }
+            }
+            break
+        }
         $lines = Get-Content $task.stdoutLog -Tail $Tail
         if ($Raw) {
             $lines
@@ -100,7 +139,7 @@ switch ($Action) {
     }
     'result' {
         if (-not $Id) { throw 'Usage: dep-posse.ps1 result <taskId>' }
-        $task = Read-TaskState $Id
+        $task = Read-TaskStateAny $Id
         if ($task.result) {
             Write-Output $task.result
         }

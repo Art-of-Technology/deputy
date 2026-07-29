@@ -92,6 +92,7 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | `dep-publish.ps1 <taskId>` | Push the branch and open the PR; refuses unless validation passed |
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <taskId> [-Method squash\|merge\|rebase]` | PR operations via gh (merge defaults to squash + delete branch) |
 | `dep-return.ps1 <taskId>` | Kill stragglers, return the lease (guarded by `--if-lease-id`), archive state |
+| `dep-dashboard.ps1 [-Id <taskId>] [-Tail n]` | Live fleet view in Windows Terminal: auto-refreshing status tab + a live-tail tab per active member. Re-running adds new members' tabs to the same window; `-Id` opens one task (active or archived) |
 
 ## Delivery modes (no-mistakes gate)
 
@@ -163,7 +164,7 @@ Two traps worth knowing:
 ## Layout
 
 ```
-bin\        toolbelt (dep-spawn, dep-watch, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-lib)
+bin\        toolbelt (dep-spawn, dep-watch, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-dashboard, dep-lib)
 config\     deputy.json, projects.json
 state\      one json per task, wake-queue.jsonl, scout reports, validation records, archive\   (runtime)
 logs\       <taskId>.jsonl stream logs + stderr                                                (runtime)

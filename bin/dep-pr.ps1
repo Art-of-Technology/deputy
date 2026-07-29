@@ -23,11 +23,7 @@ param(
 
 . "$PSScriptRoot\dep-lib.ps1"
 
-$task = try { Read-TaskState $Id } catch {
-    # allow operating on archived tasks too
-    $archived = Join-Path (Get-DeputyPaths).Archive "$Id.json"
-    if (Test-Path $archived) { Get-Content $archived -Raw | ConvertFrom-Json } else { throw }
-}
+$task = Read-TaskStateAny $Id
 
 if (-not $task.prUrl) {
     throw "Task $Id has no recorded PR URL. Check its result with: dep-posse.ps1 result $Id"
