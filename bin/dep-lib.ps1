@@ -44,10 +44,11 @@ function Get-DeputyConfig {
 }
 
 function Get-ProjectProfile([string]$RepoPath) {
-    # Delivery profile for a repo, from config\projects.json. Deputy-side by
-    # design: validation commands must never come from the repo being validated.
+    # Delivery profile for a repo, from config\projects.json. An empty
+    # validate list means auto-detect at validation time (see
+    # Get-AutoValidateCommands). Explicit entries override detection.
     $file = Join-Path (Get-DeputyPaths).Root 'config' 'projects.json'
-    $default = [pscustomobject]@{ delivery = 'direct-pr'; validate = @() }
+    $default = [pscustomobject]@{ delivery = 'no-mistakes'; validate = @() }
     if (-not (Test-Path $file)) { return $default }
     $cfg = Get-Content $file -Raw | ConvertFrom-Json
     if ($cfg.PSObject.Properties['default'] -and $cfg.default) { $default = $cfg.default }
@@ -59,6 +60,47 @@ function Get-ProjectProfile([string]$RepoPath) {
         }
     }
     $default
+}
+
+function Get-AutoValidateCommands([string]$Worktree) {
+    # Detect validation commands for the repo. Manifests are read from
+    # origin/<default> via git show, never from the task branch, so a posse
+    # member's branch cannot reconfigure its own gate.
+    $branch = Get-DefaultBranch $Worktree
+    function Show-DefaultFile([string]$Path) {
+        $content = git -C $Worktree show "origin/${branch}:$Path" 2>$null
+        if ($LASTEXITCODE -eq 0) { $content -join "`n" } else { $null }
+    }
+
+    $commands = @()
+
+    $pkgRaw = Show-DefaultFile 'package.json'
+    if ($pkgRaw) {
+        $pkg = try { $pkgRaw | ConvertFrom-Json } catch { $null }
+        $scripts = if ($pkg -and $pkg.PSObject.Properties['scripts']) { $pkg.scripts } else { $null }
+        $runner = 'npm'
+        if (Show-DefaultFile 'pnpm-lock.yaml') { $runner = 'pnpm' }
+        elseif (Show-DefaultFile 'yarn.lock') { $runner = 'yarn' }
+        if ($scripts -and $scripts.PSObject.Properties['test']) { $commands += "$runner test" }
+        if ($scripts -and $scripts.PSObject.Properties['lint']) { $commands += "$runner run lint" }
+    }
+
+    if (Show-DefaultFile 'Cargo.toml') { $commands += 'cargo test' }
+    if (Show-DefaultFile 'go.mod') { $commands += 'go test ./...' }
+
+    $tree = git -C $Worktree ls-tree -r --name-only "origin/$branch" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $tree) {
+        if ($tree | Where-Object { $_ -match '\.(sln|csproj)$' } | Select-Object -First 1) {
+            $commands += 'dotnet test'
+        }
+        if (($tree -contains 'pytest.ini') -or
+            (($pyproject = Show-DefaultFile 'pyproject.toml') -and $pyproject -match '\[tool\.pytest')) {
+            $commands += 'pytest'
+        }
+    }
+
+    # No comma-wrap: callers re-wrap with @(), which would nest a wrapped array
+    @($commands | Select-Object -Unique)
 }
 
 function Get-DefaultBranch([string]$RepoPath) {

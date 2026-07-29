@@ -1,15 +1,7 @@
 {
   "default": {
-    "delivery": "direct-pr",
+    "delivery": "no-mistakes",
     "validate": []
   },
-  "projects": [
-    {
-      "match": "deputy-ship-test-2",
-      "delivery": "no-mistakes",
-      "validate": [
-        "node test.js"
-      ]
-    }
-  ]
+  "projects": []
 }

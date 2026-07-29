@@ -25,16 +25,23 @@ $task = Read-TaskState $Id
 if ($task.kind -ne 'ship') { throw "dep-validate only applies to ship tasks; $Id is '$($task.kind)'." }
 if (-not (Test-Path $task.worktree)) { throw "Worktree gone: $($task.worktree). Was the task already returned?" }
 
+$wt = $task.worktree
 $projProfile = Get-ProjectProfile $task.repo
 $commands = @($projProfile.validate)
+$gateSource = 'configured in deputy config\projects.json'
 if ($commands.Count -eq 0) {
-    Write-Output "no validation commands configured for this repo; nothing to gate"
+    $defaultBranchName = Get-DefaultBranch $wt
+    $commands = @(Get-AutoValidateCommands $wt)
+    $gateSource = "auto-detected from origin/$defaultBranchName manifests"
+}
+if ($commands.Count -eq 0) {
+    Write-Output 'no validation commands configured or detectable for this repo; nothing to gate'
     Set-TaskField $task 'validation' 'passed'
+    Set-TaskField $task 'validationNote' 'no gate commands configured or detectable'
     Write-TaskState $task
     exit 0
 }
-
-$wt = $task.worktree
+Write-Output "gate ($gateSource): $($commands -join '; ')"
 
 function Fail-Validation([string]$Reason) {
     Set-TaskField $task 'validation' 'failed'
@@ -85,6 +92,7 @@ $lines = @(
     "- branch: $($task.branch)"
     "- validated commit: $headSha"
     "- validated at: $(Get-Date -Format o)"
+    "- gate source: $gateSource"
     "- verdict: $($allPassed ? 'PASSED' : 'FAILED')"
     ''
     '| command | exit | result |'

@@ -95,25 +95,38 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 
 ## Delivery modes (no-mistakes gate)
 
-Per-repo delivery is configured in `config\projects.json`:
+**No-mistakes is the default for every repo** - Deputy works on repos it has never seen, so the gate cannot depend on a hand-maintained list. The flow:
+
+1. The member's job ends at "implement, test, commit locally" (it never pushes or opens PRs).
+2. On completion the Deputy runs `dep-validate.ps1` in the worktree - a deterministic gate the member has no control over.
+3. On green, the evidence (commands, exit codes, output, validated commit sha, gate source) is committed to the branch, PR-viewable at `.deputy/evidence/<taskId>.md`, and `dep-publish.ps1` pushes and opens the PR.
+4. On red, the failure is recorded in task state and the Deputy respawns the member with the failure output in its briefing.
+
+**Gate commands are auto-detected** unless configured. Detection reads manifests from `origin/<default-branch>` via `git show` - never from the task branch, so a branch cannot reconfigure its own gate:
+
+| Found on default branch | Gate command |
+| --- | --- |
+| `package.json` with `test` / `lint` scripts | `npm test` / `npm run lint` (pnpm/yarn by lockfile) |
+| `Cargo.toml` | `cargo test` |
+| `go.mod` | `go test ./...` |
+| `*.sln` / `*.csproj` | `dotnet test` |
+| `pytest.ini` or `[tool.pytest]` in `pyproject.toml` | `pytest` |
+
+If nothing is detected the gate passes with a note in task state - you still get the publish separation, just no test run.
+
+`config\projects.json` overrides detection per repo - pin exact commands, or opt a repo out to `direct-pr` (the member pushes and opens the PR itself; needs `gh` access):
 
 ```json
 {
-  "default": { "delivery": "direct-pr", "validate": [] },
+  "default": { "delivery": "no-mistakes", "validate": [] },
   "projects": [
-    {
-      "match": "myapp",
-      "delivery": "no-mistakes",
-      "validate": ["npm test", "npm run lint"]
-    }
+    { "match": "myapp", "delivery": "no-mistakes", "validate": ["npm run test:ci"] },
+    { "match": "legacy-app", "delivery": "direct-pr", "validate": [] }
   ]
 }
 ```
 
-`match` is a repo folder name, or a full path if it contains a slash. Unmatched repos use `default`. The shipped file contains a worked example - replace it with your own repos.
-
-- **direct-pr**: the posse member pushes and opens the PR itself (needs `gh` access).
-- **no-mistakes**: the member's job ends at "implement, test, commit locally". On completion the Deputy runs `dep-validate.ps1` in the worktree - a deterministic gate whose commands come from Deputy's own config, never from the repo being validated. On green, the evidence (commands, exit codes, output, validated commit sha) is committed to the branch, PR-viewable at `.deputy/evidence/<taskId>.md`, and `dep-publish.ps1` pushes and opens the PR. On red, the failure is recorded in task state and the Deputy respawns the member with the failure output in its briefing.
+`match` is a repo folder name, or a full path if it contains a slash. An empty `validate` list means auto-detect.
 
 The security property of no-mistakes: the agent that wrote the code never holds the pen on validation or publishing. Members need no `gh` or push access at all, and a branch cannot rubber-stamp its own gate.
 
