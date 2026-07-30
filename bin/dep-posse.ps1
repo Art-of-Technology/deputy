@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-Fleet operations over posse tasks.
+Posse operations: status, logs, results, emergency stop.
 
 .EXAMPLE
 .\dep-posse.ps1                       # status table
@@ -87,7 +87,7 @@ switch ($Action) {
         if ($Watch) {
             while ($true) {
                 Clear-Host
-                Write-Output ("DEPUTY FLEET  {0}  (refreshes every 5s, Ctrl+C to exit)" -f (Get-Date -Format 'HH:mm:ss'))
+                Write-Output ("DEPUTY POSSE  {0}  (refreshes every 5s, Ctrl+C to exit)" -f (Get-Date -Format 'HH:mm:ss'))
                 Show-Status
                 $queue = (Get-DeputyPaths).WakeQueue
                 if (Test-Path $queue) {

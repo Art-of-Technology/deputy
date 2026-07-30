@@ -19,12 +19,12 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
 | --- | --- |
 | `dep-spawn.ps1 -Task "..." -Repo <path> [-Kind ship\|scout] [-Model m]` | Lease a treehouse worktree, launch a headless posse member |
 | `dep-watch.ps1 -Wait` | Block until an actionable wake event (completed, failed, died, stalled) |
-| `dep-posse.ps1 [status\|logs\|result\|kill] [id]` | Fleet status, readable logs, final reports, emergency stop |
+| `dep-posse.ps1 [status\|logs\|result\|kill] [id]` | Posse status, readable logs, final reports, emergency stop |
 | `dep-validate.ps1 <id>` | Run the no-mistakes gate in a finished ship task's worktree |
 | `dep-publish.ps1 <id>` | Push a validated branch and open its PR (refuses unless validation passed) |
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <id>` | Inspect and merge a task's PR via gh |
 | `dep-return.ps1 <id>` | Kill stragglers, return the worktree lease, archive state |
-| `dep-dashboard.ps1` | Open the Sheriff's live fleet view in Windows Terminal (status tab + live tail per active member). Offer it when the Sheriff wants to watch the posse work |
+| `dep-dashboard.ps1` | Open the Sheriff's live posse view in Windows Terminal (status tab + live tail per active member). Offer it when the Sheriff wants to watch the posse work |
 
 ## The loop
 

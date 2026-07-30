@@ -2,7 +2,7 @@
 
 Talk to one deputy. Ship with a posse.
 
-Deputy turns a single Claude Code session into a supervisor for a fleet of isolated, headless coding agents on **Windows**. You (the Sheriff) talk to one agent (the Deputy); it dispatches tasks to posse members that each run in their own [treehouse](https://github.com/kunchenguid/treehouse) git worktree, supervises them through a zero-token watcher, and brings you back finished pull requests or investigation reports.
+Deputy turns a single Claude Code session into a supervisor for a posse of isolated, headless coding agents on **Windows**. You (the Sheriff) talk to one agent (the Deputy); it dispatches tasks to posse members that each run in their own [treehouse](https://github.com/kunchenguid/treehouse) git worktree, supervises them through a zero-token watcher, and brings you back finished pull requests or investigation reports.
 
 Deputy is a native PowerShell reimagining of [firstmate](https://github.com/kunchenguid/firstmate). Where firstmate supervises interactive agents through tmux panes, Deputy runs posse members headless (`claude -p --output-format stream-json`) and supervises them through structured event logs - no terminal multiplexer required.
 
@@ -84,7 +84,7 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | --- | --- |
 | `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>]` | Lease a worktree, launch a headless posse member, register task state |
 | `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n]` | Scan tasks for wake events; `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90) |
-| `dep-posse.ps1 status [-Watch]` | Fleet table: status, liveness, age, PR; `-Watch` auto-refreshes with recent wakes |
+| `dep-posse.ps1 status [-Watch]` | Posse table: status, liveness, age, PR; `-Watch` auto-refreshes with recent wakes |
 | `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw] [-Follow]` | Human-readable log tail (or raw stream-json); `-Follow` live-tails |
 | `dep-posse.ps1 result <taskId>` | Final report text, scout report path, PR URL |
 | `dep-posse.ps1 kill <taskId>` | Stop a runaway member's process tree (lease kept for inspection) |
@@ -92,9 +92,9 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | `dep-publish.ps1 <taskId>` | Push the branch and open the PR; refuses unless validation passed |
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <taskId> [-Method squash\|merge\|rebase]` | PR operations via gh (merge defaults to squash + delete branch) |
 | `dep-return.ps1 <taskId>` | Kill stragglers, return the lease (guarded by `--if-lease-id`), archive state |
-| `dep-dashboard.ps1 [-Id <taskId>] [-Tail n]` | Live fleet view in Windows Terminal: auto-refreshing status tab + a live-tail tab per active member. Re-running adds new members' tabs to the same window; `-Id` opens one task (active or archived) |
+| `dep-dashboard.ps1 [-Id <taskId>] [-Tail n]` | Live posse view in Windows Terminal: auto-refreshing status tab + a live-tail tab per active member. Re-running adds new members' tabs to the same window; `-Id` opens one task (active or archived) |
 
-Inside a Deputy session, the `/dashboard` skill (`.claude\skills\dashboard`) opens the same fleet view on request.
+Inside a Deputy session, the `/dashboard` skill (`.claude\skills\dashboard`) opens the same posse view on request.
 
 ## Delivery modes (no-mistakes gate)
 
@@ -137,7 +137,7 @@ The security property of no-mistakes: the agent that wrote the code never holds 
 
 Headless members cannot answer permission prompts: anything not pre-approved stalls the task on its first gated action. Two ways to run them:
 
-1. **`bypassPermissions`** (the config default): members run fully unattended. Simple, and appropriate for repos and machines you trust - which is the usual posture for an autonomous fleet.
+1. **`bypassPermissions`** (the config default): members run fully unattended. Simple, and appropriate for repos and machines you trust - which is the usual posture for an autonomous posse.
 2. **`acceptEdits` + explicit grants**: least privilege, recommended for no-mistakes repos since members need so little:
 
    ```powershell

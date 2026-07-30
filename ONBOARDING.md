@@ -1,6 +1,6 @@
 # Deputy - first 10 minutes
 
-Deputy lets you talk to one agent (the Deputy) that dispatches coding tasks to a fleet of isolated agents (the posse) and brings you back validated pull requests. This guide gets you from zero to your first delivered PR.
+Deputy lets you talk to one agent (the Deputy) that dispatches coding tasks to a posse of isolated agents and brings you back validated pull requests. This guide gets you from zero to your first delivered PR.
 
 ## 1. Install the prerequisites (one time)
 
@@ -55,7 +55,7 @@ The Deputy will:
 Ask the Deputy in plain language ("what's the posse doing?"), or run directly:
 
 ```powershell
-pwsh -NoProfile -File bin\dep-posse.ps1 status        # fleet table
+pwsh -NoProfile -File bin\dep-posse.ps1 status        # posse table
 pwsh -NoProfile -File bin\dep-posse.ps1 logs <taskId> # readable live log
 ```
 

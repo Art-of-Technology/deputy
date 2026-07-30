@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-Open the Deputy fleet dashboard in Windows Terminal: a live status tab plus
+Open the Deputy posse dashboard in Windows Terminal: a live status tab plus
 one live-tail tab per active posse member.
 
 Reuses a named terminal window ("deputy"), so running it again after new
@@ -40,7 +40,7 @@ if ($Id) {
     $tabs += Add-Tab "$short $(Split-Path -Leaf $task.repo)" "& '$posse' logs $($task.id) -Follow -Tail $Tail"
 }
 else {
-    $tabs += Add-Tab 'deputy fleet' "& '$posse' status -Watch"
+    $tabs += Add-Tab 'deputy posse' "& '$posse' status -Watch"
     foreach ($task in @(Get-AllTasks | Where-Object { $_.status -in @('running', 'stalled') })) {
         $short = ($task.id -replace '^posse-\d{8}-\d{6}-', '')
         $tabs += Add-Tab "$short $(Split-Path -Leaf $task.repo)" "& '$posse' logs $($task.id) -Follow -Tail $Tail"
