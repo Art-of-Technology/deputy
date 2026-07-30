@@ -94,6 +94,8 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | `dep-return.ps1 <taskId>` | Kill stragglers, return the lease (guarded by `--if-lease-id`), archive state |
 | `dep-dashboard.ps1 [-Id <taskId>] [-Tail n]` | Live fleet view in Windows Terminal: auto-refreshing status tab + a live-tail tab per active member. Re-running adds new members' tabs to the same window; `-Id` opens one task (active or archived) |
 
+Inside a Deputy session, the `/dashboard` skill (`.claude\skills\dashboard`) opens the same fleet view on request.
+
 ## Delivery modes (no-mistakes gate)
 
 **No-mistakes is the default for every repo** - Deputy works on repos it has never seen, so the gate cannot depend on a hand-maintained list. The flow:
