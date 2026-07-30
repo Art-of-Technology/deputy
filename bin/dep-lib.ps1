@@ -201,3 +201,20 @@ function Limit-Text([string]$Text, [int]$Max = 200) {
     $t = ($Text -replace '\s+', ' ').Trim()
     if ($t.Length -le $Max) { $t } else { $t.Substring(0, $Max) + '...' }
 }
+
+function Remove-Secret([string]$Text) {
+    # Best-effort redaction of secrets in captured command output before it
+    # lands anywhere PR-viewable. Pattern-based, so not exhaustive: test
+    # suites should avoid printing secrets in the first place.
+    if (-not $Text) { return '' }
+    $t = $Text
+    # key=value / key: value pairs for common secret-bearing key names
+    $t = $t -replace '(?i)\b([\w-]*(?:api[_-]?key|secret|password|token|authorization))([ \t]*[=:][ \t]*)("[^"]*"|''[^'']*''|(?:bearer[ \t]+|basic[ \t]+)?[^\s"'']+)', '${1}${2}[REDACTED]'
+    # credentials embedded in connection URIs (scheme://user:pass@host)
+    $t = $t -replace '(?i)\b(postgres(?:ql)?|mysql|mongodb(?:\+srv)?)://[^\s@/]*:[^\s@/]*@', '${1}://[REDACTED]@'
+    # well-known standalone token shapes: GitHub, OpenAI-style, JWT
+    $t = $t -creplace '\bgh[pousr]_[A-Za-z0-9]{20,}', '[REDACTED]'
+    $t = $t -creplace '\bsk-[A-Za-z0-9_-]{20,}', '[REDACTED]'
+    $t = $t -creplace '\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '[REDACTED]'
+    $t
+}
