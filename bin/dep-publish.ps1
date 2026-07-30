@@ -32,14 +32,38 @@ $defaultBranch = Get-DefaultBranch $wt
 git -C $wt push -u origin $task.branch 2>&1 | ForEach-Object { Write-Output "  $_" }
 if ($LASTEXITCODE -ne 0) { throw "git push failed for branch '$($task.branch)'." }
 
-$title = Limit-Text $task.task 70
+function Get-FirstSentence([string]$Text) {
+    if (-not $Text) { return '' }
+    $t = ($Text -replace '\s+', ' ').Trim()
+    $idx = $t.IndexOf('. ')
+    if ($idx -ge 0) { $t.Substring(0, $idx + 1) } else { $t }
+}
+
+$title = Limit-Text (Get-FirstSentence $task.task) 70
 $evidenceNote = if ($task.PSObject.Properties['validationEvidence'] -and $task.validationEvidence) {
     "Validated by the Deputy no-mistakes gate; evidence at ``$($task.validationEvidence)`` on this branch."
 } else {
     'Published by Deputy.'
 }
+$summary = if ($task.PSObject.Properties['result'] -and $task.result) {
+    $task.result
+} else {
+    Get-FirstSentence $task.task
+}
 $body = @"
+## Summary
+
+$summary
+
+## Briefing
+
+<details><summary>Full task briefing</summary>
+
 $($task.task)
+
+</details>
+
+---
 
 $evidenceNote
 
