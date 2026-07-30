@@ -6,7 +6,7 @@ PR operations for a posse task, via gh.
 .EXAMPLE
 .\dep-pr.ps1 view posse-...
 .\dep-pr.ps1 checks posse-...
-.\dep-pr.ps1 merge posse-...          # squash merge, deletes remote branch
+.\dep-pr.ps1 merge posse-...          # squash merge (branch cleanup happens in dep-return.ps1)
 #>
 [CmdletBinding()]
 param(
@@ -33,6 +33,6 @@ switch ($Action) {
     'view'   { gh pr view $task.prUrl }
     'checks' { gh pr checks $task.prUrl }
     'diff'   { gh pr diff $task.prUrl }
-    'merge'  { gh pr merge $task.prUrl "--$Method" --delete-branch }
+    'merge'  { gh pr merge $task.prUrl "--$Method" }
 }
 exit $LASTEXITCODE
