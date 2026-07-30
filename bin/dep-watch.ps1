@@ -38,15 +38,28 @@ function Get-ResultEvent([string]$LogPath) {
     $null
 }
 
+function Test-PrUrlBelongsToRepo([string]$RepoPath, [string]$Owner, [string]$Repo) {
+    # Only trust a PR URL that points at the task's own repo. The URL comes
+    # from the posse member's final message, so a prompt-injected member could
+    # otherwise steer the Deputy into merging a foreign PR (dep-pr.ps1 passes
+    # prUrl straight to gh). Owner/repo compare case-insensitively (GitHub
+    # treats them that way); no origin remote means no URL can be trusted.
+    $origin = @(git -C $RepoPath remote get-url origin 2>$null)[0]
+    if ($LASTEXITCODE -ne 0 -or -not $origin) { return $false }
+    $pattern = 'github\.com[:/]{0}/{1}(\.git)?/?$' -f [regex]::Escape($Owner), [regex]::Escape($Repo)
+    $origin.Trim() -match $pattern
+}
+
 function New-Wake($Task, [string]$EventName, [string]$Summary) {
     [pscustomobject]@{
-        at      = (Get-Date -Format o)
-        taskId  = $Task.id
-        event   = $EventName
-        kind    = $Task.kind
-        repo    = $Task.repo
-        prUrl   = $Task.prUrl
-        summary = $Summary
+        at            = (Get-Date -Format o)
+        taskId        = $Task.id
+        event         = $EventName
+        kind          = $Task.kind
+        repo          = $Task.repo
+        prUrl         = $Task.prUrl
+        prUrlRejected = $Task.prUrlRejected
+        summary       = $Summary
     }
 }
 
@@ -73,8 +86,13 @@ function Invoke-Scan {
             Set-TaskField $task 'endedAt' (Get-Date -Format o)
             $text = if ($result.PSObject.Properties['result']) { [string]$result.result } else { '' }
             Set-TaskField $task 'result' $text
-            if ($text -match 'https://github\.com/[^\s)"'']+/pull/\d+') {
-                Set-TaskField $task 'prUrl' $Matches[0]
+            if ($text -match 'https://github\.com/([^/\s)"'']+)/([^/\s)"'']+)/pull/\d+') {
+                if (Test-PrUrlBelongsToRepo $task.repo $Matches[1] $Matches[2]) {
+                    Set-TaskField $task 'prUrl' $Matches[0]
+                }
+                else {
+                    Set-TaskField $task 'prUrlRejected' $Matches[0]
+                }
             }
             $events += New-Wake $task $task.status (Limit-Text $text 500)
         }
@@ -114,6 +132,7 @@ while ($true) {
         Add-WakeEvent $e
         Write-Output ("[wake] {0}: {1} ({2})" -f $e.taskId, $e.event, $e.kind)
         if ($e.prUrl) { Write-Output ("  pr: {0}" -f $e.prUrl) }
+        if ($e.prUrlRejected) { Write-Output ("  pr REJECTED (not this task's repo): {0}" -f $e.prUrlRejected) }
         if ($e.summary) { Write-Output ("  {0}" -f $e.summary) }
     }
     if ($events.Count -gt 0) {
