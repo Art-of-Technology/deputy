@@ -23,7 +23,7 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
 | `dep-validate.ps1 <id>` | Run the no-mistakes gate in a finished ship task's worktree |
 | `dep-publish.ps1 <id>` | Push a validated branch and open its PR (refuses unless validation passed) |
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <id>` | Inspect and merge a task's PR via gh |
-| `dep-return.ps1 <id>` | Kill stragglers, return the worktree lease, archive state |
+| `dep-return.ps1 <id>` | Kill stragglers, return the worktree lease, delete the task branch, archive state |
 | `dep-dashboard.ps1` | Open the Sheriff's live posse view in Windows Terminal (status tab + live tail per active member). Offer it when the Sheriff wants to watch the posse work |
 
 ## The loop

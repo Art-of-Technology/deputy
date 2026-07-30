@@ -2,7 +2,8 @@
 <#
 .SYNOPSIS
 Tear down a posse task: stop any lingering process, return the leased
-worktree to the treehouse pool, and archive the task state.
+worktree to the treehouse pool, delete the task branch (local and remote,
+best effort), and archive the task state.
 
 The lease return is guarded with --if-lease-id so a stale task record can
 never release a worktree that has since been re-leased by someone else.
@@ -33,6 +34,24 @@ if ($task.worktree -and (Test-Path $task.worktree)) {
 }
 else {
     Write-Output "worktree already gone: $($task.worktree)"
+}
+
+# Branch cleanup is best effort: the local branch usually only existed in the
+# worktree, and the remote branch may already be gone (or never pushed).
+if ($task.branch) {
+    $head = git -C $task.repo branch --show-current 2>$null
+    if ($head -eq $task.branch) {
+        Write-Output "skipped branch cleanup: $($task.branch) is checked out in $($task.repo)"
+    }
+    else {
+        git -C $task.repo branch -D $task.branch *> $null
+        if ($LASTEXITCODE -eq 0) { Write-Output "deleted local branch: $($task.branch)" }
+        else { Write-Output "local branch not present, nothing to delete: $($task.branch)" }
+
+        git -C $task.repo push origin --delete $task.branch *> $null
+        if ($LASTEXITCODE -eq 0) { Write-Output "deleted remote branch: origin/$($task.branch)" }
+        else { Write-Output "remote branch not deleted (already gone, never pushed, or no origin): $($task.branch)" }
+    }
 }
 
 Set-TaskField $task 'finalStatus' $task.status
