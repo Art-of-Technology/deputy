@@ -118,8 +118,18 @@ function New-TaskId {
     'posse-{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $suffix
 }
 
+function Assert-TaskId([string]$Id) {
+    # Task ids become file names under state\; reject anything that does not
+    # match the exact shape New-TaskId produces so a hostile id (e.g. one with
+    # path separators or '..') cannot escape the state directory.
+    if ($Id -notmatch '^posse-\d{8}-\d{6}-[a-z]{3}$') {
+        throw "Invalid task id '$Id'. Expected the form posse-YYYYMMDD-HHMMSS-abc."
+    }
+    $Id
+}
+
 function Get-TaskStatePath([string]$Id) {
-    Join-Path (Get-DeputyPaths).State "$Id.json"
+    Join-Path (Get-DeputyPaths).State "$(Assert-TaskId $Id).json"
 }
 
 function Read-TaskState([string]$Id) {
@@ -134,7 +144,7 @@ function Read-TaskStateAny([string]$Id) {
     # Like Read-TaskState but also finds archived (returned) tasks
     $path = Get-TaskStatePath $Id
     if (-not (Test-Path $path)) {
-        $path = Join-Path (Get-DeputyPaths).Archive "$Id.json"
+        $path = Join-Path (Get-DeputyPaths).Archive "$(Assert-TaskId $Id).json"
     }
     if (-not (Test-Path $path)) {
         throw "No task state (active or archived) for '$Id'."
@@ -184,7 +194,21 @@ function Get-WorktreeProcessIds([string]$RepoPath, [string]$WorktreePath) {
 function Test-TaskProcessAlive($State) {
     # The recorded pid can be a short-lived launcher (claude shims re-spawn
     # themselves), so fall back to treehouse's CWD-based process tracking.
-    if ($State.pid -and (Get-Process -Id $State.pid -ErrorAction SilentlyContinue)) { return $true }
+    # Windows recycles pids, so a live pid only counts as ours when its start
+    # time matches the recorded pidStartedAt (within a small tolerance).
+    if ($State.pid) {
+        $proc = Get-Process -Id $State.pid -ErrorAction SilentlyContinue
+        if ($proc) {
+            $recorded = $State.PSObject.Properties['pidStartedAt'] ? $State.pidStartedAt : $null
+            if (-not $recorded) { return $true }  # pre-pidStartedAt record: cannot verify
+            $started = try { $proc.StartTime } catch { $null }
+            if ($started) {
+                $expected = [datetime]::Parse($recorded, [cultureinfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::RoundtripKind)
+                if ([math]::Abs(($started - $expected).TotalSeconds) -le 2) { return $true }
+            }
+        }
+    }
     if ($State.worktree -and (Test-Path $State.worktree) -and (Test-Path $State.repo)) {
         return @(Get-WorktreeProcessIds $State.repo $State.worktree).Count -gt 0
     }
