@@ -57,6 +57,7 @@ finally { Pop-Location }
 # Branch name for ship tasks
 $slug = ($Task.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-')
 if ($slug.Length -gt 40) { $slug = $slug.Substring(0, 40).Trim('-') }
+if (-not $slug) { $slug = $id }  # all-punctuation task: 'deputy/' alone is not a valid ref
 $branch = '{0}{1}' -f $config.branchPrefix, $slug
 
 $projProfile = Get-ProjectProfile $repoPath
@@ -164,6 +165,7 @@ $state = [pscustomobject]@{
     delivery       = $delivery
     validation     = $null
     pid            = $proc.Id
+    pidStartedAt   = $(try { $proc.StartTime.ToString('o') } catch { $null })
     model          = $Model
     permissionMode = $PermissionMode
     status         = 'running'
