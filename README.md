@@ -105,6 +105,8 @@ Inside a Deputy session, the `/dashboard` skill (`.claude\skills\dashboard`) ope
 3. On green, the evidence (commands, exit codes, output, validated commit sha, gate source) is committed to the branch, PR-viewable at `.deputy/evidence/<taskId>.md`, and `dep-publish.ps1` pushes and opens the PR.
 4. On red, the failure is recorded in task state and the Deputy respawns the member with the failure output in its briefing.
 
+Captured command output in the evidence is redacted on a best-effort basis (common `key=value` secrets, connection-string credentials, well-known token shapes) before it is written anywhere. Redaction is pattern-based and cannot catch everything - test suites should not print secrets.
+
 **Gate commands are auto-detected** unless configured. Detection reads manifests from `origin/<default-branch>` via `git show` - never from the task branch, so a branch cannot reconfigure its own gate:
 
 | Found on default branch | Gate command |

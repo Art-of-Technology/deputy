@@ -132,7 +132,8 @@ foreach ($r in @($setupResults + $results)) {
     $lines += "| ``$($r.command)`` | $($r.exit) | $($r.passed ? 'PASS' : 'FAIL') |"
 }
 foreach ($r in @($setupResults + $results)) {
-    $lines += @('', "## Output: ``$($r.command)``", '', '```', (Limit-Text $r.output 2000), '```')
+    # Redact before truncating so a cut cannot split a secret past the patterns
+    $lines += @('', "## Output: ``$($r.command)``", '', '```', (Limit-Text (Remove-Secret $r.output) 2000), '```')
 }
 $evidence = $lines -join "`n"
 
