@@ -1,92 +1,155 @@
 ---
 name: adhdify
-description: Re-render a long or dense answer as a short, scannable, ADHD-friendly summary - TL;DR, a few bullets, one next action. Use when the user says "adhdify", "tl;dr that", "too long", "summarise that", "shorter", or when you are about to emit a wall of text (long status reports, validation results, multi-task posse updates, diff walkthroughs, research findings). Invocable as /adhdify.
+description: Re-render a long or dense answer as a scannable, ADHD-friendly briefing - short emoji-headed sections, plain prose, and one decisive "if you only do one thing" close. Use when the user says "adhdify", "tl;dr that", "too long", "what's next", "tell me what to do like I have ADHD", or when you are about to emit a wall of text (status reports, validation results, multi-task posse updates, diff walkthroughs, research findings). Invocable as /adhdify.
 ---
 
 # adhdify
 
-Turn a wall of text into something a distracted reader can absorb in one glance.
+Turn a wall of text into a briefing someone can scan, act on, and put down.
 
 Two ways this runs:
 
-- **Retroactively** - the user says `/adhdify` (or "tl;dr that"). Compress the answer you just gave.
-- **Pre-emptively** - you are about to produce a long answer and adhdify is on by default (see "Default on"). Write the short version *instead of* the long one, and keep the detail in your head for `/expando`.
+- **Retroactively** - the user says `/adhdify` (or "tl;dr that"). Recast the answer you just gave.
+- **Pre-emptively** - you are about to produce a long answer and adhdify is on by default (see "Default on"). Write this shape *instead of* the wall, and keep the detail in your head for `/expando`.
 
 ## Output shape
 
-Use exactly this skeleton. Nothing before it, nothing after it.
+Short sections, each led by one emoji and a 2-5 word header. `---` between them. Prose where prose is clearer, bullets only for genuine lists.
 
 ```
-**<TL;DR in one sentence - the answer, not a description of the answer>**
+✅ <2-5 word header>
 
-- <point>
-- <point>
-- <point>
+<One or two short lines. Plain sentences, not telegram.>
 
-**Next:** <the single next action, or "Your call: <the decision you need>">
+<A tight list only if the content is actually a list.>
 
-_More detail: /expando_
+---
+
+🔨 Do this next
+
+<The one thing to do, named in the first line.>
+
+- <why it's the one>
+- <what's already in place>
+- <blocked on nothing, or what it's blocked on>
+
+---
+
+👉 If you only do one thing
+
+<The same one thing, one line. No hedging.>
 ```
 
 Rules:
 
-- **150 words hard ceiling.** Aim for 80.
-- **3-6 bullets.** Never more. Each one line, ~12 words, no sub-bullets, no nesting.
-- **Lead each bullet with the load-bearing word**, bolded if it is a status: `**Passed** - 41 tests, 0 failures.`
-- **One next action.** If the next move is the user's, say so plainly under `Your call:`.
-- Drop the `_More detail_` line only if there genuinely is no detail behind it.
+- **3-6 sections.** Every section earns its place or it merges into another.
+- **One emoji per section header. Nowhere else** - never per bullet, never mid-sentence, never trailing a line.
+- **Always close with `👉 If you only do one thing`** and name a single action. This is the section the reader remembers.
+- **Short paragraphs beat dense bullets.** Two plain sentences are easier than five fragments.
+- **Bullets are for lists**, max ~5, one line each, no nesting.
+- **Blank line between everything.** White space is the point.
+- **Strikethrough what's done**: `- ~~Black bar on riverbanks~~`. Resolved things should read as closed.
+- **No word ceiling, but no padding either.** Typically 150-350 words. Past ~400 you are expanding, not summarising.
+
+## Emoji
+
+Section markers, so the eye can find the section it wants without reading. That only works if each means one thing:
+
+| | Section |
+| --- | --- |
+| ✅ | what's working, what's settled, good news |
+| 🔨 | do this next - the real work |
+| 📤 | hand off to someone else |
+| 🐛 | known issues worth leaving for now |
+| ⚠️ | unverified, or a caveat that changes a decision |
+| ❌ | broken, failed, refused |
+| 🚧 | blocked, waiting on something |
+| 🔍 | what was looked at, findings |
+| 👉 | if you only do one thing - fixed, always last |
+
+- **Never reuse an emoji** inside one answer. Two ✅ headers means those are one section.
+- **Never soften a status.** ❌ stays ❌ and ⚠️ never becomes 💡. The emoji layer must not undo what "never hide a failure" guarantees.
+- Do not invent new ones for flavour. If a section fits nothing here, question whether it belongs.
+
+## Ordering
+
+**Good news first**, when there is any. Naming what is settled clears the reader's head before you ask them to do something.
+
+Then the one action. Then handoffs. Then what you are deliberately leaving. Then 👉.
+
+Exception: **if something is on fire, it leads.** A failed gate, a blocked merge, a broken build goes first and gets ❌ or ⚠️. Never open with good news to cushion a blocker - that is burying it.
 
 ## What must survive compression
 
-Brevity never costs the reader something they need. Always keep, verbatim:
+Brevity never costs the reader something they need. Keep, verbatim:
 
-- Exact outcomes and counts: `3 passed, 1 failed`, not "mostly passing".
+- Exact outcomes and counts: `0 errors, 207 tests pass`, not "mostly green".
 - Task ids, branch names, PR URLs, file paths, error messages the user would search for.
-- Every blocker and every failure. **Never drop a bad result to make the summary tidy.**
-- The distinction between passed / failed / unverified. In Deputy, "unverified" is not a pass - if a gate ran nothing, the bullet says so.
+- Every blocker and every failure. **Never drop a bad result to make the briefing tidy.**
+- The distinction between passed / failed / unverified. In Deputy, "unverified" is not a pass - if a gate ran nothing, say nothing was verified.
 
-If something important will not fit in 6 bullets, that is a signal the answer needs `Your call:` - not that you should quietly cut it.
+Say plainly when something is your guess rather than verified, and when a problem is invisible to users right now - both change how urgent it is.
 
 ## What to cut
 
 Preamble, restating the question, narration of what you did, caveats that change no decision, options you are not recommending, and anything the user already knows.
 
-## Examples
+## Have an opinion
 
-Long version:
+The point is to spare the reader the deciding, not just the reading. So:
 
-> I ran the validation gate on task `t-7f2a` and it came back with exit code 0. The gate executed `npm run lint` and `npm test`, which produced 41 passing tests across 6 suites with no failures... [12 more lines]
+- Recommend, don't enumerate. One next action, not a menu.
+- Say why it's the one, in a line: "it's the only item that adds something new rather than fixing or checking."
+- Say what you would leave, and that you'd leave it.
+- Where the call is genuinely the user's, make that its own line: `🤔 Your call: <the two options>`.
 
-Adhdified:
-
-```
-**Task t-7f2a passed the gate - ready to publish.**
-
-- **Passed** - lint clean, 41 tests, 0 failures.
-- Branch `deputy/fix-token-refresh`, 3 files changed.
-- No anchor warning.
-
-**Next:** publishing now, then I'll hand you the PR link.
-
-_More detail: /expando_
-```
-
-Long version:
-
-> The gate came back with exit code 2... [paragraph explaining unverified]
-
-Adhdified:
+## Example
 
 ```
-**Task t-91bc is UNVERIFIED - nothing about the code is proven.**
+✅ Good news first
 
-- Gate found no commands to run in that repo.
-- Not a failure, but not a pass either. Respawning won't fix it.
-- Fix for good: pin gate commands in `config\projects.json`.
+Nothing in the game looks broken right now.
 
-**Your call:** pin the commands and re-run, or publish with `-AllowUnverified` (PR gets labelled unvalidated).
+The two defects a player could see are fixed and verified:
+- ~~Graph paper grass~~
+- ~~Black bar on riverbanks~~
 
-_More detail: /expando_
+Art gate: 0 errors. Build clean. 207 tests pass.
+
+---
+
+🔨 Do this next
+
+Paint Guillotine Gorge.
+
+- First real slice 3 content
+- Mountain atlas is applied and QA'd
+- `tools/mapgen/` already has a per-scene generator pattern to copy
+- Blocked on nothing
+
+It's the only item on the list that adds something new to the game rather than fixing or checking.
+
+---
+
+📤 Send codex one small thing
+
+The mountain cliff still pulses - 12 identical lobe stacks in a row. They fixed the seam but not the "vary the lobe width" part.
+
+Not urgent, no scene paints the mountain yet. But better fixed before you paint the gorge on top of it.
+
+---
+
+🐛 Two things I'd leave for now
+
+1. **My E2E driver is flaky.** Needs the game to print player coordinates so it can walk into position instead of guessing durations. Small job, but it's tooling, not game.
+
+2. **~350 collision marks are my guesses**, not the artist's, across 5 atlases. Invisible until someone walks into thin air. Mountain's are the artist's, so painting the gorge is safe.
+
+---
+
+👉 If you only do one thing
+
+Paint Guillotine Gorge. Everything else is polish, checking, or tools.
 ```
 
 ## Default on
