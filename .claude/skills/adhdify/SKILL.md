@@ -38,6 +38,8 @@ Short sections, each led by one emoji and a 2-5 word header. `---` between them.
 👉 If you only do one thing
 
 <The same one thing, one line. No hedging.>
+
+_More detail: /expando_
 ```
 
 Rules:
@@ -46,10 +48,11 @@ Rules:
 - **One emoji per section header. Nowhere else** - never per bullet, never mid-sentence, never trailing a line.
 - **Always close with `👉 If you only do one thing`** and name a single action. This is the section the reader remembers.
 - **Short paragraphs beat dense bullets.** Two plain sentences are easier than five fragments.
-- **Bullets are for lists**, max ~5, one line each, no nesting.
+- **Bullets are for lists**, max ~5, no nesting. One line each, except a numbered list of deferred items, where a **bold lead** plus one or two short sentences is right - see the 🐛 section of the example.
 - **Blank line between everything.** White space is the point.
 - **Strikethrough what's done**: `- ~~Black bar on riverbanks~~`. Resolved things should read as closed.
 - **No word ceiling, but no padding either.** Typically 150-350 words. Past ~400 you are expanding, not summarising.
+- **Close with `_More detail: /expando_`** whenever real detail sits behind the briefing, so the reader knows the long version is one word away. Drop the line only when there genuinely is nothing more to tell.
 
 ## Emoji
 
@@ -65,6 +68,7 @@ Section markers, so the eye can find the section it wants without reading. That 
 | ❌ | broken, failed, refused |
 | 🚧 | blocked, waiting on something |
 | 🔍 | what was looked at, findings |
+| 🤔 | a decision that is the user's to make |
 | 👉 | if you only do one thing - fixed, always last |
 
 - **Never reuse an emoji** inside one answer. Two ✅ headers means those are one section.
@@ -150,6 +154,8 @@ Not urgent, no scene paints the mountain yet. But better fixed before you paint 
 👉 If you only do one thing
 
 Paint Guillotine Gorge. Everything else is polish, checking, or tools.
+
+_More detail: /expando_
 ```
 
 ## Default on
