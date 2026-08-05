@@ -159,6 +159,12 @@ switch ($Action) {
                 Write-Output '  Nothing ran against this branch. Not a pass.'
             }
         }
+        # Independent of the verdict: a gate can pass on a stale trust anchor,
+        # and the fix belongs to the Sheriff, not to a respawn.
+        if ($task.PSObject.Properties['anchorWarning'] -and $task.anchorWarning) {
+            Write-Output ''
+            Write-Output "Anchor: $($task.anchorWarning)"
+        }
         if ($task.prUrl) { Write-Output "PR: $($task.prUrl)" }
     }
     'kill' {

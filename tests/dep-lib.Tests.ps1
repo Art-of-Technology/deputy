@@ -71,6 +71,31 @@ Describe 'Resolve-DefaultRef' {
         (Resolve-DefaultRef $repo).Source | Should -Match 'stale origin/HEAD \(origin/renamed-away is missing\)'
     }
 
+    It 'labels the anchor health so callers need not parse the source prose' {
+        $ok = New-Case @{ WithRemote = $true; TaskBranch = $script:TASK_BRANCH }
+        (Resolve-DefaultRef $ok).Health | Should -Be 'ok'
+
+        $local = New-Case @{ TaskBranch = $script:TASK_BRANCH }
+        (Resolve-DefaultRef $local).Health | Should -Be 'ok'
+
+        $stale = New-Case @{ WithRemote = $true; DanglingOriginHead = $true
+            TaskBranch = $script:TASK_BRANCH
+        }
+        (Resolve-DefaultRef $stale).Health | Should -Be 'stale'
+
+        $none = New-Case @{ DefaultBranch = 'trunk'; TaskBranch = $script:TASK_BRANCH }
+        (Resolve-DefaultRef $none).Health | Should -Be 'unresolved'
+    }
+
+    It 'calls a stale origin/HEAD with no usable fallback unresolved, and still says it was stale' {
+        $repo = New-Case @{ DefaultBranch = 'trunk'; WithRemote = $true; DanglingOriginHead = $true
+            TaskBranch = $script:TASK_BRANCH
+        }
+        $anchor = Resolve-DefaultRef $repo
+        $anchor.Health | Should -Be 'unresolved'
+        $anchor.Source | Should -Match 'stale origin/HEAD'
+    }
+
     It 'never returns a ref that does not exist' {
         foreach ($opts in @(
                 @{ TaskBranch = $script:TASK_BRANCH; WithRemote = $true },

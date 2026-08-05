@@ -79,8 +79,13 @@ function Resolve-DefaultRef([string]$RepoPath) {
     # remote at all - the local default branch by convention. Never a fallback
     # to HEAD: an unresolvable anchor returns Ref = $null, which callers must
     # treat as "cannot verify", not as "nothing to check".
-    function New-Anchor([string]$Branch, [string]$Ref, [string]$Source) {
-        [pscustomobject]@{ Branch = $Branch; Ref = $Ref; Source = $Source }
+    # Health is the machine-readable form of Source, so callers can react to a
+    # bad anchor without parsing prose: 'ok' when it resolved cleanly, 'stale'
+    # when origin/HEAD named a missing ref, 'unresolved' when there is no anchor
+    # at all. Only the Sheriff can fix the last two, at the repo level.
+    function New-Anchor([string]$Branch, [string]$Ref, [string]$Source, [switch]$Stale) {
+        $health = if (-not $Ref) { 'unresolved' } elseif ($Stale) { 'stale' } else { 'ok' }
+        [pscustomobject]@{ Branch = $Branch; Ref = $Ref; Source = $Source; Health = $health }
     }
 
     # Set when origin/HEAD names a ref that is not there (the default branch was
@@ -103,7 +108,7 @@ function Resolve-DefaultRef([string]$RepoPath) {
     }
     foreach ($b in 'main', 'master') {
         if (Test-GitRef $RepoPath "refs/remotes/origin/$b") {
-            return New-Anchor $b "refs/remotes/origin/$b" "${stale}remote-tracking origin/$b"
+            return New-Anchor $b "refs/remotes/origin/$b" "${stale}remote-tracking origin/$b" -Stale:([bool]$stale)
         }
     }
     # No remote-tracking default (no remote configured, or nothing fetched).
@@ -111,7 +116,7 @@ function Resolve-DefaultRef([string]$RepoPath) {
     # carry the configured branch prefix, so they are never named main/master.
     foreach ($b in 'main', 'master') {
         if (Test-GitRef $RepoPath "refs/heads/$b") {
-            return New-Anchor $b "refs/heads/$b" "${stale}local branch $b"
+            return New-Anchor $b "refs/heads/$b" "${stale}local branch $b" -Stale:([bool]$stale)
         }
     }
     New-Anchor $null $null "${stale}unresolved"
