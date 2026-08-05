@@ -282,6 +282,71 @@ function Limit-Text([string]$Text, [int]$Max = 200) {
     if ($t.Length -le $Max) { $t } else { $t.Substring(0, $Max) + '...' }
 }
 
+function Get-FirstSentence([string]$Text) {
+    if (-not $Text) { return '' }
+    $t = ($Text -replace '\s+', ' ').Trim()
+    $idx = $t.IndexOf('. ')
+    if ($idx -ge 0) { $t.Substring(0, $idx + 1) } else { $t }
+}
+
+function Format-PrTitle([string]$Text, [int]$Max = 80) {
+    # A PR title is a headline, so it is cut like one. Limit-Text's blunt
+    # substring shipped "...degrade into a vacuous p..." on a real PR, which had
+    # to be corrected by hand: break on a word boundary instead, and shed
+    # whatever the break leaves dangling.
+    if (-not $Text) { return '' }
+    $t = (($Text -replace '\s+', ' ').Trim()) -replace '[\s.,;:]+$', ''
+    if ($t.Length -le $Max) { return $t }
+
+    $ellipsis = '...'
+    $budget = $t.Substring(0, $Max - $ellipsis.Length)
+    $space = $budget.LastIndexOf(' ')
+    # A single word wider than the whole budget has no boundary to break on:
+    # cut it anyway rather than looping forever or returning nothing.
+    if ($space -lt 1) { return $budget + $ellipsis }
+
+    # Trailing punctuation, and a trailing function word (connective, article,
+    # bare auxiliary) that reads as a clause broken off mid-thought, both go.
+    # Never the last remaining word, so the result cannot collapse to empty.
+    $connectives = @('a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'being', 'but', 'by', 'can',
+        'could', 'did', 'do', 'does', 'for', 'from', 'had', 'has', 'have', 'if', 'in', 'into', 'is',
+        'it', 'its', 'may', 'might', 'must', 'no', 'not', 'of', 'on', 'or', 'over', 'per', 'should',
+        'so', 'than', 'that', 'the', 'their', 'to', 'via', 'was', 'were', 'when', 'which', 'while',
+        'who', 'will', 'with', 'without', 'would')
+    $cut = $budget.Substring(0, $space)
+    while ($true) {
+        $cut = $cut -replace '[\s\p{P}]+$', ''
+        $words = @($cut -split ' ')
+        if ($words.Count -le 1 -or -not ($connectives -contains $words[-1].ToLowerInvariant())) { break }
+        $cut = ($words[0..($words.Count - 2)] -join ' ')
+    }
+    if (-not $cut) { $cut = $budget }
+    $cut + $ellipsis
+}
+
+function Get-PrTitle {
+    <#
+    .SYNOPSIS
+    The PR title for a task branch: its single commit subject when it has one,
+    else the first sentence of the briefing.
+
+    A commit subject is already written as an imperative headline, while a
+    briefing's first sentence is a specification and reads like one. When the
+    branch carries several commits no single subject covers them, so the
+    briefing is the honest source there. Deputy's own evidence commit is not
+    the member's work and never counts as the branch's commit.
+    #>
+    param([string]$Worktree, [string]$DefaultRef, [string]$Briefing)
+    $source = $null
+    if ($Worktree -and $DefaultRef) {
+        $subjects = @(git -C $Worktree log "$DefaultRef..HEAD" --format=%s 2>$null |
+            Where-Object { $_ -and $_ -notmatch '^deputy: validation evidence' })
+        if ($subjects.Count -eq 1) { $source = $subjects[0] }
+    }
+    if (-not $source) { $source = Get-FirstSentence $Briefing }
+    Format-PrTitle $source
+}
+
 function Remove-Secret([string]$Text) {
     # Best-effort redaction of secrets in captured command output before it
     # lands anywhere PR-viewable. Pattern-based, so not exhaustive: test

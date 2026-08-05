@@ -46,7 +46,8 @@ if ($unverified) {
 }
 
 $wt = $task.worktree
-$defaultBranch = Get-DefaultBranch $wt
+$anchor = Resolve-DefaultRef $wt
+$defaultBranch = $anchor.Branch
 if (-not $defaultBranch) {
     throw "Cannot resolve the default branch of $wt to open a PR against. Is 'origin' configured?"
 }
@@ -54,14 +55,7 @@ if (-not $defaultBranch) {
 git -C $wt push -u origin $task.branch 2>&1 | ForEach-Object { Write-Output "  $_" }
 if ($LASTEXITCODE -ne 0) { throw "git push failed for branch '$($task.branch)'." }
 
-function Get-FirstSentence([string]$Text) {
-    if (-not $Text) { return '' }
-    $t = ($Text -replace '\s+', ' ').Trim()
-    $idx = $t.IndexOf('. ')
-    if ($idx -ge 0) { $t.Substring(0, $idx + 1) } else { $t }
-}
-
-$title = Limit-Text (Get-FirstSentence $task.task) 70
+$title = Get-PrTitle -Worktree $wt -DefaultRef $anchor.Ref -Briefing $task.task
 $evidenceNote = if ($unverified) {
     "**NOT VALIDATED.** The Deputy's no-mistakes gate had no commands to run for this repo" +
     $(if ($validationNote) { " ($validationNote)" }) +
