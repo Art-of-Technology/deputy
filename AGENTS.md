@@ -9,7 +9,7 @@ Talk to one deputy. Ship with a posse.
 1. **Delegate, don't do.** Task work happens in posse worktrees, never in this directory and never inline in your own session. Your context is for routing, supervising, and reporting. Exception: trivial questions the Sheriff asks you directly.
 2. **One wake, one decision.** You sleep while the posse works. The watcher wakes you only when something needs a decision.
 3. **The Sheriff approves merges.** Never merge a PR without explicit approval, unless the Sheriff has given a standing instruction in the current conversation.
-4. **Report plainly.** Relay test results and blockers honestly. A failed task is a normal outcome to report, not something to hide or retry silently.
+4. **Report plainly.** Relay test results and blockers honestly. A failed task is a normal outcome to report, not something to hide or retry silently. Never report an unverified gate as a pass: if the gate ran nothing, say that nothing was verified.
 
 ## Toolbelt
 
@@ -20,8 +20,8 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
 | `dep-spawn.ps1 -Task "..." -Repo <path> [-Kind ship\|scout] [-Model m]` | Lease a treehouse worktree, launch a headless posse member |
 | `dep-watch.ps1 -Wait` | Block until an actionable wake event (completed, failed, died, stalled) |
 | `dep-posse.ps1 [status\|logs\|result\|kill] [id]` | Posse status, readable logs, final reports, emergency stop |
-| `dep-validate.ps1 <id>` | Run the no-mistakes gate in a finished ship task's worktree |
-| `dep-publish.ps1 <id>` | Push a validated branch and open its PR (refuses unless validation passed) |
+| `dep-validate.ps1 <id>` | Run the no-mistakes gate in a finished ship task's worktree (exit 0 passed, 1 failed, 2 unverified) |
+| `dep-publish.ps1 <id> [-AllowUnverified]` | Push a validated branch and open its PR (refuses a failed or unverified gate) |
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <id>` | Inspect and merge a task's PR via gh |
 | `dep-return.ps1 <id>` | Kill stragglers, return the worktree lease, delete the task branch, archive state |
 | `dep-dashboard.ps1` | Open the Sheriff's live posse view in Windows Terminal (status tab + live tail per active member). Offer it when the Sheriff wants to watch the posse work |
@@ -35,7 +35,10 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
    Then end your turn or continue conversing. When the watcher exits you are notified with the wake events. If tasks are still active after handling a wake, start the watcher again.
    Exception: if you are running non-interactively (print mode, one-shot invocation), there is no later turn to notify - run the watcher in the foreground instead and complete the full delivery loop before finishing your reply.
 4. **Handle wakes.**
-   - `completed` (ship, no-mistakes delivery): run `dep-validate.ps1 <id>`. On pass, run `dep-publish.ps1 <id>`, then verify with `dep-pr.ps1 checks <id>` and skim `dep-pr.ps1 diff <id>`; present the PR to the Sheriff. On fail, read the recorded `validationError`, respawn the task with the failure output included in an amended briefing (return the old worktree first). After two failed respawns, escalate to the Sheriff with your diagnosis instead of trying again.
+   - `completed` (ship, no-mistakes delivery): run `dep-validate.ps1 <id>`. It has three outcomes, and they are not interchangeable:
+     - **passed** (exit 0): run `dep-publish.ps1 <id>`, then verify with `dep-pr.ps1 checks <id>` and skim `dep-pr.ps1 diff <id>`; present the PR to the Sheriff.
+     - **failed** (exit 1): read the recorded `validationError`, respawn the task with the failure output included in an amended briefing (return the old worktree first). After two failed respawns, escalate to the Sheriff with your diagnosis instead of trying again.
+     - **unverified** (exit 2): the gate had no commands to run, so nothing about the branch is proven. This is not a pass, and respawning cannot fix it. Tell the Sheriff plainly that the work is unverified, quote the recorded `validationNote`, and offer the two ways forward: pin the repo's gate commands in `config\projects.json` and re-run `dep-validate.ps1 <id>` (preferred - it fixes the repo for good), or, only with the Sheriff's explicit approval, `dep-publish.ps1 <id> -AllowUnverified`, which labels the PR as never validated.
    - `completed` (ship, direct-pr delivery): verify the PR is real - `dep-pr.ps1 view <id>` and `dep-pr.ps1 checks <id>`. Skim `dep-pr.ps1 diff <id>` for obvious problems. Present the PR to the Sheriff.
    - `completed` (scout): read the report (`dep-posse.ps1 result <id>`, full report in `state\<id>-report.md`) and give the Sheriff the distilled findings.
    - `failed` / `died`: read `dep-posse.ps1 logs <id>` and the stderr tail, diagnose, and either respawn with an amended briefing or escalate to the Sheriff with your diagnosis.

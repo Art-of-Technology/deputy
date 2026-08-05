@@ -76,6 +76,7 @@ function Show-Status {
             Alive  = Test-TaskProcessAlive $_
             Age    = Format-Age $_.spawnedAt $_.endedAt
             Repo   = Split-Path -Leaf $_.repo
+            Gate   = if ($_.PSObject.Properties['validation'] -and $_.validation) { $_.validation } else { '-' }
             Pr     = $_.prUrl
             Task   = Limit-Text $_.task 60
         }
@@ -148,6 +149,16 @@ switch ($Action) {
         }
         $report = Join-Path (Get-DeputyPaths).State "$Id-report.md"
         if (Test-Path $report) { Write-Output ''; Write-Output "Full scout report: $report" }
+        if ($task.PSObject.Properties['validation'] -and $task.validation) {
+            Write-Output ''
+            Write-Output "Gate: $($task.validation)"
+            foreach ($detail in 'validationNote', 'validationError') {
+                if ($task.PSObject.Properties[$detail] -and $task.$detail) { Write-Output "  $($task.$detail)" }
+            }
+            if ($task.validation -eq 'unverified') {
+                Write-Output '  Nothing ran against this branch. Not a pass.'
+            }
+        }
         if ($task.prUrl) { Write-Output "PR: $($task.prUrl)" }
     }
     'kill' {

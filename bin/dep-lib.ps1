@@ -62,13 +62,61 @@ function Get-ProjectProfile([string]$RepoPath) {
     $default
 }
 
-function Get-AutoValidateCommands([string]$Worktree) {
-    # Detect validation commands for the repo. Manifests are read from
-    # origin/<default> via git show, never from the task branch, so a posse
-    # member's branch cannot reconfigure its own gate.
-    $branch = Get-DefaultBranch $Worktree
+function Test-GitRef([string]$RepoPath, [string]$Ref) {
+    git -C $RepoPath show-ref --verify --quiet $Ref 2>$null
+    $LASTEXITCODE -eq 0
+}
+
+function Resolve-DefaultRef([string]$RepoPath) {
+    # The trust anchor Deputy reads a repo's shape from: gate manifests and the
+    # "is this branch actually ahead" check. It must never resolve to the
+    # checked-out branch, because inside a posse worktree that is the task
+    # branch - a member could otherwise add a manifest (or delete one) on its
+    # own branch and reconfigure the gate that judges it.
+    #
+    # Preference order: the remote's default branch (authoritative, and not
+    # reachable by editing files in a worktree), then - for a repo with no
+    # remote at all - the local default branch by convention. Never a fallback
+    # to HEAD: an unresolvable anchor returns Ref = $null, which callers must
+    # treat as "cannot verify", not as "nothing to check".
+    function New-Anchor([string]$Branch, [string]$Ref, [string]$Source) {
+        [pscustomobject]@{ Branch = $Branch; Ref = $Ref; Source = $Source }
+    }
+
+    $ref = git -C $RepoPath symbolic-ref --short refs/remotes/origin/HEAD 2>$null
+    if ($LASTEXITCODE -eq 0 -and $ref) {
+        $b = ((($ref -join '').Trim()) -replace '^origin/', '')
+        if ($b) { return New-Anchor $b "refs/remotes/origin/$b" 'origin/HEAD' }
+    }
+    foreach ($b in 'main', 'master') {
+        if (Test-GitRef $RepoPath "refs/remotes/origin/$b") {
+            return New-Anchor $b "refs/remotes/origin/$b" "remote-tracking origin/$b"
+        }
+    }
+    # No remote-tracking default (no remote configured, or nothing fetched).
+    # main/master are safe to accept even when checked out here: task branches
+    # carry the configured branch prefix, so they are never named main/master.
+    foreach ($b in 'main', 'master') {
+        if (Test-GitRef $RepoPath "refs/heads/$b") {
+            return New-Anchor $b "refs/heads/$b" "local branch $b"
+        }
+    }
+    New-Anchor $null $null 'unresolved'
+}
+
+function Get-DefaultBranch([string]$RepoPath) {
+    # Short name of the default branch, or $null when it cannot be resolved.
+    (Resolve-DefaultRef $RepoPath).Branch
+}
+
+function Get-AutoValidateCommands([string]$Worktree, [string]$DefaultRef) {
+    # Detect validation commands for the repo. Manifests are read from the
+    # default branch's ref via git show, never from the task branch or the
+    # working tree, so a posse member's branch cannot reconfigure its own gate.
+    if (-not $DefaultRef) { $DefaultRef = (Resolve-DefaultRef $Worktree).Ref }
+    if (-not $DefaultRef) { return @() }  # no trust anchor: detect nothing
     function Show-DefaultFile([string]$Path) {
-        $content = git -C $Worktree show "origin/${branch}:$Path" 2>$null
+        $content = git -C $Worktree show "${DefaultRef}:$Path" 2>$null
         if ($LASTEXITCODE -eq 0) { $content -join "`n" } else { $null }
     }
 
@@ -88,7 +136,7 @@ function Get-AutoValidateCommands([string]$Worktree) {
     if (Show-DefaultFile 'Cargo.toml') { $commands += 'cargo test' }
     if (Show-DefaultFile 'go.mod') { $commands += 'go test ./...' }
 
-    $tree = git -C $Worktree ls-tree -r --name-only "origin/$branch" 2>$null
+    $tree = git -C $Worktree ls-tree -r --name-only $DefaultRef 2>$null
     if ($LASTEXITCODE -eq 0 -and $tree) {
         if ($tree | Where-Object { $_ -match '\.(sln|csproj)$' } | Select-Object -First 1) {
             $commands += 'dotnet test'
@@ -101,16 +149,6 @@ function Get-AutoValidateCommands([string]$Worktree) {
 
     # No comma-wrap: callers re-wrap with @(), which would nest a wrapped array
     @($commands | Select-Object -Unique)
-}
-
-function Get-DefaultBranch([string]$RepoPath) {
-    $ref = git -C $RepoPath symbolic-ref --short refs/remotes/origin/HEAD 2>$null
-    if ($LASTEXITCODE -eq 0 -and $ref) { return ($ref -replace '^origin/', '') }
-    foreach ($b in 'main', 'master') {
-        git -C $RepoPath show-ref --verify --quiet "refs/remotes/origin/$b" 2>$null
-        if ($LASTEXITCODE -eq 0) { return $b }
-    }
-    (git -C $RepoPath rev-parse --abbrev-ref HEAD).Trim()
 }
 
 function New-TaskId {

@@ -47,6 +47,7 @@ The Deputy will:
 
 - **Delivered PRs** carry a validation evidence file at `.deputy/evidence/<taskId>.md` - proof of what was run and that it passed, pinned to the validated commit.
 - **Validation is automatic**: the gate detects `npm test`/`lint`, `cargo test`, `go test`, `dotnet test`, or `pytest` from the repo's default branch. To pin exact commands or opt a repo out, edit `config\projects.json` (see README).
+- **A gate with nothing to run is not a pass**: if your repo has no detectable test command, the Deputy reports the work as *unverified* and refuses to publish until you pin commands in `config\projects.json` or explicitly approve publishing unvalidated work.
 - **Failures are normal output**: if a member gets stuck or its work fails the gate, the Deputy diagnoses, retries with better instructions, or escalates to you with its analysis.
 - **Security posture**: posse members run unattended (`bypassPermissions` by default) inside their worktrees. Point Deputy at repos you trust, on a machine you trust. For least privilege, see "Permissions for posse members" in the README.
 
