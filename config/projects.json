@@ -3,5 +3,14 @@
     "delivery": "no-mistakes",
     "validate": []
   },
-  "projects": []
+  "projects": [
+    {
+      "match": "deputy",
+      "delivery": "no-mistakes",
+      "validate": [
+        "pwsh -NoProfile -File tools/Invoke-Lint.ps1",
+        "pwsh -NoProfile -File tools/Invoke-Tests.ps1"
+      ]
+    }
+  ]
 }

@@ -10,7 +10,12 @@ branch (PR-viewable) and the task is marked validation=passed, which is what
 authorizes dep-publish.ps1. On a red run the failure summary is recorded in
 task state for the respawn briefing.
 
-Exit codes: 0 = passed, 1 = failed.
+A gate with no commands is neither: it proves nothing, so it is recorded as
+validation=unverified and dep-publish.ps1 refuses it unless the Sheriff
+approves -AllowUnverified. Fix an unverified repo by pinning its commands in
+config\projects.json.
+
+Exit codes: 0 = passed, 1 = failed, 2 = unverified (nothing ran).
 #>
 [CmdletBinding()]
 param(
@@ -26,22 +31,21 @@ if ($task.kind -ne 'ship') { throw "dep-validate only applies to ship tasks; $Id
 if (-not (Test-Path $task.worktree)) { throw "Worktree gone: $($task.worktree). Was the task already returned?" }
 
 $wt = $task.worktree
+
+# A re-run must not inherit the previous run's verdict or its explanation
+foreach ($stale in 'validationNote', 'validationError') { Set-TaskField $task $stale $null }
+
+$anchor = Resolve-DefaultRef $wt
 $projProfile = Get-ProjectProfile $task.repo
 $commands = @($projProfile.validate)
 $gateSource = 'configured in deputy config\projects.json'
 if ($commands.Count -eq 0) {
-    $defaultBranchName = Get-DefaultBranch $wt
-    $commands = @(Get-AutoValidateCommands $wt)
-    $gateSource = "auto-detected from origin/$defaultBranchName manifests"
+    $commands = @(Get-AutoValidateCommands $wt $anchor.Ref)
+    $gateSource = if ($anchor.Ref) {
+        "auto-detected from manifests on $($anchor.Ref) ($($anchor.Source))"
+    }
+    else { 'auto-detection had no trusted default branch to read manifests from' }
 }
-if ($commands.Count -eq 0) {
-    Write-Output 'no validation commands configured or detectable for this repo; nothing to gate'
-    Set-TaskField $task 'validation' 'passed'
-    Set-TaskField $task 'validationNote' 'no gate commands configured or detectable'
-    Write-TaskState $task
-    exit 0
-}
-Write-Output "gate ($gateSource): $($commands -join '; ')"
 
 function Deny-Validation([string]$Reason) {
     Set-TaskField $task 'validation' 'failed'
@@ -51,7 +55,22 @@ function Deny-Validation([string]$Reason) {
     exit 1
 }
 
-# Preconditions: the member must have left a clean, committed branch
+function Deny-Verification([string]$Reason) {
+    # Nothing ran, so nothing is proven. Recorded as its own outcome: a
+    # supervising agent must not be able to read this as a pass.
+    Set-TaskField $task 'validation' 'unverified'
+    Set-TaskField $task 'validationNote' $Reason
+    Write-TaskState $task
+    Write-Output "VALIDATION UNVERIFIED: $Reason"
+    Write-Output 'The gate ran nothing, so nothing about this branch is verified. This is NOT a pass.'
+    Write-Output "Fix: pin this repo's gate commands in config\projects.json, then re-run dep-validate.ps1 $Id."
+    Write-Output 'dep-publish.ps1 refuses an unverified task unless the Sheriff approves -AllowUnverified.'
+    exit 2
+}
+
+# Preconditions: the member must have left a clean, committed branch. Checked
+# before the gate contents, because a dirty or empty branch is a real failure
+# whether or not there are commands to run.
 $currentBranch = (git -C $wt rev-parse --abbrev-ref HEAD).Trim()
 if ($currentBranch -ne $task.branch) {
     Deny-Validation "worktree is on '$currentBranch', expected branch '$($task.branch)'"
@@ -60,10 +79,30 @@ $dirty = git -C $wt status --porcelain
 if ($dirty) {
     Deny-Validation ("working tree is dirty (uncommitted changes): " + (Limit-Text ($dirty -join '; ') 200))
 }
-$defaultBranch = Get-DefaultBranch $wt
-$commits = git -C $wt log "origin/$defaultBranch..HEAD" --oneline 2>$null
-if (-not $commits) {
-    Deny-Validation "no commits on '$($task.branch)' ahead of origin/$defaultBranch"
+if ($anchor.Ref) {
+    $commits = git -C $wt log "$($anchor.Ref)..HEAD" --oneline 2>$null
+    if (-not $commits) {
+        Deny-Validation "no commits on '$($task.branch)' ahead of $($anchor.Ref)"
+    }
+}
+
+if ($commands.Count -eq 0) {
+    if ($anchor.Ref) {
+        Deny-Verification ("no gate commands are configured for this repo in config\projects.json, " +
+            "and none could be detected from the manifests on $($anchor.Ref)")
+    }
+    else {
+        Deny-Verification ('no gate commands are configured for this repo in config\projects.json, ' +
+            'and no trusted default branch could be resolved (no origin/HEAD, no origin/main or ' +
+            'origin/master, no local main or master), so manifests could not be read at all')
+    }
+}
+Write-Output "gate ($gateSource): $($commands -join '; ')"
+$anchorWarning = $null
+if (-not $anchor.Ref) {
+    $anchorWarning = 'could not resolve a trusted default branch for this repo, so the branch was ' +
+        'not checked for being ahead of the default branch'
+    Write-Output "WARNING: $anchorWarning"
 }
 
 # Environmental setup: JS gates need node_modules in the (possibly recycled)
@@ -124,6 +163,7 @@ $lines = @(
     "- validated at: $(Get-Date -Format o)"
     "- gate source: $gateSource"
     "- verdict: $($allPassed ? 'PASSED' : 'FAILED')"
+    $(if ($anchorWarning) { "- warning: $anchorWarning" })
     ''
     '| command | exit | result |'
     '| --- | --- | --- |'

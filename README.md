@@ -88,8 +88,8 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw] [-Follow]` | Human-readable log tail (or raw stream-json); `-Follow` live-tails |
 | `dep-posse.ps1 result <taskId>` | Final report text, scout report path, PR URL |
 | `dep-posse.ps1 kill <taskId>` | Stop a runaway member's process tree (lease kept for inspection) |
-| `dep-validate.ps1 <taskId>` | Run the no-mistakes gate in the task's worktree; commits evidence on pass |
-| `dep-publish.ps1 <taskId>` | Push the branch and open the PR; refuses unless validation passed |
+| `dep-validate.ps1 <taskId>` | Run the no-mistakes gate in the task's worktree; commits evidence on pass. Exit 0 passed, 1 failed, 2 unverified (no commands to run) |
+| `dep-publish.ps1 <taskId> [-AllowUnverified]` | Push the branch and open the PR; refuses a failed or unverified gate. `-AllowUnverified` is the Sheriff's opt-in for repos with no gate, and labels the PR as never validated |
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <taskId> [-Method squash\|merge\|rebase]` | PR operations via gh (merge defaults to squash; branch cleanup happens in dep-return) |
 | `dep-return.ps1 <taskId>` | Kill stragglers, return the lease (guarded by `--if-lease-id`), delete the task branch, archive state |
 | `dep-dashboard.ps1 [-Id <taskId>] [-Tail n]` | Live posse view in Windows Terminal: auto-refreshing status tab + a live-tail tab per active member. Re-running adds new members' tabs to the same window; `-Id` opens one task (active or archived) |
@@ -107,7 +107,7 @@ Inside a Deputy session, the `/dashboard` skill (`.claude\skills\dashboard`) ope
 
 Captured command output in the evidence is redacted on a best-effort basis (common `key=value` secrets, connection-string credentials, well-known token shapes) before it is written anywhere. Redaction is pattern-based and cannot catch everything - test suites should not print secrets.
 
-**Gate commands are auto-detected** unless configured. Detection reads manifests from `origin/<default-branch>` via `git show` - never from the task branch, so a branch cannot reconfigure its own gate:
+**Gate commands are auto-detected** unless configured. Detection reads manifests with `git show` from the repo's default branch - never from the task branch or the worktree's files, so a branch cannot reconfigure its own gate:
 
 | Found on default branch | Gate command |
 | --- | --- |
@@ -117,7 +117,14 @@ Captured command output in the evidence is redacted on a best-effort basis (comm
 | `*.sln` / `*.csproj` | `dotnet test` |
 | `pytest.ini` or `[tool.pytest]` in `pyproject.toml` | `pytest` |
 
-If nothing is detected the gate passes with a note in task state - you still get the publish separation, just no test run.
+The default branch is resolved as `origin/HEAD`, then `origin/main` / `origin/master`, then - for a repo with no remote configured - the local `main` / `master`. Every candidate must actually exist: a stale `origin/HEAD` left by a default branch that was renamed or deleted upstream falls through to the next candidate, and the staleness is reported in the gate's anchor source. Never the checked-out branch, which inside a posse worktree is the task branch. A repo with no remote and an unconventional default branch name resolves to nothing at all; pin its commands in `config\projects.json`.
+
+The gate's *command list* is Deputy-controlled; the test code those commands execute lives on the task branch, and is reviewed on the PR like any other change.
+
+**An empty gate is not a pass.** If nothing is configured and nothing is detected, `dep-validate.ps1` records `validation=unverified`, exits 2, and says so loudly - a gate that gates nothing must not read as green. `dep-publish.ps1` refuses an unverified task the same way it refuses a failed one. Two ways forward:
+
+1. Pin the repo's gate commands in `config\projects.json` and re-run `dep-validate.ps1` - fixes the repo for good.
+2. `dep-publish.ps1 <taskId> -AllowUnverified` - the Sheriff's explicit opt-in for a repo with genuinely nothing to run. The PR body then states in plain text that no tests and no lint were executed against the branch, and the task records `publishedUnverified`.
 
 `config\projects.json` overrides detection per repo - pin exact commands, or opt a repo out to `direct-pr` (the member pushes and opens the PR itself; needs `gh` access):
 
@@ -170,15 +177,26 @@ Two traps worth knowing:
 ```
 bin\        toolbelt (dep-spawn, dep-watch, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-dashboard, dep-lib)
 config\     deputy.json, projects.json
+tools\      Deputy's own gate: Invoke-Lint.ps1, Invoke-Tests.ps1
+tests\      Pester suite for the toolbelt
 state\      one json per task, wake-queue.jsonl, scout reports, validation records, archive\   (runtime)
 logs\       <taskId>.jsonl stream logs + stderr                                                (runtime)
 AGENTS.md   the Deputy's operating contract (harness-neutral)
 CLAUDE.md   loads AGENTS.md into Claude Code sessions
 ONBOARDING.md   first 10 minutes for new users
-PSScriptAnalyzerSettings.psd1   lint gate for bin\
+PSScriptAnalyzerSettings.psd1   lint gate settings
 ```
 
-Lint gate: `Invoke-ScriptAnalyzer -Path bin\*.ps1 -Settings PSScriptAnalyzerSettings.psd1` (bin\ is kept clean).
+## Working on Deputy itself
+
+Deputy gates its own repo with the same mechanism it applies to everything else: `config\projects.json` pins `match: deputy` to the two commands below, so a posse member working on Deputy is validated rather than waved through.
+
+```powershell
+pwsh -NoProfile -File tools\Invoke-Lint.ps1    # PSScriptAnalyzer over bin\, tools\, tests\ (exit 1 on any finding)
+pwsh -NoProfile -File tools\Invoke-Tests.ps1   # Pester suite in tests\ (-Filter dep-lib to narrow)
+```
+
+Both need modules: `Install-Module PSScriptAnalyzer, Pester -Scope CurrentUser` (Pester 5+). The tests build throwaway git repos and throwaway Deputy installs under `$env:TEMP` - no network, and they never touch the real `state\` or `logs\`.
 
 ## Credits
 
