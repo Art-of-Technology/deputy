@@ -120,6 +120,19 @@ Describe 'dep-validate.ps1 preconditions' {
         (Get-TestTaskState -InstallRoot $s.Install -Id $s.Id).validation | Should -Be 'failed'
     }
 
+    It 'does not deny real commits when origin/HEAD is dangling' {
+        # A stale origin/HEAD used to become the anchor unchecked, so the
+        # ahead-of-default check compared against a missing ref, found nothing,
+        # and denied work that was perfectly fine.
+        $s = New-Scenario -Validate @('exit 0') -RepoOptions @{ WithRemote = $true
+            DanglingOriginHead = $true
+        }
+        $run = Invoke-DeputyScript -InstallRoot $s.Install -Script 'dep-validate.ps1' -Arguments @($s.Id)
+        $run.Output | Should -Not -Match 'no commits on'
+        $run.ExitCode | Should -Be 0
+        (Get-TestTaskState -InstallRoot $s.Install -Id $s.Id).validation | Should -Be 'passed'
+    }
+
     It 'fails a branch with no commits ahead of the default branch' {
         $s = New-Scenario -Validate @('exit 0')
         git -C $s.Repo reset -q --hard main

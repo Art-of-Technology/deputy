@@ -83,14 +83,27 @@ function Resolve-DefaultRef([string]$RepoPath) {
         [pscustomobject]@{ Branch = $Branch; Ref = $Ref; Source = $Source }
     }
 
+    # Set when origin/HEAD names a ref that is not there (the default branch was
+    # renamed or deleted since the clone). Falling through to the candidates
+    # below is right: the repo still has a real default branch, and returning an
+    # unverified ref would make callers deny good work with "no commits ahead of
+    # <missing ref>". But it is not silent either - the staleness rides along in
+    # the anchor's Source, which dep-validate reports, so the repo-level fix
+    # (git remote set-head origin -a) is visible rather than guessed at.
+    $stale = ''
     $ref = git -C $RepoPath symbolic-ref --short refs/remotes/origin/HEAD 2>$null
     if ($LASTEXITCODE -eq 0 -and $ref) {
         $b = ((($ref -join '').Trim()) -replace '^origin/', '')
-        if ($b) { return New-Anchor $b "refs/remotes/origin/$b" 'origin/HEAD' }
+        if ($b) {
+            if (Test-GitRef $RepoPath "refs/remotes/origin/$b") {
+                return New-Anchor $b "refs/remotes/origin/$b" 'origin/HEAD'
+            }
+            $stale = "stale origin/HEAD (origin/$b is missing), fell back to "
+        }
     }
     foreach ($b in 'main', 'master') {
         if (Test-GitRef $RepoPath "refs/remotes/origin/$b") {
-            return New-Anchor $b "refs/remotes/origin/$b" "remote-tracking origin/$b"
+            return New-Anchor $b "refs/remotes/origin/$b" "${stale}remote-tracking origin/$b"
         }
     }
     # No remote-tracking default (no remote configured, or nothing fetched).
@@ -98,10 +111,10 @@ function Resolve-DefaultRef([string]$RepoPath) {
     # carry the configured branch prefix, so they are never named main/master.
     foreach ($b in 'main', 'master') {
         if (Test-GitRef $RepoPath "refs/heads/$b") {
-            return New-Anchor $b "refs/heads/$b" "local branch $b"
+            return New-Anchor $b "refs/heads/$b" "${stale}local branch $b"
         }
     }
-    New-Anchor $null $null 'unresolved'
+    New-Anchor $null $null "${stale}unresolved"
 }
 
 function Get-DefaultBranch([string]$RepoPath) {

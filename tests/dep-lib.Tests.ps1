@@ -50,6 +50,46 @@ Describe 'Resolve-DefaultRef' {
         $anchor.Ref | Should -Be 'refs/remotes/origin/master'
     }
 
+    It 'falls through to a ref that exists when origin/HEAD is dangling' {
+        # A stale origin/HEAD (default branch renamed or deleted upstream) named
+        # a missing ref, and the gate then denied good work with "no commits
+        # ahead of refs/remotes/origin/<gone>".
+        $repo = New-Case @{ WithRemote = $true; DanglingOriginHead = $true
+            TaskBranch = $script:TASK_BRANCH
+        }
+        (git -C $repo symbolic-ref --short refs/remotes/origin/HEAD).Trim() | Should -Be 'origin/renamed-away'
+        $anchor = Resolve-DefaultRef $repo
+        $anchor.Ref | Should -Be 'refs/remotes/origin/main'
+        $anchor.Branch | Should -Be 'main'
+        Test-GitRef $repo $anchor.Ref | Should -BeTrue
+    }
+
+    It 'reports the stale origin/HEAD in the anchor source rather than hiding it' {
+        $repo = New-Case @{ WithRemote = $true; DanglingOriginHead = $true
+            TaskBranch = $script:TASK_BRANCH
+        }
+        (Resolve-DefaultRef $repo).Source | Should -Match 'stale origin/HEAD \(origin/renamed-away is missing\)'
+    }
+
+    It 'never returns a ref that does not exist' {
+        foreach ($opts in @(
+                @{ TaskBranch = $script:TASK_BRANCH; WithRemote = $true },
+                @{ TaskBranch = $script:TASK_BRANCH; WithRemote = $true; DanglingOriginHead = $true },
+                @{ TaskBranch = $script:TASK_BRANCH; WithRemote = $true; NoOriginHead = $true },
+                @{ TaskBranch = $script:TASK_BRANCH; DefaultBranch = 'master'
+                    WithRemote = $true; DanglingOriginHead = $true
+                },
+                @{ TaskBranch = $script:TASK_BRANCH; DefaultBranch = 'trunk'
+                    WithRemote = $true; DanglingOriginHead = $true
+                },
+                @{ TaskBranch = $script:TASK_BRANCH }
+            )) {
+            $repo = New-Case $opts
+            $anchor = Resolve-DefaultRef $repo
+            if ($anchor.Ref) { Test-GitRef $repo $anchor.Ref | Should -BeTrue }
+        }
+    }
+
     It 'falls back to the local default branch when there is no remote' {
         $repo = New-Case @{ TaskBranch = $script:TASK_BRANCH }
         (git -C $repo remote) | Should -BeNullOrEmpty

@@ -41,4 +41,21 @@ $config.Output.Verbosity = 'Detailed'
 $result = Invoke-Pester -Configuration $config
 Write-Output ("Pester {0}: {1} passed, {2} failed, {3} skipped" -f
     $pester.Version, $result.PassedCount, $result.FailedCount, $result.SkippedCount)
-exit ($result.FailedCount -gt 0 ? 1 : 0)
+
+# FailedCount alone is not enough. A run that dies before any test executes - a
+# parse error in a .Tests.ps1 file, a throwing top-level BeforeAll, any failed
+# container - leaves FailedCount at 0 while Result is 'Failed', and a run that
+# discovers no tests at all reports 'Passed' with nothing behind it. Judge every
+# condition, and name the one that tripped so the reason is in the gate output.
+$reasons = @()
+if ($result.FailedCount -gt 0) { $reasons += "$($result.FailedCount) test(s) failed" }
+if ($result.FailedContainersCount -gt 0) {
+    $reasons += "$($result.FailedContainersCount) container(s) failed (discovery or top-level setup error)"
+}
+if ($result.Result -ne 'Passed') { $reasons += "Pester run result is '$($result.Result)'" }
+if ($result.TotalCount -eq 0) { $reasons += 'no tests ran, so nothing is verified' }
+if ($reasons.Count -gt 0) {
+    Write-Output ("Test gate FAILED: " + ($reasons -join '; '))
+    exit 1
+}
+exit 0

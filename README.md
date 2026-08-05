@@ -117,7 +117,7 @@ Captured command output in the evidence is redacted on a best-effort basis (comm
 | `*.sln` / `*.csproj` | `dotnet test` |
 | `pytest.ini` or `[tool.pytest]` in `pyproject.toml` | `pytest` |
 
-The default branch is resolved as `origin/HEAD`, then `origin/main` / `origin/master`, then - for a repo with no remote configured - the local `main` / `master`. Never the checked-out branch, which inside a posse worktree is the task branch. A repo with no remote and an unconventional default branch name resolves to nothing at all; pin its commands in `config\projects.json`.
+The default branch is resolved as `origin/HEAD`, then `origin/main` / `origin/master`, then - for a repo with no remote configured - the local `main` / `master`. Every candidate must actually exist: a stale `origin/HEAD` left by a default branch that was renamed or deleted upstream falls through to the next candidate, and the staleness is reported in the gate's anchor source. Never the checked-out branch, which inside a posse worktree is the task branch. A repo with no remote and an unconventional default branch name resolves to nothing at all; pin its commands in `config\projects.json`.
 
 The gate's *command list* is Deputy-controlled; the test code those commands execute lives on the task branch, and is reviewed on the PR like any other change.
 

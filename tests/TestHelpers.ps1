@@ -50,6 +50,9 @@ function New-TestRepo {
         [switch]$WithRemote,
         # Skip refs/remotes/origin/HEAD, as a shallow or older clone might.
         [switch]$NoOriginHead,
+        # Point origin/HEAD at a branch that is not there, as a clone whose
+        # default branch was since renamed or deleted upstream would have.
+        [switch]$DanglingOriginHead,
         [string]$TaskBranch,
         [hashtable]$TaskFiles = @{},
         [string[]]$TaskDeletes = @()
@@ -76,6 +79,10 @@ function New-TestRepo {
         if ($NoOriginHead) {
             # push -u does not create origin/HEAD, but be explicit about it
             & git -C $Path symbolic-ref --delete refs/remotes/origin/HEAD 2>&1 | Out-Null
+        }
+        elseif ($DanglingOriginHead) {
+            Invoke-Git @('-C', $Path, 'symbolic-ref', 'refs/remotes/origin/HEAD',
+                'refs/remotes/origin/renamed-away')
         }
         else {
             Invoke-Git @('-C', $Path, 'remote', 'set-head', 'origin', '-a')
