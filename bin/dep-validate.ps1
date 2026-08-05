@@ -204,7 +204,7 @@ if ($allPassed) {
     $evidenceFile = Join-Path $evidenceDir "$Id.md"
     Set-Content -Path $evidenceFile -Value $evidence -Encoding utf8
     git -C $wt add '.deputy/evidence' 2>&1 | Out-Null
-    git -C $wt commit -m "deputy: validation evidence for $Id" 2>&1 | Out-Null
+    git -C $wt commit -m (New-EvidenceCommitMessage $Id) 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { Deny-Validation 'failed to commit validation evidence' }
 
     Set-TaskField $task 'validation' 'passed'

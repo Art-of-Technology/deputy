@@ -231,6 +231,65 @@ Describe 'Format-PrTitle' {
         Format-PrTitle '' | Should -Be ''
         Format-PrTitle $null | Should -Be ''
     }
+
+    Context 'sanitising a title that came from untrusted text' {
+        # The title can now be a posse member's commit subject, and the Deputy
+        # and Sheriff read it in a terminal. None of this is reachable through
+        # the briefing path, but Format-PrTitle guards both.
+        BeforeAll {
+            $script:ESC = [char]0x1B
+        }
+
+        It 'removes an ANSI colour sequence whole, leaving no bracketed residue' {
+            $title = Format-PrTitle "Fix login$($script:ESC)[31m bug$($script:ESC)[0m"
+            $title | Should -Be 'Fix login bug'
+            $title | Should -Not -Match '\[3?1?m'
+        }
+
+        It 'removes a cursor-control sequence that would overwrite what was printed' {
+            Format-PrTitle "Harmless title$($script:ESC)[2K$($script:ESC)[1A gate passed" |
+                Should -Be 'Harmless title gate passed'
+        }
+
+        It 'removes an OSC sequence along with its payload' {
+            Format-PrTitle "Fix bug$($script:ESC)]0;window title$([char]0x07) done" |
+                Should -Be 'Fix bug done'
+        }
+
+        It 'removes control characters and invisible format characters' {
+            # A bidi override makes a title read as something other than what it
+            # says; a zero-width space and a soft hyphen hide a word boundary
+            # that is not really there. All are deleted rather than spaced out,
+            # because none of them was ever a space.
+            $title = Format-PrTitle ("Fix bug$([char]0x07) with$([char]0x202E)reversed$([char]0x202C) " +
+                "and$([char]0x200B)hidden$([char]0x00AD)text")
+            $title | Should -Be 'Fix bug withreversed andhiddentext'
+            $title | Should -Not -Match '[\p{Cc}\p{Cf}]'
+        }
+
+        It 'keeps a newline in the source from splitting the headline' {
+            Format-PrTitle "Fix the bug`r`n`r`nBody text pretending to be a title" |
+                Should -Be 'Fix the bug Body text pretending to be a title'
+        }
+
+        It 'sanitises before the length cut, so escapes cannot eat the budget' {
+            $noisy = "Fix the validation gate so it cannot$($script:ESC)[31m silently degrade into a " +
+                "vacuous pass$($script:ESC)[0m that nobody ever notices"
+            Format-PrTitle $noisy |
+                Should -Be 'Fix the validation gate so it cannot silently degrade into a vacuous pass...'
+        }
+
+        It 'leaves ordinary punctuation and markup characters alone' {
+            # GitHub renders a PR title as plain text, so backticks are literal
+            # and a legitimate title needs them.
+            Format-PrTitle 'Fix `Get-PrTitle` so it handles a $var and 100% of *cases*' |
+                Should -Be 'Fix `Get-PrTitle` so it handles a $var and 100% of *cases*'
+        }
+
+        It 'returns an empty string for text that is nothing but escapes' {
+            Format-PrTitle "$($script:ESC)[31m$([char]0x202E)$([char]0x200B)" | Should -Be ''
+        }
+    }
 }
 
 Describe 'Get-PrTitle' {
@@ -251,8 +310,10 @@ Describe 'Get-PrTitle' {
     }
 
     It 'ignores the deputy evidence commit when counting the branch commits' {
+        # Built with the same one definition dep-validate.ps1 commits with, so
+        # the exclusion cannot drift away from the subject it has to match.
         $repo = New-Case @{ TaskBranch = $script:TASK_BRANCH }
-        Add-Commit $repo 'deputy: validation evidence for posse-20260101-120000-abc'
+        Add-Commit $repo (New-EvidenceCommitMessage 'posse-20260101-120000-abc')
         Get-PrTitle -Worktree $repo -DefaultRef 'refs/heads/main' -Briefing $script:BRIEFING |
             Should -Be 'task work'
     }
@@ -269,6 +330,30 @@ Describe 'Get-PrTitle' {
         $anchor = Resolve-DefaultRef $repo
         $anchor.Ref | Should -BeNullOrEmpty
         Get-PrTitle -Worktree $repo -DefaultRef $anchor.Ref -Briefing $script:BRIEFING |
+            Should -Be 'Surface the anchor provenance regardless of how the gate commands...'
+    }
+
+    # These go through git's stdout, so they stay in the ASCII range: a
+    # non-ASCII character's UTF-8 bytes decode by the console encoding, which
+    # varies by machine. The full character classes are covered in the
+    # Format-PrTitle tests above, where no encoding boundary is crossed.
+    It 'sanitises a member commit subject before it becomes the title' {
+        # The trust shift this guards: the subject is the member's text, and the
+        # derived title is read in the Sheriff's terminal.
+        $repo = New-Case @{ TaskBranch = $script:TASK_BRANCH }
+        Invoke-Git @('-C', $repo, 'reset', '-q', '--soft', 'main')
+        Add-Commit $repo ("Fix the login bug$([char]0x1B)[2K$([char]0x1B)[32m validated by the " +
+            "Sheriff$([char]0x1B)[0m$([char]0x07)")
+        $title = Get-PrTitle -Worktree $repo -DefaultRef 'refs/heads/main' -Briefing $script:BRIEFING
+        $title | Should -Be 'Fix the login bug validated by the Sheriff'
+        $title | Should -Not -Match '[\p{Cc}\p{Cf}]'
+    }
+
+    It 'falls back to the briefing when the subject sanitises away to nothing' {
+        $repo = New-Case @{ TaskBranch = $script:TASK_BRANCH }
+        Invoke-Git @('-C', $repo, 'reset', '-q', '--soft', 'main')
+        Add-Commit $repo "$([char]0x1B)[31m$([char]0x1B)[0m$([char]0x07)"
+        Get-PrTitle -Worktree $repo -DefaultRef 'refs/heads/main' -Briefing $script:BRIEFING |
             Should -Be 'Surface the anchor provenance regardless of how the gate commands...'
     }
 

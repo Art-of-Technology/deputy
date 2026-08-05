@@ -295,7 +295,20 @@ function Format-PrTitle([string]$Text, [int]$Max = 80) {
     # to be corrected by hand: break on a word boundary instead, and shed
     # whatever the break leaves dangling.
     if (-not $Text) { return '' }
-    $t = (($Text -replace '\s+', ' ').Trim()) -replace '[\s.,;:]+$', ''
+    # The title can come from a posse member's commit subject (see Get-PrTitle),
+    # so treat the text as untrusted display data: the Deputy and the Sheriff
+    # both read it in a terminal. Escape sequences go first, whole, so that
+    # dropping the ESC does not leave its parameters behind as visible noise -
+    # a CSI sequence can recolour or overwrite what is printed, and an OSC one
+    # carries a payload of its own.
+    $t = $Text -replace '\x1B\[[0-9;:<=>?]*[ -/]*[@-~]', ''
+    $t = $t -replace '\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)?', ''
+    # Whitespace collapses before the control strip, so tab and newline survive
+    # as spaces. What is left to drop is invisible: remaining control
+    # characters, and format characters such as the bidi overrides that make a
+    # title read as something other than what it says.
+    $t = ($t -replace '\s+', ' ') -replace '[\p{Cc}\p{Cf}]', ''
+    $t = $t.Trim() -replace '[\s.,;:]+$', ''
     if ($t.Length -le $Max) { return $t }
 
     $ellipsis = '...'
@@ -324,6 +337,22 @@ function Format-PrTitle([string]$Text, [int]$Max = 80) {
     $cut + $ellipsis
 }
 
+# The subject of Deputy's own validation-evidence commit, defined in one place
+# because two sites depend on it agreeing: dep-validate.ps1 writes the commit,
+# and Get-PrTitle excludes it when counting the member's own commits. Kept as
+# separate copies, an edit to one would leave the exclusion silently not
+# matching, and the evidence commit's subject would become the PR title.
+$script:EvidenceCommitPrefix = 'deputy: validation evidence'
+
+function New-EvidenceCommitMessage([string]$Id) {
+    "$script:EvidenceCommitPrefix for $Id"
+}
+
+function Test-EvidenceCommitSubject([string]$Subject) {
+    if (-not $Subject) { return $false }
+    $Subject.StartsWith($script:EvidenceCommitPrefix, [StringComparison]::Ordinal)
+}
+
 function Get-PrTitle {
     <#
     .SYNOPSIS
@@ -335,16 +364,20 @@ function Get-PrTitle {
     branch carries several commits no single subject covers them, so the
     briefing is the honest source there. Deputy's own evidence commit is not
     the member's work and never counts as the branch's commit.
+
+    The subject is a posse member's text, so it is display data the Sheriff has
+    not written: Format-PrTitle sanitises it. A subject left empty by that is no
+    headline at all, and the briefing is used instead.
     #>
     param([string]$Worktree, [string]$DefaultRef, [string]$Briefing)
-    $source = $null
+    $title = ''
     if ($Worktree -and $DefaultRef) {
         $subjects = @(git -C $Worktree log "$DefaultRef..HEAD" --format=%s 2>$null |
-            Where-Object { $_ -and $_ -notmatch '^deputy: validation evidence' })
-        if ($subjects.Count -eq 1) { $source = $subjects[0] }
+            Where-Object { $_ -and -not (Test-EvidenceCommitSubject $_) })
+        if ($subjects.Count -eq 1) { $title = Format-PrTitle $subjects[0] }
     }
-    if (-not $source) { $source = Get-FirstSentence $Briefing }
-    Format-PrTitle $source
+    if (-not $title) { $title = Format-PrTitle (Get-FirstSentence $Briefing) }
+    $title
 }
 
 function Remove-Secret([string]$Text) {
