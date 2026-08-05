@@ -251,8 +251,10 @@ Describe 'Get-PrTitle' {
     }
 
     It 'ignores the deputy evidence commit when counting the branch commits' {
+        # Built with the same one definition dep-validate.ps1 commits with, so
+        # the exclusion cannot drift away from the subject it has to match.
         $repo = New-Case @{ TaskBranch = $script:TASK_BRANCH }
-        Add-Commit $repo 'deputy: validation evidence for posse-20260101-120000-abc'
+        Add-Commit $repo (New-EvidenceCommitMessage 'posse-20260101-120000-abc')
         Get-PrTitle -Worktree $repo -DefaultRef 'refs/heads/main' -Briefing $script:BRIEFING |
             Should -Be 'task work'
     }

@@ -82,6 +82,21 @@ Describe 'dep-validate.ps1 with a configured gate' {
         (git -C $s.Repo show "HEAD:.deputy/evidence/$($s.Id).md") -join "`n" | Should -Match 'verdict: PASSED'
     }
 
+    It 'writes evidence with the subject Get-PrTitle excludes from the PR title' {
+        # Two sites have to agree on the evidence-commit subject: the commit
+        # dep-validate.ps1 writes here, and the exclusion Get-PrTitle applies in
+        # dep-publish.ps1. Run the real script and derive a real title, so a
+        # future edit that re-hardcodes either one fails here instead of quietly
+        # making the evidence commit's subject the PR title.
+        . (Join-Path $script:sourceRoot 'bin' 'dep-lib.ps1')
+        $s = New-Scenario -Validate @('exit 0')
+        $run = Invoke-DeputyScript -InstallRoot $s.Install -Script 'dep-validate.ps1' -Arguments @($s.Id)
+        $run.ExitCode | Should -Be 0
+        (git -C $s.Repo log -1 --format=%s) | Should -Be (New-EvidenceCommitMessage $s.Id)
+        Get-PrTitle -Worktree $s.Repo -DefaultRef 'refs/heads/main' -Briefing 'A briefing sentence. And more.' |
+            Should -Be 'task work'
+    }
+
     It 'fails when a command exits non-zero' {
         $s = New-Scenario -Validate @('Write-Output boom; exit 7')
         $run = Invoke-DeputyScript -InstallRoot $s.Install -Script 'dep-validate.ps1' -Arguments @($s.Id)

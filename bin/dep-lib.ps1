@@ -324,6 +324,22 @@ function Format-PrTitle([string]$Text, [int]$Max = 80) {
     $cut + $ellipsis
 }
 
+# The subject of Deputy's own validation-evidence commit, defined in one place
+# because two sites depend on it agreeing: dep-validate.ps1 writes the commit,
+# and Get-PrTitle excludes it when counting the member's own commits. Kept as
+# separate copies, an edit to one would leave the exclusion silently not
+# matching, and the evidence commit's subject would become the PR title.
+$script:EvidenceCommitPrefix = 'deputy: validation evidence'
+
+function New-EvidenceCommitMessage([string]$Id) {
+    "$script:EvidenceCommitPrefix for $Id"
+}
+
+function Test-EvidenceCommitSubject([string]$Subject) {
+    if (-not $Subject) { return $false }
+    $Subject.StartsWith($script:EvidenceCommitPrefix, [StringComparison]::Ordinal)
+}
+
 function Get-PrTitle {
     <#
     .SYNOPSIS
@@ -340,7 +356,7 @@ function Get-PrTitle {
     $source = $null
     if ($Worktree -and $DefaultRef) {
         $subjects = @(git -C $Worktree log "$DefaultRef..HEAD" --format=%s 2>$null |
-            Where-Object { $_ -and $_ -notmatch '^deputy: validation evidence' })
+            Where-Object { $_ -and -not (Test-EvidenceCommitSubject $_) })
         if ($subjects.Count -eq 1) { $source = $subjects[0] }
     }
     if (-not $source) { $source = Get-FirstSentence $Briefing }
