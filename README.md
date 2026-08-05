@@ -117,7 +117,9 @@ Captured command output in the evidence is redacted on a best-effort basis (comm
 | `*.sln` / `*.csproj` | `dotnet test` |
 | `pytest.ini` or `[tool.pytest]` in `pyproject.toml` | `pytest` |
 
-The default branch is resolved as `origin/HEAD`, then `origin/main` / `origin/master`, then - for a repo with no remote configured - the local `main` / `master`. Every candidate must actually exist: a stale `origin/HEAD` left by a default branch that was renamed or deleted upstream falls through to the next candidate, and the staleness is reported in the gate's anchor source. Never the checked-out branch, which inside a posse worktree is the task branch. A repo with no remote and an unconventional default branch name resolves to nothing at all; pin its commands in `config\projects.json`.
+The default branch is resolved as `origin/HEAD`, then `origin/main` / `origin/master`, then - for a repo with no remote configured - the local `main` / `master`. Every candidate must actually exist: a stale `origin/HEAD` left by a default branch that was renamed or deleted upstream falls through to the next candidate. Never the checked-out branch, which inside a posse worktree is the task branch. A repo with no remote and an unconventional default branch name resolves to nothing at all; pin its commands in `config\projects.json`.
+
+**A bad anchor is loud, whatever the gate.** The anchor decides which ref manifests are read from and what "ahead of the default branch" means, so every run records its provenance in the evidence (`- default-branch anchor: ...`) - including runs whose commands were pinned rather than detected. A stale or unresolvable anchor additionally prints `ANCHOR WARNING` in the gate output, is kept as `anchorWarning` in task state, and shows up in `dep-posse.ps1 result`. It does not fail the branch: it is the repo that needs fixing (`git remote set-head origin -a`), and only the Sheriff can do that. An anchor that resolved normally stays out of the gate's output.
 
 The gate's *command list* is Deputy-controlled; the test code those commands execute lives on the task branch, and is reviewed on the PR like any other change.
 

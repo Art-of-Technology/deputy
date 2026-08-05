@@ -1,8 +1,9 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-Tests for the gate's trust anchor (Resolve-DefaultRef / Get-DefaultBranch) and
-its command detection (Get-AutoValidateCommands).
+Tests for the gate's trust anchor (Resolve-DefaultRef / Get-DefaultBranch), its
+command detection (Get-AutoValidateCommands), and the PR title dep-publish
+derives from a finished branch (Format-PrTitle / Get-PrTitle).
 
 The regression these pin down: in a repo with no remote, the anchor used to
 fall back to the checked-out branch, so every origin/<branch> read failed,
@@ -69,6 +70,31 @@ Describe 'Resolve-DefaultRef' {
             TaskBranch = $script:TASK_BRANCH
         }
         (Resolve-DefaultRef $repo).Source | Should -Match 'stale origin/HEAD \(origin/renamed-away is missing\)'
+    }
+
+    It 'labels the anchor health so callers need not parse the source prose' {
+        $ok = New-Case @{ WithRemote = $true; TaskBranch = $script:TASK_BRANCH }
+        (Resolve-DefaultRef $ok).Health | Should -Be 'ok'
+
+        $local = New-Case @{ TaskBranch = $script:TASK_BRANCH }
+        (Resolve-DefaultRef $local).Health | Should -Be 'ok'
+
+        $stale = New-Case @{ WithRemote = $true; DanglingOriginHead = $true
+            TaskBranch = $script:TASK_BRANCH
+        }
+        (Resolve-DefaultRef $stale).Health | Should -Be 'stale'
+
+        $none = New-Case @{ DefaultBranch = 'trunk'; TaskBranch = $script:TASK_BRANCH }
+        (Resolve-DefaultRef $none).Health | Should -Be 'unresolved'
+    }
+
+    It 'calls a stale origin/HEAD with no usable fallback unresolved, and still says it was stale' {
+        $repo = New-Case @{ DefaultBranch = 'trunk'; WithRemote = $true; DanglingOriginHead = $true
+            TaskBranch = $script:TASK_BRANCH
+        }
+        $anchor = Resolve-DefaultRef $repo
+        $anchor.Health | Should -Be 'unresolved'
+        $anchor.Source | Should -Match 'stale origin/HEAD'
     }
 
     It 'never returns a ref that does not exist' {
@@ -145,6 +171,114 @@ Describe 'Get-DefaultBranch' {
     It 'returns null when the default branch cannot be resolved' {
         $repo = New-Case @{ DefaultBranch = 'trunk'; TaskBranch = $script:TASK_BRANCH }
         Get-DefaultBranch $repo | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Format-PrTitle' {
+    # The regression: the title was a blunt 70-character substring of the
+    # briefing's first sentence, which shipped "into a vacuous p..." on a real
+    # PR and had to be corrected by hand.
+    BeforeAll {
+        $script:REAL_BRIEFING = 'Fix the validation gate so it cannot silently degrade into a vacuous ' +
+            "pass. This is the Deputy tool's own repo. Read AGENTS.md first."
+    }
+
+    It 'leaves a title that fits alone, minus its sentence punctuation' {
+        Format-PrTitle 'Redact secrets from validation evidence output.' |
+            Should -Be 'Redact secrets from validation evidence output'
+        Format-PrTitle 'Harden task id handling, pid liveness checks and branch slugs,' |
+            Should -Be 'Harden task id handling, pid liveness checks and branch slugs'
+    }
+
+    It 'no longer cuts the real PR title mid-word' {
+        $sentence = Get-FirstSentence $script:REAL_BRIEFING
+        # what shipped before this change
+        Limit-Text $sentence 70 | Should -Be 'Fix the validation gate so it cannot silently degrade into a vacuous p...'
+        Format-PrTitle $sentence |
+            Should -Be 'Fix the validation gate so it cannot silently degrade into a vacuous pass'
+    }
+
+    It 'breaks on a word boundary when it has to truncate' {
+        $long = 'Fix the validation gate so it cannot silently degrade into a vacuous pass that nobody ever notices.'
+        $title = Format-PrTitle $long
+        $title | Should -Be 'Fix the validation gate so it cannot silently degrade into a vacuous pass...'
+        $title.Length | Should -BeLessOrEqual 80
+        $long.StartsWith(($title -replace '\.\.\.$', '')) | Should -BeTrue
+    }
+
+    It 'sheds punctuation the break left dangling' {
+        Format-PrTitle 'Verify the test gate own exit code and the default-branch anchor it trusts, end to end, in Pester.' |
+            Should -Be 'Verify the test gate own exit code and the default-branch anchor it trusts...'
+    }
+
+    It 'sheds a connective the break left dangling' {
+        $title = Format-PrTitle 'Redact secrets from the validation evidence, the recorded state, and the logs before publishing.'
+        $title | Should -Be 'Redact secrets from the validation evidence, the recorded state...'
+        $title | Should -Not -Match '\b(and|the|of|to|were)\.\.\.$'
+    }
+
+    It 'still returns something for one word wider than the whole limit' {
+        # No word boundary to break on: cut it, but never loop and never
+        # return nothing.
+        $title = Format-PrTitle ('Supercalifragilisticexpialidocious' * 3)
+        $title | Should -Not -BeNullOrEmpty
+        $title.Length | Should -Be 80
+        $title | Should -BeLike '*...'
+        $title.TrimEnd('.') | Should -Not -Match '\s'
+    }
+
+    It 'returns an empty string for no text at all' {
+        Format-PrTitle '' | Should -Be ''
+        Format-PrTitle $null | Should -Be ''
+    }
+}
+
+Describe 'Get-PrTitle' {
+    BeforeAll {
+        $script:BRIEFING = 'Surface the anchor provenance regardless of how the gate commands were ' +
+            'resolved, and make a stale anchor visible. Then add tests.'
+        function Add-Commit([string]$Repo, [string]$Subject) {
+            Invoke-Git @('-C', $Repo, 'commit', '-q', '--allow-empty', '-m', $Subject)
+        }
+    }
+
+    It 'uses the commit subject when the branch carries exactly one commit' {
+        # A commit subject is already a headline; a briefing's first sentence is
+        # a specification.
+        $repo = New-Case @{ TaskBranch = $script:TASK_BRANCH }
+        Get-PrTitle -Worktree $repo -DefaultRef 'refs/heads/main' -Briefing $script:BRIEFING |
+            Should -Be 'task work'
+    }
+
+    It 'ignores the deputy evidence commit when counting the branch commits' {
+        $repo = New-Case @{ TaskBranch = $script:TASK_BRANCH }
+        Add-Commit $repo 'deputy: validation evidence for posse-20260101-120000-abc'
+        Get-PrTitle -Worktree $repo -DefaultRef 'refs/heads/main' -Briefing $script:BRIEFING |
+            Should -Be 'task work'
+    }
+
+    It 'falls back to the briefing when the branch carries several commits' {
+        $repo = New-Case @{ TaskBranch = $script:TASK_BRANCH }
+        Add-Commit $repo 'Second commit of two'
+        Get-PrTitle -Worktree $repo -DefaultRef 'refs/heads/main' -Briefing $script:BRIEFING |
+            Should -Be 'Surface the anchor provenance regardless of how the gate commands...'
+    }
+
+    It 'falls back to the briefing when there is no trusted anchor to count against' {
+        $repo = New-Case @{ DefaultBranch = 'trunk'; TaskBranch = $script:TASK_BRANCH }
+        $anchor = Resolve-DefaultRef $repo
+        $anchor.Ref | Should -BeNullOrEmpty
+        Get-PrTitle -Worktree $repo -DefaultRef $anchor.Ref -Briefing $script:BRIEFING |
+            Should -Be 'Surface the anchor provenance regardless of how the gate commands...'
+    }
+
+    It 'truncates a long single commit subject on a word boundary too' {
+        $repo = New-Case @{ TaskBranch = $script:TASK_BRANCH }
+        Invoke-Git @('-C', $repo, 'reset', '-q', '--soft', 'main')
+        Add-Commit $repo ('Fix the validation gate so it cannot silently degrade into a vacuous pass ' +
+            'that nobody ever notices')
+        Get-PrTitle -Worktree $repo -DefaultRef 'refs/heads/main' -Briefing $script:BRIEFING |
+            Should -Be 'Fix the validation gate so it cannot silently degrade into a vacuous pass...'
     }
 }
 

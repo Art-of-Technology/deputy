@@ -33,7 +33,7 @@ if (-not (Test-Path $task.worktree)) { throw "Worktree gone: $($task.worktree). 
 $wt = $task.worktree
 
 # A re-run must not inherit the previous run's verdict or its explanation
-foreach ($stale in 'validationNote', 'validationError') { Set-TaskField $task $stale $null }
+foreach ($stale in 'validationNote', 'validationError', 'anchorWarning') { Set-TaskField $task $stale $null }
 
 $anchor = Resolve-DefaultRef $wt
 $projProfile = Get-ProjectProfile $task.repo
@@ -45,6 +45,31 @@ if ($commands.Count -eq 0) {
         "auto-detected from manifests on $($anchor.Ref) ($($anchor.Source))"
     }
     else { 'auto-detection had no trusted default branch to read manifests from' }
+}
+
+# The anchor is the gate's trust root whether or not detection ran: it decides
+# which ref manifests are read from, and what "ahead of the default branch"
+# means. So its provenance is reported here, before the gate and independently
+# of how the commands were resolved - a repo that pins its commands used to be
+# the one place a stale origin/HEAD stayed invisible. Proportionate on purpose:
+# a healthy anchor is recorded in the evidence only, while a stale or
+# unresolved one is printed and kept in task state, because those are the cases
+# that need a repo-level fix from the Sheriff.
+$anchorWarning = switch ($anchor.Health) {
+    'stale' {
+        "$($anchor.Source). The gate anchored on $($anchor.Ref) instead. Fix it at the repo level " +
+        "with: git remote set-head origin -a (in $($task.repo))"
+    }
+    'unresolved' {
+        'could not resolve a trusted default branch for this repo (no origin/HEAD, no origin/main ' +
+        'or origin/master, no local main or master), so the branch was not checked for being ahead ' +
+        "of the default branch and manifests could not be read from a trusted ref (anchor: $($anchor.Source))"
+    }
+    default { $null }
+}
+if ($anchorWarning) {
+    Write-Output "ANCHOR WARNING: $anchorWarning"
+    Set-TaskField $task 'anchorWarning' $anchorWarning
 }
 
 function Deny-Validation([string]$Reason) {
@@ -98,12 +123,6 @@ if ($commands.Count -eq 0) {
     }
 }
 Write-Output "gate ($gateSource): $($commands -join '; ')"
-$anchorWarning = $null
-if (-not $anchor.Ref) {
-    $anchorWarning = 'could not resolve a trusted default branch for this repo, so the branch was ' +
-        'not checked for being ahead of the default branch'
-    Write-Output "WARNING: $anchorWarning"
-}
 
 # Environmental setup: JS gates need node_modules in the (possibly recycled)
 # worktree. Only install when the manifest actually declares dependencies,
@@ -162,8 +181,9 @@ $lines = @(
     "- validated commit: $headSha"
     "- validated at: $(Get-Date -Format o)"
     "- gate source: $gateSource"
+    "- default-branch anchor: $($anchor.Ref ? "$($anchor.Ref) ($($anchor.Source))" : $anchor.Source)"
     "- verdict: $($allPassed ? 'PASSED' : 'FAILED')"
-    $(if ($anchorWarning) { "- warning: $anchorWarning" })
+    $(if ($anchorWarning) { "- anchor warning: $anchorWarning" })
     ''
     '| command | exit | result |'
     '| --- | --- | --- |'

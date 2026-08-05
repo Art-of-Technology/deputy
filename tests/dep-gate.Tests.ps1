@@ -157,6 +157,79 @@ Describe 'dep-validate.ps1 auto-detection in a repo with no remote' {
     }
 }
 
+Describe 'dep-validate.ps1 anchor provenance' {
+    # The regression: the anchor's provenance was only printed on the branch
+    # where gate commands were auto-detected, so a repo that pins its commands -
+    # the well-configured case - never saw a stale origin/HEAD at all.
+    BeforeAll {
+        $script:stale = New-Scenario -Validate @('exit 0') -RepoOptions @{ WithRemote = $true
+            DanglingOriginHead = $true
+        }
+        $script:staleRun = Invoke-DeputyScript -InstallRoot $script:stale.Install `
+            -Script 'dep-validate.ps1' -Arguments @($script:stale.Id)
+    }
+
+    It 'reports a stale origin/HEAD even though the gate commands are pinned' {
+        $script:staleRun.Output | Should -Match 'gate \(configured in deputy'
+        $script:staleRun.Output | Should -Match 'ANCHOR WARNING'
+        $script:staleRun.Output | Should -Match 'stale origin/HEAD \(origin/renamed-away is missing\)'
+        $script:staleRun.Output | Should -Match 'git remote set-head origin -a'
+    }
+
+    It 'still passes the gate: a stale anchor is a repo problem, not a branch failure' {
+        $script:staleRun.ExitCode | Should -Be 0
+        (Get-TestTaskState -InstallRoot $script:stale.Install -Id $script:stale.Id).validation |
+            Should -Be 'passed'
+    }
+
+    It 'keeps the warning in task state and in dep-posse.ps1 result' {
+        $state = Get-TestTaskState -InstallRoot $script:stale.Install -Id $script:stale.Id
+        $state.anchorWarning | Should -Match 'stale'
+        $run = Invoke-DeputyScript -InstallRoot $script:stale.Install -Script 'dep-posse.ps1' `
+            -Arguments @('result', $script:stale.Id)
+        $run.Output | Should -Match 'Anchor: .*stale origin/HEAD'
+    }
+
+    It 'records the anchor in the PR-viewable evidence' {
+        $evidence = (git -C $script:stale.Repo show "HEAD:.deputy/evidence/$($script:stale.Id).md") -join "`n"
+        $evidence | Should -Match 'default-branch anchor: refs/remotes/origin/main \(stale origin/HEAD'
+        $evidence | Should -Match 'anchor warning: .*git remote set-head origin -a'
+    }
+
+    It 'reports an unresolved anchor with pinned commands too' {
+        $s = New-Scenario -Validate @('exit 0') -RepoOptions @{ DefaultBranch = 'trunk' }
+        $run = Invoke-DeputyScript -InstallRoot $s.Install -Script 'dep-validate.ps1' -Arguments @($s.Id)
+        $run.ExitCode | Should -Be 0
+        $run.Output | Should -Match 'ANCHOR WARNING: could not resolve a trusted default branch'
+        (Get-TestTaskState -InstallRoot $s.Install -Id $s.Id).anchorWarning |
+            Should -Match 'could not resolve a trusted default branch'
+    }
+
+    It 'says nothing about an anchor that resolved normally, but records it as evidence' {
+        # Proportionate: a healthy anchor must not turn every run into noise.
+        $s = New-Scenario -Validate @('exit 0') -RepoOptions @{ WithRemote = $true }
+        $run = Invoke-DeputyScript -InstallRoot $s.Install -Script 'dep-validate.ps1' -Arguments @($s.Id)
+        $run.ExitCode | Should -Be 0
+        $run.Output | Should -Not -Match 'ANCHOR WARNING'
+        (Get-TestTaskState -InstallRoot $s.Install -Id $s.Id).anchorWarning | Should -BeNullOrEmpty
+        (git -C $s.Repo show "HEAD:.deputy/evidence/$($s.Id).md") -join "`n" |
+            Should -Match 'default-branch anchor: refs/remotes/origin/main \(origin/HEAD\)'
+    }
+
+    It 'drops the warning on a re-run once the repo is fixed' {
+        $s = New-Scenario -Validate @('exit 0') -RepoOptions @{ WithRemote = $true
+            DanglingOriginHead = $true
+        }
+        $first = Invoke-DeputyScript -InstallRoot $s.Install -Script 'dep-validate.ps1' -Arguments @($s.Id)
+        $first.Output | Should -Match 'ANCHOR WARNING'
+        Invoke-Git @('-C', $s.Repo, 'remote', 'set-head', 'origin', '-a')
+        $second = Invoke-DeputyScript -InstallRoot $s.Install -Script 'dep-validate.ps1' -Arguments @($s.Id)
+        $second.ExitCode | Should -Be 0
+        $second.Output | Should -Not -Match 'ANCHOR WARNING'
+        (Get-TestTaskState -InstallRoot $s.Install -Id $s.Id).anchorWarning | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'dep-publish.ps1 on an unverified gate' {
     BeforeAll {
         $script:pub = New-Scenario -RepoOptions @{ WithRemote = $true }

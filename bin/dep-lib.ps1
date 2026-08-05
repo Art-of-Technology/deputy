@@ -79,8 +79,13 @@ function Resolve-DefaultRef([string]$RepoPath) {
     # remote at all - the local default branch by convention. Never a fallback
     # to HEAD: an unresolvable anchor returns Ref = $null, which callers must
     # treat as "cannot verify", not as "nothing to check".
-    function New-Anchor([string]$Branch, [string]$Ref, [string]$Source) {
-        [pscustomobject]@{ Branch = $Branch; Ref = $Ref; Source = $Source }
+    # Health is the machine-readable form of Source, so callers can react to a
+    # bad anchor without parsing prose: 'ok' when it resolved cleanly, 'stale'
+    # when origin/HEAD named a missing ref, 'unresolved' when there is no anchor
+    # at all. Only the Sheriff can fix the last two, at the repo level.
+    function New-Anchor([string]$Branch, [string]$Ref, [string]$Source, [switch]$Stale) {
+        $health = if (-not $Ref) { 'unresolved' } elseif ($Stale) { 'stale' } else { 'ok' }
+        [pscustomobject]@{ Branch = $Branch; Ref = $Ref; Source = $Source; Health = $health }
     }
 
     # Set when origin/HEAD names a ref that is not there (the default branch was
@@ -103,7 +108,7 @@ function Resolve-DefaultRef([string]$RepoPath) {
     }
     foreach ($b in 'main', 'master') {
         if (Test-GitRef $RepoPath "refs/remotes/origin/$b") {
-            return New-Anchor $b "refs/remotes/origin/$b" "${stale}remote-tracking origin/$b"
+            return New-Anchor $b "refs/remotes/origin/$b" "${stale}remote-tracking origin/$b" -Stale:([bool]$stale)
         }
     }
     # No remote-tracking default (no remote configured, or nothing fetched).
@@ -111,7 +116,7 @@ function Resolve-DefaultRef([string]$RepoPath) {
     # carry the configured branch prefix, so they are never named main/master.
     foreach ($b in 'main', 'master') {
         if (Test-GitRef $RepoPath "refs/heads/$b") {
-            return New-Anchor $b "refs/heads/$b" "${stale}local branch $b"
+            return New-Anchor $b "refs/heads/$b" "${stale}local branch $b" -Stale:([bool]$stale)
         }
     }
     New-Anchor $null $null "${stale}unresolved"
@@ -275,6 +280,71 @@ function Limit-Text([string]$Text, [int]$Max = 200) {
     if (-not $Text) { return '' }
     $t = ($Text -replace '\s+', ' ').Trim()
     if ($t.Length -le $Max) { $t } else { $t.Substring(0, $Max) + '...' }
+}
+
+function Get-FirstSentence([string]$Text) {
+    if (-not $Text) { return '' }
+    $t = ($Text -replace '\s+', ' ').Trim()
+    $idx = $t.IndexOf('. ')
+    if ($idx -ge 0) { $t.Substring(0, $idx + 1) } else { $t }
+}
+
+function Format-PrTitle([string]$Text, [int]$Max = 80) {
+    # A PR title is a headline, so it is cut like one. Limit-Text's blunt
+    # substring shipped "...degrade into a vacuous p..." on a real PR, which had
+    # to be corrected by hand: break on a word boundary instead, and shed
+    # whatever the break leaves dangling.
+    if (-not $Text) { return '' }
+    $t = (($Text -replace '\s+', ' ').Trim()) -replace '[\s.,;:]+$', ''
+    if ($t.Length -le $Max) { return $t }
+
+    $ellipsis = '...'
+    $budget = $t.Substring(0, $Max - $ellipsis.Length)
+    $space = $budget.LastIndexOf(' ')
+    # A single word wider than the whole budget has no boundary to break on:
+    # cut it anyway rather than looping forever or returning nothing.
+    if ($space -lt 1) { return $budget + $ellipsis }
+
+    # Trailing punctuation, and a trailing function word (connective, article,
+    # bare auxiliary) that reads as a clause broken off mid-thought, both go.
+    # Never the last remaining word, so the result cannot collapse to empty.
+    $connectives = @('a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'being', 'but', 'by', 'can',
+        'could', 'did', 'do', 'does', 'for', 'from', 'had', 'has', 'have', 'if', 'in', 'into', 'is',
+        'it', 'its', 'may', 'might', 'must', 'no', 'not', 'of', 'on', 'or', 'over', 'per', 'should',
+        'so', 'than', 'that', 'the', 'their', 'to', 'via', 'was', 'were', 'when', 'which', 'while',
+        'who', 'will', 'with', 'without', 'would')
+    $cut = $budget.Substring(0, $space)
+    while ($true) {
+        $cut = $cut -replace '[\s\p{P}]+$', ''
+        $words = @($cut -split ' ')
+        if ($words.Count -le 1 -or -not ($connectives -contains $words[-1].ToLowerInvariant())) { break }
+        $cut = ($words[0..($words.Count - 2)] -join ' ')
+    }
+    if (-not $cut) { $cut = $budget }
+    $cut + $ellipsis
+}
+
+function Get-PrTitle {
+    <#
+    .SYNOPSIS
+    The PR title for a task branch: its single commit subject when it has one,
+    else the first sentence of the briefing.
+
+    A commit subject is already written as an imperative headline, while a
+    briefing's first sentence is a specification and reads like one. When the
+    branch carries several commits no single subject covers them, so the
+    briefing is the honest source there. Deputy's own evidence commit is not
+    the member's work and never counts as the branch's commit.
+    #>
+    param([string]$Worktree, [string]$DefaultRef, [string]$Briefing)
+    $source = $null
+    if ($Worktree -and $DefaultRef) {
+        $subjects = @(git -C $Worktree log "$DefaultRef..HEAD" --format=%s 2>$null |
+            Where-Object { $_ -and $_ -notmatch '^deputy: validation evidence' })
+        if ($subjects.Count -eq 1) { $source = $subjects[0] }
+    }
+    if (-not $source) { $source = Get-FirstSentence $Briefing }
+    Format-PrTitle $source
 }
 
 function Remove-Secret([string]$Text) {
