@@ -144,6 +144,15 @@ The gate's *command list* is Deputy-controlled; the test code those commands exe
 
 The security property of no-mistakes: the agent that wrote the code never holds the pen on validation or publishing. Members need no `gh` or push access at all, and a branch cannot rubber-stamp its own gate.
 
+**Whose text the PR title is.** `dep-publish.ps1` derives the title from the branch's one member commit subject when there is exactly one of them (Deputy's own evidence commit never counts), and from the Sheriff's briefing otherwise. That is a trust boundary worth naming rather than leaving implicit: on a single-commit branch, the title of a pull request on your organisation's repository is text a headless posse member wrote, where it used to be the Sheriff's own words. What that text can do is deliberately bounded to being a headline:
+
+- **The title only.** The base and head branches, the briefing quoted in the body, the gate verdict and the evidence are the Deputy's or the Sheriff's. A member still never pushes and never holds a `gh` credential.
+- **Sanitised before use.** Terminal escape sequences are stripped, along with control characters and invisible format characters such as bidi overrides - a title is read in the Deputy's and the Sheriff's terminals, where an escape sequence can recolour or overwrite what they see and a bidi override can make text read as something other than what it says. Whitespace is then collapsed and the result is cut to 80 characters on a word boundary. A subject with nothing left after that falls back to the briefing.
+- **Plain text on GitHub**, which renders no markup in a PR title.
+- **Only on a green gate**, since publishing refuses a failed or unverified task.
+
+So the title is a summary the branch proposed for itself, not a claim Deputy vouches for. It is worth a glance when you review the PR; the diff and the evidence are what actually attest to the work.
+
 ## Permissions for posse members
 
 Headless members cannot answer permission prompts: anything not pre-approved stalls the task on its first gated action. Two ways to run them:
