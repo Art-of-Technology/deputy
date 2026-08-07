@@ -50,7 +50,7 @@ Rules:
 - **Short paragraphs beat dense bullets.** Two plain sentences are easier than five fragments.
 - **Bullets are for lists**, max ~5, no nesting. One line each, except a numbered list of deferred items, where a **bold lead** plus one or two short sentences is right - see the 🐛 section of the example.
 - **Blank line between everything.** White space is the point.
-- **Strikethrough what's done**: `- ~~Black bar on riverbanks~~`. Resolved things should read as closed.
+- **Strikethrough what's done**: `- ~~Expired tokens accepted for 60s after revoke~~`. Resolved things should read as closed.
 - **No word ceiling, but no padding either.** Typically 150-350 words. Past ~400 you are expanding, not summarising.
 - **Close with `_More detail: /expando_`** whenever real detail sits behind the briefing, so the reader knows the long version is one word away. Drop the line only when there genuinely is nothing more to tell.
 
@@ -112,48 +112,48 @@ The point is to spare the reader the deciding, not just the reading. So:
 ```
 ✅ Good news first
 
-Nothing in the game looks broken right now.
+Nothing a client calling the API would hit is broken right now.
 
-The two defects a player could see are fixed and verified:
-- ~~Graph paper grass~~
-- ~~Black bar on riverbanks~~
+The two bugs that returned wrong data are fixed and verified:
+- ~~`/orders` paginated past the last page~~
+- ~~Expired tokens accepted for 60s after revoke~~
 
-Art gate: 0 errors. Build clean. 207 tests pass.
+Gate: lint 0 errors, 207 tests pass, typecheck clean.
 
 ---
 
 🔨 Do this next
 
-Paint Guillotine Gorge.
+Build the `/orders/{id}/refunds` endpoint.
 
-- First real slice 3 content
-- Mountain atlas is applied and QA'd
-- `tools/mapgen/` already has a per-scene generator pattern to copy
+- Last endpoint missing from the v2 contract
+- Payment provider client is already wired and covered by tests
+- `src/routes/orders/` has a handler + validator pattern to copy
 - Blocked on nothing
 
-It's the only item on the list that adds something new to the game rather than fixing or checking.
+It's the only item on the list that adds something new rather than fixing or checking.
 
 ---
 
-📤 Send codex one small thing
+📤 Send the platform team one small thing
 
-The mountain cliff still pulses - 12 identical lobe stacks in a row. They fixed the seam but not the "vary the lobe width" part.
+Staging Postgres still has no connection pooler, so the load test tops out at 40 concurrent requests before it starts refusing connections.
 
-Not urgent, no scene paints the mountain yet. But better fixed before you paint the gorge on top of it.
+Not urgent, production has one. But it makes every load number from staging meaningless until it's fixed.
 
 ---
 
 🐛 Two things I'd leave for now
 
-1. **My E2E driver is flaky.** Needs the game to print player coordinates so it can walk into position instead of guessing durations. Small job, but it's tooling, not game.
+1. **The integration suite needs a live Redis.** It fails on a clean checkout until you start the container by hand. Small job, but it's tooling, not API.
 
-2. **~350 collision marks are my guesses**, not the artist's, across 5 atlases. Invisible until someone walks into thin air. Mountain's are the artist's, so painting the gorge is safe.
+2. **~40 error responses still use the old `{message}` shape** instead of the v2 `{error, code}` envelope, across 5 route files. Invisible until a client parses one. The order routes are all converted, so the refunds endpoint is safe to build.
 
 ---
 
 👉 If you only do one thing
 
-Paint Guillotine Gorge. Everything else is polish, checking, or tools.
+Build the refunds endpoint. Everything else is cleanup, checking, or tooling.
 
 _More detail: /expando_
 ```
