@@ -55,9 +55,7 @@ if ($source -notin @('clear', 'compact')) {
     }
 }
 
-$active = @()
 Write-Section 'Posse' {
-    $script:active = @(Get-ActiveTasks)
     if (@(Get-AllTasks).Count -eq 0) { 'Posse: no tasks.' }
     else {
         'Posse (dep-posse.ps1 status):'
@@ -68,14 +66,22 @@ Write-Section 'Posse' {
 Write-Section 'Watcher' {
     $health = Get-WatcherHealth
     if ($health.Healthy) { "Watcher: $($health.Reason)." }
-    elseif ($script:active.Count -gt 0) {
-        $start = 'pwsh -NoProfile -File "{0}" -Wait' -f (Join-Path $PSScriptRoot 'dep-watch.ps1')
-        $how = if ((Get-DeputyConfig).autoWatch) {
-            "The stop hook starts one when this turn ends; to start it now, run in the background: $start"
-        } else { "Start it in the background: $start" }
-        "Watcher: $($health.Reason), and $($script:active.Count) task(s) are active. $how"
+    else {
+        # A watcher has work while a member runs, and while a published pull
+        # request is waiting to be merged (it polls those).
+        $load = Get-WatchLoad
+        if ($load.Total -gt 0) {
+            $start = 'pwsh -NoProfile -File "{0}" -Wait' -f (Join-Path $PSScriptRoot 'dep-watch.ps1')
+            $how = if ((Get-DeputyConfig).autoWatch) {
+                "The stop hook starts one when this turn ends; to start it now, run in the background: $start"
+            } else { "Start it in the background: $start" }
+            $what = @()
+            if ($load.Active -gt 0) { $what += "$($load.Active) task(s) are active" }
+            if ($load.Pulls -gt 0) { $what += "$($load.Pulls) published pull request(s) are waiting to be merged" }
+            "Watcher: $($health.Reason), and $($what -join ' and '). $how"
+        }
+        else { 'Watcher: not running (no active tasks).' }
     }
-    else { 'Watcher: not running (no active tasks).' }
 }
 
 Write-Section 'Wake queue' {

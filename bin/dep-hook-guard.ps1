@@ -4,8 +4,9 @@
 Stop hook (synchronous): do not let the Deputy end a turn while posse tasks
 are active and nothing is watching them.
 
-If any task is running or stalled and no healthy watcher will report to this
-session, the stop is blocked (exit 2) with a one-line instruction to start the
+If any task is running or stalled - or a published pull request is still
+waiting to be merged, which the watcher polls - and no healthy watcher will
+report to this session, the stop is blocked (exit 2) with a one-line instruction to start the
 watcher. At most three stops in a row are blocked; the count lives in
 state\hook-guard.blocks. After that the stop is let through with a warning to
 the Sheriff, and stays let through until a watcher is healthy again or no task
@@ -36,7 +37,10 @@ try {
     $session = Get-HookField (Read-HookInput) 'session_id'
     $paths = Get-DeputyPaths
     $autoWatch = [bool](Get-DeputyConfig).autoWatch
-    $active = @(Get-ActiveTasks).Count
+    # What needs a watcher: running members, and published pull requests that
+    # are not merged yet (the watcher polls those for `merged` and `degraded`).
+    $load = Get-WatchLoad
+    $active = $load.Total
     $health = Get-WatcherHealth
     $serving = Test-WatcherServes $health $session
 
@@ -69,9 +73,9 @@ try {
     $why = $health.Healthy ? "the running watcher reports to another session ($($health.Session))" : $health.Reason
     switch ($decision.Action) {
         'block' {
-            $message = ("Deputy stop guard ({0}/{1}): {2} posse task(s) are active and {3}. " +
+            $message = ("Deputy stop guard ({0}/{1}): {2} and {3}. " +
                 "Start the watcher as a background process before ending the turn: {4}") -f
-                $decision.Blocks, $script:GuardMaxBlocks, $active, $why, $start
+                $decision.Blocks, $script:GuardMaxBlocks, $load.Text, $why, $start
             [Console]::Error.WriteLine($message)
             exit 2
         }
@@ -79,9 +83,10 @@ try {
             # Exit 0 with a systemMessage: shown to the Sheriff, not fed back
             # to the model, which has already been told the maximum number of
             # times.
-            $message = ("DEPUTY STOP GUARD GAVE UP: {0} posse task(s) are active and {1}. The stop was blocked {2} times " +
-                "and is now being let through, so NOTHING WILL WAKE THE DEPUTY when a task finishes. Start the watcher " +
-                "({3}) or check on the posse with dep-posse.ps1 status.") -f $active, $why, $script:GuardMaxBlocks, $start
+            $message = ("DEPUTY STOP GUARD GAVE UP: {0} and {1}. The stop was blocked {2} times " +
+                "and is now being let through, so NOTHING WILL WAKE THE DEPUTY when a task finishes or a pull request " +
+                "is merged. Start the watcher ({3}) or check on the posse with dep-posse.ps1 status.") -f
+                $load.Text, $why, $script:GuardMaxBlocks, $start
             Write-Output (([ordered]@{ systemMessage = $message }) | ConvertTo-Json -Compress)
             exit 0
         }

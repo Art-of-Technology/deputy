@@ -1,8 +1,9 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-Watch running posse tasks and surface actionable wake events: completed,
-failed, interrupted, blocked, needs-decision, died, stalled.
+Watch running posse tasks and the pull requests of published ones, and surface
+actionable wake events: completed, failed, interrupted, blocked,
+needs-decision, died, stalled, merged, degraded.
 
 A task is completed (or failed, interrupted, blocked, needs-decision) only when
 its final result event has arrived AND the member process has exited. A result
@@ -22,9 +23,23 @@ Only the current run is read: after dep-send.ps1 resumes a member, the log
 holds the earlier runs' results too, and the task's logOffset marks where the
 current one starts.
 
+Once a task has a pull request, the watcher keeps reading it until it is seen
+merged or the task is returned: every prPollMinutes (config, default 5; 0
+switches it off), over REST (`gh api`), so no read:org token scope is needed.
+- `merged`, once: the PR was merged. mergedAt and mergeSha are recorded, and
+  the task is not polled again. A merge dep-pr.ps1 merge made itself is already
+  recorded and raises no wake.
+- `degraded`, once per head commit: a check is failing at the PR's current
+  head. A PR counts as green from the moment it is published - the gate passed
+  on that commit - so the first failing check is news, and so is the first
+  one after every new head.
+A PR that cannot be read (no network, gh not signed in, a 404) produces
+nothing at all: a failed lookup is never a merge, and never a wake.
+
 Default: one scan, print any events, exit.
 -Wait: block (polling) until at least one actionable event occurs, print it,
-exit 0. Exits 0 immediately if no tasks are active; exits 2 on timeout.
+exit 0. Exits 0 immediately if no task is active and no published pull request
+is waiting to be merged; exits 2 on timeout.
 Designed to run as a background process so the Deputy is woken only when a
 decision is needed. Exits 1 only when the watcher lock is held by a process
 that should be replaced and cannot be.
@@ -51,6 +66,7 @@ param(
     [switch]$Wait,
     [int]$IntervalSeconds = 0,   # 0 = use config
     [int]$StallMinutes = 0,      # 0 = use config
+    [int]$PrPollSeconds = 0,     # seconds between reads of one pull request; 0 = use config (prPollMinutes)
     [int]$DeadSeconds = 90,      # log-silence grace before a dead process counts as died
     [int]$TimeoutMinutes = 0,    # with -Wait: 0 = wait forever
     [string]$Session = '',       # the Claude session a stop hook runs this watcher for
@@ -62,6 +78,7 @@ Initialize-Deputy
 $config = Get-DeputyConfig
 if ($IntervalSeconds -le 0) { $IntervalSeconds = [int]$config.watchIntervalSeconds }
 if ($StallMinutes -le 0) { $StallMinutes = [int]$config.stallMinutes }
+if ($PrPollSeconds -le 0) { $PrPollSeconds = [int]([double]$config.prPollMinutes * 60) }
 
 function ConvertFrom-StreamLine([string]$Line) {
     # One stream-json line as an object, or $null for anything unparseable
@@ -151,6 +168,8 @@ function Set-TaskPrUrl($Task, [string]$Text, $Report) {
     if ($claimed -match 'https://github\.com/([^/\s)"'']+)/([^/\s)"'']+)/pull/\d+') {
         if (Test-PrUrlBelongsToRepo $Task.repo $Matches[1] $Matches[2]) {
             Set-TaskField $Task 'prUrl' $Matches[0]
+            # The PR is polled from here on; its first read is one interval away.
+            Set-TaskField $Task 'prCheckedAt' (Get-Date -Format o)
         }
         else {
             Set-TaskField $Task 'prUrlRejected' $Matches[0]
@@ -280,7 +299,82 @@ function Invoke-Scan {
         if ($wake) { $events += Add-WakeEvent $wake }
         Write-TaskState $task
     }
+    $events += @(Invoke-PrScan)
     , $events
+}
+
+function Get-PrObservation($Task) {
+    <#
+    .SYNOPSIS
+    Read one task's pull request and say what changed: the fields to record,
+    and the wake to raise, if any.
+
+    | what the read shows                           | wake     | recorded                 |
+    | the PR could not be read                      | none     | prCheckedAt              |
+    | merged                                        | merged   | mergedAt, mergeSha       |
+    | open, a check failing at a head not yet told  | degraded | prDegradedHead           |
+    | open and nothing failing, or already told     | none     | prCheckedAt              |
+    | closed without merging                        | none     | prCheckedAt              |
+    #>
+    $fields = [ordered]@{ prCheckedAt = (Get-Date -Format o) }
+    $observation = [pscustomobject]@{ Fields = $fields; Event = ''; Summary = '' }
+    $ref = Get-TaskPrRef $Task
+    $pr = Get-PullRequest $ref
+    # Silent on purpose. An unreadable PR says nothing about the PR.
+    if (-not $pr.Ok) { return $observation }
+
+    if ($pr.Merged) {
+        $fields['mergedAt'] = $pr.MergedAt ?? (Get-Date -Format o)
+        $fields['mergeSha'] = $pr.MergeSha
+        $observation.Event = 'merged'
+        $observation.Summary = "Pull request #$($ref.Number) was merged" +
+            $(if ($pr.MergeSha) { " as $(Format-Sha $pr.MergeSha)" }) + '.'
+        return $observation
+    }
+    if ($pr.State -ne 'open' -or -not $pr.HeadSha) { return $observation }
+    if ($pr.HeadSha -eq [string](Get-EventField $Task 'prDegradedHead')) { return $observation }
+
+    $checks = Get-PrChecks $ref $pr.HeadSha
+    if (-not $checks.Ok -or $checks.Failing.Count -eq 0) { return $observation }
+    $fields['prDegradedHead'] = $pr.HeadSha
+    $observation.Event = 'degraded'
+    $names = @($checks.Failing | ForEach-Object { "$($_.Name) ($($_.Detail))" }) -join ', '
+    $summary = "Pull request #$($ref.Number) has $($checks.Failing.Count) failing check(s) at $(Format-Sha $pr.HeadSha): $names."
+    $published = [string](Get-EventField $Task 'prHead')
+    if ($published -and $published -ne $pr.HeadSha) {
+        $summary += " That is not the commit Deputy published ($(Format-Sha $published)): somebody pushed to the PR."
+    }
+    $observation.Summary = $summary
+    $observation
+}
+
+function Invoke-PrScan {
+    # Poll the pull request of every published, unmerged task that is due.
+    $events = @()
+    if ($PrPollSeconds -le 0) { return $events }
+    foreach ($task in (Get-PrWatchTasks)) {
+        $last = ConvertTo-UtcDateTime (Get-EventField $task 'prCheckedAt')
+        if ($last -and ([datetime]::UtcNow - $last).TotalSeconds -lt $PrPollSeconds) { continue }
+        Set-WatcherBeat   # a read can take seconds, and there may be several
+        $observation = Get-PrObservation $task
+
+        # The read took a moment, and other scripts write this record too
+        # (dep-pr.ps1 merge, dep-publish.ps1, dep-return.ps1). Look again before
+        # saying anything: a task that was returned, or whose merge is already
+        # recorded, needs no wake.
+        $current = try { Read-TaskState $task.id } catch { $null }
+        if (-not $current) { continue }
+        if ($observation.Event -eq 'merged' -and (Get-EventField $current 'mergedAt')) { continue }
+
+        # Queue first, record second, as above: a watcher killed in between
+        # repeats the wake rather than losing it. Only the fields this poll
+        # owns are written, onto the record as it is on disk now.
+        if ($observation.Event) {
+            $events += Add-WakeEvent (New-Wake $current $observation.Event (Limit-Text $observation.Summary 500))
+        }
+        $null = Update-TaskState $task.id $observation.Fields
+    }
+    $events
 }
 
 $drainHint = 'Drain and acknowledge: ' + (Get-WakeCommand 'drain')
@@ -321,8 +415,8 @@ try {
             Write-Output "watch: no new events."
             break
         }
-        if ((Get-ActiveTasks).Count -eq 0) {
-            Write-Output "watch: no active posse tasks."
+        if ((Get-WatchLoad).Total -eq 0) {
+            Write-Output "watch: no active posse tasks and no published pull request waiting to be merged."
             exit 0
         }
         if ($deadline -and (Get-Date) -gt $deadline) {

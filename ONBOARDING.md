@@ -58,6 +58,8 @@ The Deputy will:
 - **Delivered PRs** carry a validation evidence file at `.deputy/evidence/<taskId>.md` - proof of what was run and that it passed, pinned to the validated commit.
 - **Validation is automatic**: the gate detects `npm test`/`lint`, `cargo test`, `go test`, `dotnet test`, or `pytest` from the repo's default branch. To pin exact commands or opt a repo out, edit `config\projects.json` (see README).
 - **A gate with nothing to run is not a pass**: if your repo has no detectable test command, the Deputy reports the work as *unverified* and refuses to publish until you pin commands in `config\projects.json` or explicitly approve publishing unvalidated work.
+- **Merging and tearing down are guarded**: the Deputy merges only a PR that is open, conflict-free, green at its current commit and unchanged since it was published, and tells you every reason when it will not. It returns a worktree only after proving the work landed (pushed, or merged); throwing unlanded work away takes your explicit word.
+- **Open PRs are watched**: after a PR is opened the Deputy is told when it is merged (it then tears the task down) and when a check on it turns red (it then tells you).
 - **Failures are normal output**: if a member gets stuck or its work fails the gate, the Deputy diagnoses, retries with better instructions, or escalates to you with its analysis.
 - **Security posture**: posse members run unattended (`bypassPermissions` by default) inside their worktrees. Point Deputy at repos you trust, on a machine you trust. For least privilege, see "Permissions for posse members" in the README.
 
@@ -75,7 +77,7 @@ pwsh -NoProfile -File bin\dep-posse.ps1 logs <taskId> # readable live log
 - **Member stalls immediately** - almost always permissions: headless agents cannot answer prompts. Keep the default permission mode, or grant tools explicitly (README, Permissions section).
 - **`gh` errors about token scopes** - `gh pr view` needs `read:org`; re-auth with `gh auth login` or add the scope to your PAT.
 - **Spawn refuses with "Refusing to lease a worktree"** - treehouse is older than 3.0.1 or its version cannot be read. Run `pwsh -NoProfile -File bin\dep-doctor.ps1` and apply the fix it names (`treehouse update`, with no tasks leased, straight to the latest release - never to 3.0.0).
-- **Worktree stuck as leased** - `treehouse status` (run inside the repo) to inspect; `pwsh -NoProfile -File bin\dep-return.ps1 <taskId>` releases it safely.
+- **Worktree stuck as leased** - `treehouse status` (run inside the repo) to inspect; `pwsh -NoProfile -File bin\dep-return.ps1 <taskId>` releases it safely: it refuses, and says why, if the task's work has not landed anywhere (add `-Discard` only when you mean to throw that work away).
 
 ## Updating
 

@@ -19,9 +19,10 @@ posse member ...... own worktree, own branch; as many in parallel as you like
 posse member ......   ship: implement + test + commit    scout: investigate
    |
    v
-dep-watch.ps1 ..... polls stream-json logs + process liveness; wakes the
-   |                Deputy only on: completed / failed / interrupted /
-   |                blocked / needs-decision / died / stalled.
+dep-watch.ps1 ..... polls stream-json logs + process liveness, and the pull
+   |                request of every published task; wakes the Deputy only
+   |                on: completed / failed / interrupted / blocked /
+   |                needs-decision / died / stalled / merged / degraded.
    |                Started by the session's Stop hook, and every wake is
    |                queued until acknowledged (dep-wake.ps1), so a restart
    |                or an API error loses nothing
@@ -34,7 +35,11 @@ delivery .......... direct-pr:   member already pushed and opened the PR
                                  dep-publish.ps1 pushes and opens the PR
    |
    v
-dep-return.ps1 .... worktree back to the pool, task state archived
+dep-pr.ps1 merge .. merges only a PR it has proven fit to merge
+   |
+   v
+dep-return.ps1 .... proves the work landed, then: worktree back to the pool,
+                    task state archived
 ```
 
 - **Ship tasks** implement, test, and commit; how the PR happens depends on the repo's delivery mode (below).
@@ -96,7 +101,7 @@ pwsh -NoProfile -File bin\dep-pr.ps1 checks <taskId>
 pwsh -NoProfile -File bin\dep-pr.ps1 diff <taskId>
 pwsh -NoProfile -File bin\dep-pr.ps1 merge <taskId>
 
-# tear down
+# tear down (refuses work that has not landed; -Discard overrides, on your word only)
 pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 ```
 
@@ -107,7 +112,7 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | `dep-doctor.ps1` | Toolchain check: PowerShell 7+, `git` / `gh` / `claude` / `treehouse` on PATH, `gh auth status`, treehouse at least 3.0.1 with `get --lease`, and the Deputy clone on its default branch and not behind `origin`. One line per problem, each naming its fix; prints nothing when healthy. Exit 0 healthy, 1 on any problem. Report only - it never installs, updates or pulls |
 | `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>] [-Effort low\|medium\|high\|xhigh\|max] [-MaxBudgetUsd <n>]` | Lease a worktree, launch a headless posse member, register task state. The session gets an id Deputy chose (`--session-id`, kept as `sessionId` in task state) and the task id as its name, so it can be resumed. `-Effort` and `-MaxBudgetUsd` become `--effort` and `--max-budget-usd`; both default to the config and are left off when that is `null`. Refuses to lease when treehouse fails the doctor's version check |
 | `dep-send.ps1 <taskId> -Message <text>` | Send a follow-up to a member whose process has exited: starts `claude -p --resume <sessionId>` in the task's worktree with the message on stdin and the same flags as the first run, appends to the same log, sets the task back to `running` and records the follow-up in task state. Refuses while the member is alive, when the watcher has not reported the run's outcome yet, and when the worktree is gone (see "Resumable members") |
-| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n]` | Scan tasks for wake events; `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as completed (or failed, interrupted, blocked, needs-decision) only when its final `result` event has arrived AND the member process has exited - a `result` seen while the process is alive is interim (the member may be waiting on background helpers) and wakes nobody. What the final result means is in "Resumable members". A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90). Every wake is appended to the durable queue with a sequence number before its task record is updated. One watcher at a time: it holds `state\watcher.lock` and touches `state\watcher.beat` on every poll, and a second one says so and exits 0 (see "Wakes that survive") |
+| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n] [-PrPollSeconds n]` | Scan tasks for wake events, and poll the pull request of every published, unmerged task for `merged` and `degraded` (see "Guarded merge, guarded teardown, and PR watching"); `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as completed (or failed, interrupted, blocked, needs-decision) only when its final `result` event has arrived AND the member process has exited - a `result` seen while the process is alive is interim (the member may be waiting on background helpers) and wakes nobody. What the final result means is in "Resumable members". A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90). Every wake is appended to the durable queue with a sequence number before its task record is updated. One watcher at a time: it holds `state\watcher.lock` and touches `state\watcher.beat` on every poll, and a second one says so and exits 0 (see "Wakes that survive") |
 | `dep-wake.ps1 drain` | Print every unacknowledged wake, oldest first, with what its task looks like now. The last line is the exact `ack -Through <seq>` command for what was printed. Changes nothing |
 | `dep-wake.ps1 ack -Through <seq>` | Remove the wakes at or below `<seq>` from the queue, atomically and under the state lock. Refuses a sequence that was never handed out |
 | `dep-session-start.ps1 [-Hook]` | Session-start report: doctor lines, `dep-posse.ps1 status`, watcher health, the drained queue. Always exits 0. Run by the `SessionStart` hook |
@@ -117,9 +122,9 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | `dep-posse.ps1 result <taskId>` | Final report text, the status the member reported, follow-ups sent, cost, scout report path, PR URL |
 | `dep-posse.ps1 kill <taskId>` | Stop a runaway member's process tree (lease kept for inspection). Kills only processes proven to be the task's - see "What Deputy will kill" |
 | `dep-validate.ps1 <taskId>` | Run the no-mistakes gate in the task's worktree; commits evidence on pass. Exit 0 passed, 1 failed, 2 unverified (no commands to run) |
-| `dep-publish.ps1 <taskId> [-AllowUnverified]` | Push the branch and open the PR; refuses a failed or unverified gate. `-AllowUnverified` is the Sheriff's opt-in for repos with no gate, and labels the PR as never validated |
-| `dep-pr.ps1 <view\|checks\|diff\|merge> <taskId> [-Method squash\|merge\|rebase]` | PR operations via gh (merge defaults to squash; branch cleanup happens in dep-return) |
-| `dep-return.ps1 <taskId>` | Kill stragglers (same proof as `kill`), return the lease (guarded by `--if-lease-id`), delete the task branch, archive state. After this the task can no longer be resumed |
+| `dep-publish.ps1 <taskId> [-AllowUnverified]` | Push the branch and open the PR, recording its number and head commit (`prNumber`, `prHead`); refuses a failed or unverified gate, and a branch that moved after the gate judged it. On a task that already has a PR it pushes the branch's new validated commits to that PR, rewrites the PR description and moves `prHead` on. `-AllowUnverified` is the Sheriff's opt-in for repos with no gate, and labels the PR as never validated |
+| `dep-pr.ps1 <view\|checks\|diff\|merge> <taskId> [-Method squash\|merge\|rebase] [-AllowNoChecks]` | PR operations over GitHub's REST API (`gh api`), so no `read:org` token scope is needed. `checks` exits 0 when nothing is failing or pending, 1 on a failing check, 8 when one is only pending. `merge` (squash by default) refuses a PR that is not fit to merge, listing every failing condition, and records the merge only when it is proven; branch cleanup happens in dep-return |
+| `dep-return.ps1 <taskId> [-Discard]` | Prove the work landed (refuse with the reason and exit 1 otherwise), then kill stragglers (same proof as `kill`), return the lease (guarded by `--if-lease-id`), delete the task branch, archive state. `-Discard` skips the proof and needs the Sheriff's explicit word. The remote branch of an open PR is never deleted. After this the task can no longer be resumed |
 | `dep-dashboard.ps1 [-Id <taskId>] [-Tail n]` | Live posse view in Windows Terminal: auto-refreshing status tab + a live-tail tab per active member. Re-running adds new members' tabs to the same window; `-Id` opens one task (active or archived) |
 
 Inside a Deputy session, the `/dashboard` skill (`.claude\skills\dashboard`) opens the same posse view on request.
@@ -192,7 +197,7 @@ The watcher reads `structured_output` from the final `result` event and keeps it
 
 **One log, several runs.** A resumed run appends to the task's log. `dep-send.ps1` first writes a marker line (`{"type":"deputy","subtype":"follow_up",...}`, shown as `[send]` by `dep-posse.ps1 logs`) and records the byte offset after it as `logOffset`; the watcher reads results only from there on, so an earlier run's result is never mistaken for the resumed run's. A resumed run that writes nothing ends as `died`, not as a second `completed`. Each follow-up is kept in task state (`followUps`: number, time, the status it answered, pid, message) and its text in `state\<taskId>-followup-<n>.md`.
 
-**A follow-up reopens the gate.** The member is about to change the branch, so `dep-send.ps1` clears `validation` and its notes; `dep-validate.ps1` has to judge the branch again. `dep-publish.ps1` opens a PR once and does not push to it again, so follow-ups belong before publishing.
+**A follow-up reopens the gate.** The member is about to change the branch, so `dep-send.ps1` clears `validation` and its notes; `dep-validate.ps1` has to judge the branch again. That works after publishing too: `dep-publish.ps1` on a task that already has a PR pushes the new validated commits to that same PR (a plain push, never a force), rewrites the PR description with the new summary and verdict, and moves the recorded `prHead` to the new commit. It refuses when the PR is no longer open or cannot be read, and does nothing when the PR is already at the branch's head.
 
 **Cost.** The watcher keeps `total_cost_usd`, `num_turns` and `duration_ms` from each final result as `totalCostUsd`, `numTurns` and `durationMs`, and `dep-posse.ps1 status` shows the cost per task. `--max-budget-usd` caps one run: a member that reaches it ends as `failed` with `Reached maximum budget`, and a resumed run gets the cap afresh.
 
@@ -213,6 +218,45 @@ The watcher reads `structured_output` from the final `result` event and keeps it
 | The real scripts end to end against the real CLI (a throwaway Deputy home; `treehouse` replaced by a shim that leased a linked worktree of the throwaway repo): `dep-spawn.ps1`, a `needs-decision` wake carrying the member's question, `dep-send.ps1` with the decision, a `completed` wake | works: both runs carried the session id from task state, the resumed run appended to the same log after the `[send]` marker, committed the file it had created in the first run, and quoted a codeword from the briefing |
 | The same against a real treehouse lease | not checked: the hand runs deliberately left the real worktree pool alone |
 
+## Guarded merge, guarded teardown, and PR watching
+
+The two irreversible commands in the toolbelt used to be the two with no checks: `dep-return.ps1` reset the worktree and deleted the remote branch whatever state the work was in, and `dep-pr.ps1 merge` merged whatever state CI was in. Both relied on the supervising model getting the order right every time. They now prove the outcome themselves and refuse otherwise.
+
+**Everything GitHub is read over REST.** `dep-pr.ps1` and the watcher call `gh api repos/{owner}/{repo}/pulls/{n}`, the check-runs and commit-status endpoints of the head commit, and the branch protection endpoint; the merge is a REST call too (`PUT .../pulls/{n}/merge`). gh's own `pr view`, `pr checks` and `pr merge` go through GraphQL queries that need the `read:org` token scope, which a supervisor's token often lacks; the REST endpoints need nothing beyond access to the repository. Owner, repo and number come from the task's recorded `prUrl`.
+
+**`dep-pr.ps1 merge` refuses** unless the pull request is fit to merge. It reads the PR and reports every failing condition, not just the first:
+
+| Condition | Refused when |
+| --- | --- |
+| State | the PR is not open (a PR that is already merged is recorded and reported, not merged again) |
+| Draft | the PR is a draft |
+| Conflicts | GitHub reports it not mergeable, or has not finished computing that after a few re-reads |
+| Checks | any check run or commit status at the current head commit is failing or still pending (neutral and skipped runs count as successful), or the checks cannot be read |
+| No checks | nothing is reported at the head while the base branch's protection requires checks. When the protection cannot be read - GitHub answers 403 or 404 to a token without admin rights on the repository - that is said, and the merge is refused unless `-AllowNoChecks` is passed. The flag never overrides a protection that was read and requires checks |
+| Head | the head commit is not the one recorded at publish (`prHead`): somebody pushed to the PR after the gate judged it. A PR the member opened itself (`direct-pr`) has no recorded head, and is held to the HEAD of the task worktree |
+
+The merge call names the head commit it expects (`sha`, the REST form of `gh pr merge --match-head-commit <sha>`), so GitHub refuses it if the head moves in between. Afterwards the PR is read again, and `mergedAt` and `mergeSha` go into task state only when that read shows it merged; otherwise the command prints `MERGE NOT PROVEN`, records nothing and exits 1.
+
+**`dep-return.ps1` refuses** unless the work has landed. The test is one function, `Test-TaskLanded` in `dep-lib.ps1`:
+
+- **Ship tasks.** The worktree is clean, untracked files included, and one of these holds: every commit ahead of the default branch is reachable from a remote-tracking branch after a `git fetch --prune`; or the task's pull request is merged and either its head contains the local HEAD or the local tree is identical to the freshly fetched default branch (a squash merge leaves no commit of the branch behind, only its content). A branch with nothing ahead of the default branch has nothing to lose.
+- **Scout tasks.** The report file `state\<taskId>-report.md` exists.
+
+Otherwise it prints `REFUSED`, with the reason, changes nothing and exits 1. `-Discard` overrides the refusal and throws the unlanded work away; it is yours to order, explicitly, for that task. The teardown records what it stood on (`landed`, `landedReason`, and `discarded` when the proof was overridden).
+
+The remote branch is treated separately, because deleting it can destroy work the local proof just relied on: it is never deleted while the task's pull request is open - not with `-Discard` either - or while the PR cannot be read, and it is kept when it is the only place the commits exist (pushed, but not merged anywhere). It is deleted once the PR is merged or the commits are on another remote branch.
+
+**PR watching.** Once a task has a pull request, the watcher reads it every `prPollMinutes` (default 5) until it is merged or the task is returned, and raises two wakes through the same durable queue as all the others:
+
+| Wake | When | What the Deputy does |
+| --- | --- | --- |
+| `merged` | once, when the PR is seen merged. `mergedAt` and `mergeSha` are recorded. A merge `dep-pr.ps1 merge` made itself is already recorded and raises none | runs `dep-return.ps1` |
+| `degraded` | once per head commit, when a check is failing at the PR's head. A PR counts as green from the moment it is published, since the gate passed on that commit, so the first red check is news | tells you |
+
+A lookup that fails - no network, gh not signed in, a 404, a 500 - raises nothing and records nothing but the time of the attempt: an unreadable PR is never read as merged. The poll writes only its own fields onto the task record as it is on disk, so it cannot undo what another command recorded while the read was in flight.
+
+An open pull request counts as work for the watcher: the `Stop` hooks keep one running for it exactly as they do for a running member, and `dep-watch.ps1 -Wait` goes home only when no task is active and no published PR is waiting. In print mode (`claude -p`) that holds a one-shot Deputy until the PR is merged; set `"prPollMinutes": 0` to switch PR watching off for such runs.
+
 ## What Deputy will kill
 
 `dep-posse.ps1 kill` and `dep-return.ps1` force-kill process trees, so a pid is treated as a claim to check, not an instruction. The candidates are the member pid recorded at spawn and whatever treehouse lists in the task's worktree; treehouse's listing says where to look, and is never by itself a licence to kill. A candidate is killed only when both of these hold:
@@ -229,7 +273,7 @@ On top of that, pid 0 and pid 4 are never candidates, a worktree listing of more
 1. The member's job ends at "implement, test, commit locally" (it never pushes or opens PRs).
 2. On completion the Deputy runs `dep-validate.ps1` in the worktree - a deterministic gate the member has no control over.
 3. On green, the evidence (commands, exit codes, output, validated commit sha, gate source) is committed to the branch, PR-viewable at `.deputy/evidence/<taskId>.md`, and `dep-publish.ps1` pushes and opens the PR.
-4. On red, the failure is recorded in task state and the Deputy respawns the member with the failure output in its briefing.
+4. On red, the failure is recorded in task state and the Deputy sends the failure output back to the member (`dep-send.ps1`), which fixes it in the same session and worktree.
 
 Captured command output in the evidence is redacted on a best-effort basis (common `key=value` secrets, connection-string credentials, well-known token shapes) before it is written anywhere. Redaction is pattern-based and cannot catch everything - test suites should not print secrets.
 
@@ -311,6 +355,7 @@ Two traps worth knowing:
 | `autoWatch` | `true` | Whether the `Stop` / `StopFailure` hook runs the watcher and rewakes the session (see "Wakes that survive") |
 | `effort` | `null` | Default `--effort` for posse members: `low`, `medium`, `high`, `xhigh` or `max` (`null` = leave the flag off). `dep-spawn.ps1 -Effort` overrides it |
 | `maxBudgetUsd` | `null` | Default `--max-budget-usd` for one run of a posse member (`null` = no cap). `dep-spawn.ps1 -MaxBudgetUsd` overrides it |
+| `prPollMinutes` | `5` | Minutes between the watcher's reads of one published task's pull request (`0` = no PR watching, no `merged` or `degraded` wakes) |
 
 ## Layout
 
@@ -346,7 +391,7 @@ Both run on exact module versions pinned in `tools\gate-modules.psd1`, and refus
 pwsh -NoProfile -File tools\Install-GateModules.ps1
 ```
 
-The tests build throwaway git repos and throwaway Deputy installs under `$env:TEMP` - no network, and they never touch the real `state\` or `logs\`. They need only `git` and `pwsh`: no treehouse, no claude, and no signed-in `gh`. Where a test has to see what a member process was given (`dep-spawn.ps1`, `dep-send.ps1`), fake `claude` and `treehouse` shims go first on `PATH`.
+The tests build throwaway git repos and throwaway Deputy installs under `$env:TEMP` - no network, and they never touch the real `state\` or `logs\`. They need only `git` and `pwsh`: no treehouse, no claude, and no signed-in `gh`. Where a test has to see what a member process was given (`dep-spawn.ps1`, `dep-send.ps1`), fake `claude` and `treehouse` shims go first on `PATH`. Everything that reads or merges a pull request (`dep-pr.ps1`, `dep-publish.ps1`, `dep-return.ps1`, the watcher's PR polling) runs against a fake `gh` on `PATH` that answers `gh api` from a routes file, and against local bare repositories as `origin`.
 
 ### CI
 

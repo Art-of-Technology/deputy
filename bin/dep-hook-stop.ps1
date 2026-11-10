@@ -11,9 +11,10 @@ if the session is sitting idle. So this hook:
 
 1. hands over any wake in the durable queue that it has not pushed at the
    session before (exit 2 with the drain report);
-2. otherwise, if tasks are active and no healthy watcher reports to this
-   session, runs dep-watch.ps1 -Wait in its own foreground and, when that
-   returns a wake, exits 2 with the drain report;
+2. otherwise, if tasks are active - or a published pull request is still
+   waiting to be merged, which the watcher polls - and no healthy watcher
+   reports to this session, runs dep-watch.ps1 -Wait in its own foreground
+   and, when that returns a wake, exits 2 with the drain report;
 3. otherwise exits 0 and says nothing.
 
 It runs on StopFailure too, which is the turn ending on an API error - the
@@ -88,11 +89,13 @@ try {
         # replaced (another session's stop hook took the lock over) or it
         # crashed. Either way, stand down rather than fight for the lock.
         if ($watchExit -ne 0) { exit 0 }
-        if (@(Get-ActiveTasks).Count -eq 0) { exit 0 }
+        # Work for a watcher is a running member, or a published pull request
+        # that has not been merged yet (the watcher polls it).
+        if ((Get-WatchLoad).Total -eq 0) { exit 0 }
         if (Test-WatcherServes (Get-WatcherHealth) $session) { exit 0 }
 
-        # Park on the watcher. It returns when a wake fires, when no task is
-        # active any more, or at once when another live watcher holds the lock;
+        # Park on the watcher. It returns when a wake fires, when there is
+        # nothing left to watch, or at once when another live watcher holds the lock;
         # the next pass through the loop works out which from the queue and
         # the lock, not from what it printed.
         $started = [datetime]::UtcNow

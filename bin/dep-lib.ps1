@@ -79,6 +79,9 @@ function Get-DeputyConfig {
         # flag off the member's command line.
         effort               = $null
         maxBudgetUsd         = $null
+        # How often the watcher reads each published, unmerged task's pull
+        # request (see Get-PrWatchTasks). 0 switches PR watching off.
+        prPollMinutes        = 5
     }
     $p = Get-DeputyPaths
     if (Test-Path $p.ConfigFile) {
@@ -243,23 +246,55 @@ function Read-TaskState([string]$Id) {
     Get-Content $path -Raw | ConvertFrom-Json
 }
 
+function Get-TaskStateFile([string]$Id) {
+    # Where a task's record is right now: active, else archived (returned),
+    # else $null.
+    $path = Get-TaskStatePath $Id
+    if (Test-Path -LiteralPath $path) { return $path }
+    $path = Join-Path (Get-DeputyPaths).Archive "$(Assert-TaskId $Id).json"
+    if (Test-Path -LiteralPath $path) { return $path }
+    $null
+}
+
 function Read-TaskStateAny([string]$Id) {
     # Like Read-TaskState but also finds archived (returned) tasks
-    $path = Get-TaskStatePath $Id
-    if (-not (Test-Path $path)) {
-        $path = Join-Path (Get-DeputyPaths).Archive "$(Assert-TaskId $Id).json"
-    }
-    if (-not (Test-Path $path)) {
+    $path = Get-TaskStateFile $Id
+    if (-not $path) {
         throw "No task state (active or archived) for '$Id'."
     }
     Get-Content $path -Raw | ConvertFrom-Json
 }
 
-function Write-TaskState($State) {
-    $path = Get-TaskStatePath $State.id
-    $tmp = "$path.tmp"
+function Write-TaskState($State, [string]$Path) {
+    # -Path is for a record that may be archived (see Write-TaskStateAny).
+    if (-not $Path) { $Path = Get-TaskStatePath $State.id }
+    $tmp = "$Path.tmp"
     $State | ConvertTo-Json -Depth 8 | Set-Content -Path $tmp -Encoding utf8
-    Move-Item -Force $tmp $path
+    Move-Item -Force $tmp $Path
+}
+
+function Write-TaskStateAny($State) {
+    # Write a record back where it lives. Write-TaskState alone would bring a
+    # returned task back to life in the active directory.
+    $path = Get-TaskStateFile $State.id
+    if (-not $path) { throw "No task state (active or archived) for '$($State.id)'." }
+    Write-TaskState $State $path
+}
+
+function Update-TaskState([string]$Id, [System.Collections.IDictionary]$Fields) {
+    # Set a few fields on an ACTIVE task's record as it is on disk right now,
+    # under the state lock. For a writer that read the record a while ago (the
+    # watcher, across a network call): writing its own stale copy back would
+    # undo whatever another script recorded in the meantime. False when the
+    # task is no longer active.
+    Invoke-WithStateLock {
+        $path = Get-TaskStatePath $Id
+        if (-not (Test-Path -LiteralPath $path)) { return $false }
+        $state = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+        foreach ($name in @($Fields.Keys)) { Set-TaskField $state $name $Fields[$name] }
+        Write-TaskState $state
+        $true
+    }
 }
 
 function Set-TaskField($State, [string]$Name, $Value) {
@@ -274,8 +309,40 @@ function Get-AllTasks {
 }
 
 function Get-ActiveTasks {
-    # Tasks a watcher still has to watch.
+    # Tasks whose member a watcher still has to watch.
     @(Get-AllTasks | Where-Object { $_.status -in @('running', 'stalled') })
+}
+
+function Test-TaskPrWatched($State) {
+    # Does this task have a pull request the watcher should keep an eye on?
+    # Published (or opened by the member), not yet seen merged, not returned.
+    if ($State.kind -ne 'ship' -or $State.status -eq 'returned') { return $false }
+    if (Get-EventField $State 'mergedAt') { return $false }
+    [bool](Get-TaskPrRef $State)
+}
+
+function Get-PrWatchTasks {
+    # Tasks whose pull request the watcher polls. None when PR watching is
+    # switched off (prPollMinutes 0).
+    if ([double](Get-DeputyConfig).prPollMinutes -le 0) { return @() }
+    @(Get-AllTasks | Where-Object { Test-TaskPrWatched $_ })
+}
+
+function Get-WatchLoad {
+    # Everything a watcher has work for: members that are running, and pull
+    # requests that are open. A watcher is needed while Total is above zero.
+    $active = @(Get-ActiveTasks)
+    $activeIds = @($active | ForEach-Object { $_.id })
+    $pulls = @(Get-PrWatchTasks | Where-Object { $activeIds -notcontains $_.id })
+    $parts = @()
+    if ($active.Count -gt 0) { $parts += "$($active.Count) posse task(s) are active" }
+    if ($pulls.Count -gt 0) { $parts += "$($pulls.Count) published pull request(s) are waiting to be merged" }
+    [pscustomobject]@{
+        Active = $active.Count
+        Pulls  = $pulls.Count
+        Total  = $active.Count + $pulls.Count
+        Text   = $parts -join ' and '
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -504,6 +571,9 @@ function Format-Wake {
         # These are answered in the member's own session, not with a respawn.
         '  follow-ups sent so far: {0}. Answer in the same session with: {1}' -f
             [int]$Wake.followUps, (Get-SendCommand $Wake.taskId)
+    }
+    if ($Wake.event -eq 'merged') {
+        '  The work has landed. Tear the task down with: {0}' -f (Get-ReturnCommand $Wake.taskId)
     }
 }
 
@@ -1653,8 +1723,440 @@ function Get-TaskFollowUps($State) {
     @(Get-EventField $State 'followUps' | Where-Object { $_ })
 }
 
+function Get-ReturnCommand([string]$Id) {
+    'pwsh -NoProfile -File "{0}" {1}' -f (Join-Path (Get-DeputyPaths).Bin 'dep-return.ps1'), $Id
+}
+
 function Get-SendCommand([string]$Id, [string]$Message = '...') {
     'pwsh -NoProfile -File "{0}" {1} -Message "{2}"' -f (Join-Path (Get-DeputyPaths).Bin 'dep-send.ps1'), $Id, $Message
+}
+
+# ---------------------------------------------------------------------------
+# GitHub over REST. Every read of a pull request, and the merge itself, goes
+# through `gh api`: gh's own `pr view`, `pr checks` and `pr merge` use GraphQL
+# queries that need the read:org token scope, which a supervisor's token often
+# does not have. The REST endpoints below need nothing beyond access to the
+# repository.
+# ---------------------------------------------------------------------------
+
+function Invoke-GhApi {
+    <#
+    .SYNOPSIS
+    One REST call through `gh api`. Returns Ok, the HTTP Status (0 when gh never
+    got an answer: not installed, not signed in, no network), the parsed Json,
+    the body Text, and an Error line when it failed. Never throws.
+
+    -Fields become query parameters (-f) and are for GET; -Body is sent as the
+    JSON request body on stdin, so its text never has to survive a command line.
+    #>
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Endpoint,
+        [string]$Method = 'GET',
+        [System.Collections.IDictionary]$Fields,
+        [System.Collections.IDictionary]$Body,
+        [string]$Accept,
+        # The body is not JSON (a diff): leave it as text.
+        [switch]$Raw
+    )
+    $result = [pscustomobject]@{ Ok = $false; Status = 0; Json = $null; Text = ''; Error = '' }
+    if (-not (Test-CommandOnPath 'gh')) {
+        $result.Error = 'gh is not on PATH'
+        return $result
+    }
+    # --include puts the status line and headers in front of the body, for
+    # errors too, so the status is read from the response and not guessed from
+    # an error message.
+    $arguments = @('api', '--include', '--method', $Method)
+    if ($Accept) { $arguments += @('-H', "Accept: $Accept") }
+    if ($Fields) { foreach ($name in @($Fields.Keys)) { $arguments += @('-f', "$name=$($Fields[$name])") } }
+    if ($Body) { $arguments += @('--input', '-') }
+    $arguments += $Endpoint
+
+    # gh writes UTF-8 whatever the console's code page is.
+    $previousEncoding = $null
+    try {
+        $previousEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    }
+    catch { $previousEncoding = $null }
+    try {
+        $all = if ($Body) { ($Body | ConvertTo-Json -Depth 8 -Compress) | & gh @arguments 2>&1 }
+        else { & gh @arguments 2>&1 }
+        $exit = $LASTEXITCODE
+    }
+    catch {
+        $result.Error = "gh could not be run: $($_.Exception.Message)"
+        return $result
+    }
+    finally {
+        if ($previousEncoding) { try { [Console]::OutputEncoding = $previousEncoding } catch { $null = $_ } }
+    }
+
+    $stderr = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) |
+        ForEach-Object { "$_" }) -join ' '
+    $lines = @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" })
+    $bodyLines = $lines
+    if ($lines.Count -gt 0 -and $lines[0] -match '^HTTP/\S+\s+(\d{3})\b') {
+        $result.Status = [int]$Matches[1]
+        $blank = [array]::IndexOf($lines, '')
+        $bodyLines = if ($blank -ge 0 -and $blank + 1 -lt $lines.Count) { $lines[($blank + 1)..($lines.Count - 1)] } else { @() }
+    }
+    elseif ($stderr -match '\(HTTP (\d{3})\)') { $result.Status = [int]$Matches[1] }
+    $result.Text = $bodyLines -join "`n"
+    if (-not $Raw -and $result.Text.Trim()) {
+        $result.Json = try { $result.Text | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+    }
+    $result.Ok = ($exit -eq 0) -and ($result.Status -eq 0 -or ($result.Status -ge 200 -and $result.Status -lt 300))
+    if (-not $result.Ok) {
+        $message = [string](Get-EventField $result.Json 'message')
+        $said = if ($message) { $message } elseif ($stderr) { $stderr } else { "gh api exited $exit" }
+        $result.Error = if ($result.Status) { "HTTP $($result.Status): $(Limit-Text $said 200)" } else { Limit-Text $said 200 }
+    }
+    $result
+}
+
+function Get-TaskPrRef($State) {
+    # The pull request a task record names, as owner, repo and number, or $null
+    # when it names none. The number comes from the URL, so a PR the member
+    # opened itself (direct-pr delivery) is addressed the same way as one
+    # dep-publish.ps1 opened.
+    $url = [string](Get-EventField $State 'prUrl')
+    if ($url -notmatch '^https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)') { return $null }
+    [pscustomobject]@{
+        Owner  = $Matches[1]
+        Repo   = $Matches[2]
+        Number = [int]$Matches[3]
+        Url    = $Matches[0]
+        Api    = "repos/$($Matches[1])/$($Matches[2])"
+    }
+}
+
+function Get-PullRequest($Ref) {
+    # The pull request as GitHub has it right now. Ok is false, with the Status
+    # and an Error, when it could not be read - which is never the same thing as
+    # "not merged" or "closed", and callers must not read it as either.
+    $response = Invoke-GhApi "$($Ref.Api)/pulls/$($Ref.Number)"
+    $pr = $response.Json
+    if (-not $response.Ok -or $pr -isnot [pscustomobject] -or -not (Get-EventField $pr 'state')) {
+        return [pscustomobject]@{
+            Ok     = $false
+            Status = $response.Status
+            Error  = if ($response.Error) { $response.Error } else { 'the response was not a pull request' }
+        }
+    }
+    $head = Get-EventField $pr 'head'
+    $base = Get-EventField $pr 'base'
+    $merged = [bool](Get-EventField $pr 'merged') -or ($null -ne (Get-EventField $pr 'merged_at'))
+    [pscustomobject]@{
+        Ok             = $true
+        Status         = $response.Status
+        Error          = ''
+        Number         = $Ref.Number
+        # open, closed (without merging) or merged
+        State          = if ($merged) { 'merged' } else { [string]$pr.state }
+        Merged         = $merged
+        MergedAt       = Get-EventField $pr 'merged_at'
+        MergeSha       = if ($merged) { [string](Get-EventField $pr 'merge_commit_sha') } else { '' }
+        Draft          = [bool](Get-EventField $pr 'draft')
+        # $true, $false, or $null while GitHub is still working it out
+        Mergeable      = Get-EventField $pr 'mergeable'
+        MergeableState = [string](Get-EventField $pr 'mergeable_state')
+        HeadSha        = [string](Get-EventField $head 'sha')
+        HeadRef        = [string](Get-EventField $head 'ref')
+        BaseRef        = [string](Get-EventField $base 'ref')
+        Title          = [string](Get-EventField $pr 'title')
+        Url            = [string](Get-EventField $pr 'html_url')
+        Raw            = $pr
+    }
+}
+
+function Get-PrChecks($Ref, [string]$Sha) {
+    <#
+    .SYNOPSIS
+    Every check reported at one commit: check runs (GitHub Actions and other
+    apps) and commit statuses (the older API some CI still reports through).
+    Each is success, pending or failure. A check run that is neutral or skipped
+    counts as success, as GitHub itself counts it.
+
+    Ok is false when either list could not be read: "no checks" is only ever
+    said about a commit whose checks were actually read.
+    #>
+    $checks = @()
+    $failed = { param($why) [pscustomobject]@{ Ok = $false; Error = $why; Checks = @(); Failing = @(); Pending = @() } }
+
+    for ($page = 1; $page -le 20; $page++) {
+        $response = Invoke-GhApi "$($Ref.Api)/commits/$Sha/check-runs" -Fields ([ordered]@{ per_page = 100; page = $page })
+        if (-not $response.Ok -or $response.Json -isnot [pscustomobject]) {
+            return (& $failed "check runs could not be read ($($response.Error))")
+        }
+        $runs = @(Get-EventField $response.Json 'check_runs' | Where-Object { $_ })
+        foreach ($run in $runs) {
+            $conclusion = [string](Get-EventField $run 'conclusion')
+            $state = if ((Get-EventField $run 'status') -ne 'completed') { 'pending' }
+            elseif ($conclusion -in @('success', 'neutral', 'skipped')) { 'success' }
+            else { 'failure' }
+            $checks += [pscustomobject]@{
+                Name   = [string](Get-EventField $run 'name')
+                State  = $state
+                Detail = if ($state -eq 'pending') { [string](Get-EventField $run 'status') } else { $conclusion }
+                Url    = [string](Get-EventField $run 'html_url')
+            }
+        }
+        $total = [int](Get-EventField $response.Json 'total_count')
+        if ($runs.Count -eq 0 -or $checks.Count -ge $total) { break }
+    }
+
+    $statuses = @()
+    for ($page = 1; $page -le 20; $page++) {
+        $response = Invoke-GhApi "$($Ref.Api)/commits/$Sha/status" -Fields ([ordered]@{ per_page = 100; page = $page })
+        if (-not $response.Ok -or $response.Json -isnot [pscustomobject]) {
+            return (& $failed "commit statuses could not be read ($($response.Error))")
+        }
+        $batch = @(Get-EventField $response.Json 'statuses' | Where-Object { $_ })
+        foreach ($status in $batch) {
+            $reported = [string](Get-EventField $status 'state')
+            $statuses += [pscustomobject]@{
+                Name   = [string](Get-EventField $status 'context')
+                State  = if ($reported -eq 'success') { 'success' } elseif ($reported -eq 'pending') { 'pending' } else { 'failure' }
+                Detail = $reported
+                Url    = [string](Get-EventField $status 'target_url')
+            }
+        }
+        $total = [int](Get-EventField $response.Json 'total_count')
+        if ($batch.Count -eq 0 -or $statuses.Count -ge $total) { break }
+    }
+
+    $checks = @($checks) + @($statuses)
+    [pscustomobject]@{
+        Ok      = $true
+        Error   = ''
+        Checks  = @($checks)
+        Failing = @($checks | Where-Object { $_.State -eq 'failure' })
+        Pending = @($checks | Where-Object { $_.State -eq 'pending' })
+    }
+}
+
+function Get-RequiredChecks($Ref, [string]$Branch) {
+    # The status checks a branch's protection requires. Readable is false when
+    # the protection could not be read at all - GitHub answers 404 or 403 to a
+    # token without admin rights on the repository, and to an unprotected
+    # branch alike, so neither answer says "nothing is required".
+    $response = Invoke-GhApi "$($Ref.Api)/branches/$([uri]::EscapeDataString($Branch))/protection"
+    if (-not $response.Ok -or $response.Json -isnot [pscustomobject]) {
+        return [pscustomobject]@{
+            Readable = $false
+            Required = @()
+            Error    = if ($response.Error) { $response.Error } else { 'the response was not a branch protection' }
+        }
+    }
+    $required = Get-EventField $response.Json 'required_status_checks'
+    $names = @(Get-EventField $required 'contexts') +
+        @(Get-EventField $required 'checks' | ForEach-Object { Get-EventField $_ 'context' })
+    [pscustomobject]@{
+        Readable = $true
+        Required = @($names | Where-Object { $_ } | Select-Object -Unique)
+        Error    = ''
+    }
+}
+
+function Format-Sha([string]$Sha) {
+    if ($Sha.Length -gt 10) { $Sha.Substring(0, 10) } else { $Sha }
+}
+
+# ---------------------------------------------------------------------------
+# Teardown. dep-return.ps1 resets a worktree and deletes branches, which cannot
+# be taken back, so it proves the work is somewhere else first.
+# ---------------------------------------------------------------------------
+
+function Test-TaskLanded($State) {
+    <#
+    .SYNOPSIS
+    Has this task's work landed somewhere that survives a teardown? The one
+    test dep-return.ps1 runs before it returns anything.
+
+    A ship task has landed when its worktree is clean (untracked files count as
+    dirty) and one of these holds:
+
+    - every commit ahead of the default branch is reachable from a
+      remote-tracking branch, after a fetch;
+    - its pull request is merged, and either the PR's head contains the local
+      HEAD or the local tree is identical to the freshly fetched default branch
+      (a squash merge leaves no commit of the branch behind, only its content).
+
+    A branch with no commits ahead of the default branch has nothing to lose,
+    and neither has a task whose worktree and local branch are both gone. A
+    scout has landed when its report file exists.
+
+    Returns Landed and the Reason either way, plus what dep-return.ps1 needs to
+    know about the remote branch: PrState (none, open, closed, merged, or
+    unknown when a recorded PR could not be read) and KeepRemoteBranch with
+    KeepRemoteReason - set while the PR is open or unreadable, and when the
+    task's own remote branch is the only place the commits exist.
+    #>
+    $verdict = [pscustomobject]@{
+        Landed           = $false
+        Reason           = ''
+        PrState          = 'none'
+        KeepRemoteBranch = $false
+        KeepRemoteReason = ''
+    }
+
+    if ($State.kind -eq 'scout') {
+        $report = Join-Path (Get-DeputyPaths).State "$(Assert-TaskId $State.id)-report.md"
+        $verdict.Landed = Test-Path -LiteralPath $report -PathType Leaf
+        $verdict.Reason = if ($verdict.Landed) { "the scout report exists at $report" }
+        else { "the scout wrote no report: $report does not exist" }
+        return $verdict
+    }
+
+    $ref = Get-TaskPrRef $State
+    $pr = $null
+    if ($ref) {
+        $pr = Get-PullRequest $ref
+        $verdict.PrState = if ($pr.Ok) { $pr.State } else { 'unknown' }
+        if ($verdict.PrState -eq 'open') {
+            $verdict.KeepRemoteBranch = $true
+            $verdict.KeepRemoteReason = "pull request #$($ref.Number) is still open"
+        }
+        elseif ($verdict.PrState -eq 'unknown') {
+            $verdict.KeepRemoteBranch = $true
+            $verdict.KeepRemoteReason = "pull request #$($ref.Number) could not be read ($($pr.Error)), so it may still be open"
+        }
+    }
+    $prNote = switch ($verdict.PrState) {
+        'none' { 'The task has no pull request.' }
+        'open' { "Pull request #$($ref.Number) is open, not merged." }
+        'closed' { "Pull request #$($ref.Number) was closed without merging." }
+        'unknown' { "Pull request #$($ref.Number) could not be read ($($pr.Error))." }
+        default { '' }
+    }
+
+    # Where the commits live: the worktree while it exists, else the task
+    # branch in the repository the worktree was leased from.
+    $branch = [string](Get-EventField $State 'branch')
+    $hasWorktree = $State.worktree -and (Test-Path -LiteralPath $State.worktree -PathType Container)
+    $dir = if ($hasWorktree) { $State.worktree } else { $State.repo }
+    $isRepo = $false
+    if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
+        git -C $dir rev-parse --git-dir *> $null
+        $isRepo = ($LASTEXITCODE -eq 0)
+    }
+    if (-not $isRepo) {
+        $verdict.Landed = $true
+        $verdict.Reason = 'neither the worktree nor the repository is there any more, so nothing local is left to lose'
+        return $verdict
+    }
+
+    if ($hasWorktree) {
+        $dirty = @(git -C $dir status --porcelain 2>$null)
+        if ($LASTEXITCODE -ne 0) {
+            $verdict.Reason = "git status failed in $dir, so the worktree cannot be shown to be clean"
+            return $verdict
+        }
+        if ($dirty.Count -gt 0) {
+            $verdict.Reason = "the worktree has $($dirty.Count) uncommitted or untracked path(s): " +
+                (Limit-Text ($dirty -join '; ') 200)
+            return $verdict
+        }
+        $tip = (git -C $dir rev-parse --verify --quiet 'HEAD^{commit}' 2>$null | Out-String).Trim()
+    }
+    elseif ($branch -and (Test-GitRef $dir "refs/heads/$branch")) {
+        $tip = (git -C $dir rev-parse --verify --quiet "refs/heads/$branch^{commit}" 2>$null | Out-String).Trim()
+    }
+    else {
+        $verdict.Landed = $true
+        $verdict.Reason = 'the worktree is gone and the task branch does not exist locally, so nothing local is left to lose'
+        return $verdict
+    }
+    if (-not $tip) {
+        $verdict.Reason = "the task's HEAD commit cannot be resolved in $dir"
+        return $verdict
+    }
+
+    # What is on the remote is only known after a fetch. --prune, so a remote
+    # branch that was deleted does not go on vouching for commits.
+    $hasOrigin = @(git -C $dir remote 2>$null) -contains 'origin'
+    $fetched = $false
+    if ($hasOrigin) {
+        $previousPrompt = $env:GIT_TERMINAL_PROMPT
+        $env:GIT_TERMINAL_PROMPT = '0'  # fail, do not sit at a credential prompt
+        try { git -C $dir fetch --quiet --prune origin *> $null; $fetched = ($LASTEXITCODE -eq 0) }
+        finally { $env:GIT_TERMINAL_PROMPT = $previousPrompt }
+    }
+
+    $anchor = Resolve-DefaultRef $dir
+    if (-not $anchor.Ref) {
+        $verdict.Reason = "the default branch of $dir cannot be resolved ($($anchor.Source)), so nothing can be proven about what is ahead of it"
+        return $verdict
+    }
+    $ahead = @(git -C $dir rev-list $tip "^$($anchor.Ref)" 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        $verdict.Reason = "git could not list the commits ahead of $($anchor.Ref)"
+        return $verdict
+    }
+    if ($ahead.Count -eq 0) {
+        $verdict.Landed = $true
+        $verdict.Reason = "there are no commits ahead of $($anchor.Ref)"
+        return $verdict
+    }
+    if ($hasOrigin -and -not $fetched) {
+        $verdict.Reason = "origin could not be fetched, so what is on the remote cannot be proven ($($ahead.Count) commit(s) are ahead of $($anchor.Ref))"
+        return $verdict
+    }
+
+    $unpushed = @(git -C $dir rev-list $tip "^$($anchor.Ref)" --not --remotes=origin 2>$null)
+    if ($unpushed.Count -eq 0) {
+        $verdict.Landed = $true
+        $verdict.Reason = "every commit ahead of $($anchor.Ref) is on a remote-tracking branch"
+        # Is the task's own remote branch the only one holding them? Then
+        # deleting it would delete the work, unless the PR took it in.
+        $others = @(git -C $dir for-each-ref --format='%(refname)' refs/remotes/origin 2>$null |
+            Where-Object { $_ -and $_ -ne "refs/remotes/origin/$branch" })
+        $elsewhere = $false
+        if ($others.Count -gt 0) {
+            $onlyHere = @(git -C $dir rev-list $tip --not @others 2>$null)
+            $elsewhere = ($LASTEXITCODE -eq 0) -and ($onlyHere.Count -eq 0)
+        }
+        if (-not $elsewhere -and $verdict.PrState -ne 'merged' -and -not $verdict.KeepRemoteBranch) {
+            $verdict.KeepRemoteBranch = $true
+            $verdict.KeepRemoteReason = "origin/$branch is the only place its commits exist"
+        }
+        return $verdict
+    }
+
+    $first = (git -C $dir log -1 --format='%h %s' $unpushed[-1] 2>$null | Out-String).Trim()
+    $missing = "$($unpushed.Count) commit(s) ahead of $($anchor.Ref) are on no remote-tracking branch (oldest: $(Limit-Text $first 80))"
+    if ($verdict.PrState -ne 'merged') {
+        $verdict.Reason = "$missing. $prNote"
+        return $verdict
+    }
+
+    # Merged. The PR's head may be a commit this clone never fetched (someone
+    # pushed to the PR, and the branch is deleted on merge): ask for it.
+    if ($pr.HeadSha -and $pr.HeadSha -ne $tip) {
+        git -C $dir cat-file -e "$($pr.HeadSha)^{commit}" *> $null
+        if ($LASTEXITCODE -ne 0) { git -C $dir fetch --quiet origin "refs/pull/$($ref.Number)/head" *> $null }
+    }
+    $contained = $false
+    if ($pr.HeadSha) {
+        git -C $dir merge-base --is-ancestor $tip $pr.HeadSha *> $null
+        $contained = ($LASTEXITCODE -eq 0)
+    }
+    if ($contained) {
+        $verdict.Landed = $true
+        $verdict.Reason = "pull request #$($ref.Number) is merged and its head $(Format-Sha $pr.HeadSha) contains the local HEAD"
+        return $verdict
+    }
+    $localTree = (git -C $dir rev-parse --verify --quiet "$tip^{tree}" 2>$null | Out-String).Trim()
+    $defaultTree = (git -C $dir rev-parse --verify --quiet "$($anchor.Ref)^{tree}" 2>$null | Out-String).Trim()
+    if ($fetched -and $localTree -and $localTree -eq $defaultTree) {
+        $verdict.Landed = $true
+        $verdict.Reason = "pull request #$($ref.Number) is merged and the local tree is identical to $($anchor.Ref)"
+        return $verdict
+    }
+    $verdict.Reason = "$missing. Pull request #$($ref.Number) is merged, but its head $(Format-Sha $pr.HeadSha) does not " +
+        "contain the local HEAD $(Format-Sha $tip) and the local tree differs from $($anchor.Ref), so some local work was never part of it"
+    $verdict
 }
 
 function Limit-Text([string]$Text, [int]$Max = 200) {

@@ -91,7 +91,7 @@ function Show-Status {
             Gate   = if ($_.PSObject.Properties['validation'] -and $_.validation) { $_.validation } else { '-' }
             # The session's running total, as of the last result the watcher read.
             Cost   = ($cost = Format-Cost (Get-EventField $_ 'totalCostUsd')) ? $cost : '-'
-            Pr     = $_.prUrl
+            Pr     = if ($_.prUrl -and (Get-EventField $_ 'mergedAt')) { "$($_.prUrl) (merged)" } else { $_.prUrl }
             Task   = Limit-Text $_.task 60
         }
     } | Format-Table -AutoSize
@@ -199,6 +199,16 @@ switch ($Action) {
             Write-Output "Anchor: $($task.anchorWarning)"
         }
         if ($task.prUrl) { Write-Output "PR: $($task.prUrl)" }
+        $prHead = Get-EventField $task 'prHead'
+        if ($prHead) { Write-Output "  published head: $prHead" }
+        $mergedAt = Get-EventField $task 'mergedAt'
+        if ($mergedAt) {
+            Write-Output "  merged: $((ConvertTo-UtcDateTime $mergedAt).ToString('yyyy-MM-dd HH:mm:ss')) UTC as $(Get-EventField $task 'mergeSha')"
+        }
+        if (Get-EventField $task 'discarded') {
+            Write-Output ''
+            Write-Output "Returned with -Discard, work not landed: $(Get-EventField $task 'landedReason')"
+        }
     }
     'kill' {
         if (-not $Id) { throw 'Usage: dep-posse.ps1 kill <taskId>' }

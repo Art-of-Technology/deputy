@@ -203,7 +203,8 @@ function New-MemberShims {
     claude-calls.jsonl: its arguments, what it read on stdin, its working
     directory and the DEPUTY_POSSE_TASK marker. The treehouse shim passes the
     doctor's checks, leases the worktree named in lease.json, lists no
-    processes, and logs every invocation to treehouse-calls.log.
+    processes, accepts every `return` without touching the worktree, and logs
+    every invocation to treehouse-calls.log.
     #>
     param([Parameter(Mandatory)][string]$Path, [string]$LeasePath)
     New-Item -ItemType Directory -Force $Path | Out-Null
@@ -232,6 +233,7 @@ function New-MemberShims {
         'if "%1"=="--version" (echo v3.1.8& exit /b 0)'
         'if "%1"=="get" if "%2"=="--help" (echo       --lease   lease the worktree& exit /b 0)'
         'if "%1"=="get" (type "%~dp0lease.json" & exit /b 0)'
+        'if "%1"=="return" exit /b 0'
         'exit /b 1'
     )
     if ($LeasePath) {
@@ -375,4 +377,213 @@ function Wait-TestProcessExit {
     # True when the process exits within the timeout.
     param([Parameter(Mandatory)]$Process, [int]$TimeoutSeconds = 30)
     $Process.WaitForExit($TimeoutSeconds * 1000)
+}
+
+function New-GhShim {
+    <#
+    .SYNOPSIS
+    A fake gh for tests that read or merge pull requests. Put the returned
+    directory first on PATH. Nothing reaches GitHub.
+
+    `gh api` answers from gh-routes.json in the shim's directory (written by
+    Set-GhRoutes): a map from "METHOD endpoint" to a route with
+    - status: the HTTP status (default 200);
+    - body:   the JSON body, or text: a raw body (a diff);
+    - fail:   answer with no HTTP response at all (no network, not signed in);
+    - then:   routes to put in place once this one was hit - how a merge call
+              turns the pull request into a merged one.
+    A request with no route gets a 404. Like the real gh with --include, it
+    prints the status line and headers before the body, for errors too, and
+    exits 1 with `gh: <message> (HTTP <status>)` on stderr for a status of 400
+    or above. `gh pr create` prints the URL in the "pr create" route. Every
+    invocation is recorded as a JSON line in gh-calls.jsonl.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    New-Item -ItemType Directory -Force $Path | Out-Null
+    $Path = (Resolve-Path $Path).Path
+    Set-Content -Path (Join-Path $Path 'gh.cmd') -Encoding ascii -Value @(
+        '@echo off'
+        'pwsh -NoProfile -File "%~dp0fake-gh.ps1" %*'
+    )
+    Set-Content -Path (Join-Path $Path 'fake-gh.ps1') -Encoding utf8 -Value @'
+$arguments = @($args | ForEach-Object { "$_" })
+$routesFile = Join-Path $PSScriptRoot 'gh-routes.json'
+$routes = if (Test-Path $routesFile) { Get-Content $routesFile -Raw | ConvertFrom-Json -AsHashtable } else { @{} }
+function Write-Call($Call) {
+    Add-Content -Path (Join-Path $PSScriptRoot 'gh-calls.jsonl') -Value ($Call | ConvertTo-Json -Compress -Depth 10) -Encoding utf8
+}
+
+if ($arguments.Count -ge 2 -and $arguments[0] -eq 'pr' -and $arguments[1] -eq 'create') {
+    Write-Call ([ordered]@{ kind = 'pr create'; args = $arguments })
+    $route = $routes['pr create']
+    if (-not $route) { [Console]::Error.WriteLine('fake gh: no "pr create" route'); exit 1 }
+    [Console]::Out.WriteLine($route.url)
+    exit 0
+}
+if ($arguments.Count -eq 0 -or $arguments[0] -ne 'api') {
+    Write-Call ([ordered]@{ kind = 'other'; args = $arguments })
+    [Console]::Error.WriteLine("fake gh: only 'api' and 'pr create' are supported, got: $($arguments -join ' ')")
+    exit 1
+}
+
+$method = 'GET'; $endpoint = $null; $fields = [ordered]@{}; $headers = @(); $inputText = $null
+for ($i = 1; $i -lt $arguments.Count; $i++) {
+    switch -CaseSensitive ($arguments[$i]) {
+        { $_ -in '--include', '-i' } { continue }
+        { $_ -in '--method', '-X' } { $method = $arguments[++$i]; continue }
+        { $_ -in '-H', '--header' } { $headers += $arguments[++$i]; continue }
+        { $_ -in '-f', '-F', '--raw-field', '--field' } {
+            $pair = $arguments[++$i] -split '=', 2
+            $fields[$pair[0]] = $pair[1]
+            continue
+        }
+        '--input' { $i++; $inputText = [Console]::In.ReadToEnd(); continue }
+        default { $endpoint = $arguments[$i] }
+    }
+}
+Write-Call ([ordered]@{
+    kind = 'api'; method = $method; endpoint = $endpoint; fields = $fields; headers = $headers
+    input = if ($inputText) { $inputText | ConvertFrom-Json } else { $null }
+})
+
+$route = $routes["$method $endpoint"]
+if (-not $route) { $route = @{ status = 404; body = @{ message = 'Not Found' } } }
+if ($route.fail) {
+    [Console]::Error.WriteLine([string]$route.fail)
+    exit 1
+}
+$status = if ($route.status) { [int]$route.status } else { 200 }
+$reason = switch ($status) { 200 { 'OK' } 403 { 'Forbidden' } 404 { 'Not Found' } 405 { 'Method Not Allowed' } 409 { 'Conflict' } default { 'Status' } }
+[Console]::Out.WriteLine("HTTP/2.0 $status $reason")
+[Console]::Out.WriteLine('Content-Type: application/json; charset=utf-8')
+[Console]::Out.WriteLine('X-Github-Request-Id: FAKE')
+[Console]::Out.WriteLine('')
+if ($null -ne $route.text) { [Console]::Out.WriteLine([string]$route.text) }
+elseif ($null -ne $route.body) { [Console]::Out.WriteLine(($route.body | ConvertTo-Json -Compress -Depth 20)) }
+
+if ($route.then) {
+    foreach ($key in @($route.then.Keys)) { $routes[$key] = $route.then[$key] }
+    ($routes | ConvertTo-Json -Depth 30) | Set-Content -Path $routesFile -Encoding utf8
+}
+if ($status -ge 400) {
+    $message = if ($route.body -and $route.body.message) { $route.body.message } else { $reason }
+    [Console]::Error.WriteLine("gh: $message (HTTP $status)")
+    exit 1
+}
+exit 0
+'@
+    $Path
+}
+
+function Set-GhRoutes {
+    # Replace the fake gh's routes. See New-GhShim for what a route is.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][System.Collections.IDictionary]$Routes)
+    ($Routes | ConvertTo-Json -Depth 30) | Set-Content -Path (Join-Path $Path 'gh-routes.json') -Encoding utf8
+}
+
+function Get-GhCalls {
+    # Every recorded invocation of the fake gh, oldest first, one object each
+    # (so it can be piped; wrap it in @() to count or index).
+    param([Parameter(Mandatory)][string]$Path)
+    $log = Join-Path $Path 'gh-calls.jsonl'
+    if (-not (Test-Path $log)) { return }
+    Get-Content $log | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json }
+}
+
+function New-PullRequestJson {
+    # A pull request as GitHub's REST API returns it, cut down to what Deputy reads.
+    param(
+        [int]$Number = 7,
+        [string]$Repo = 'acme/widgets',
+        [ValidateSet('open', 'closed')][string]$State = 'open',
+        [switch]$Merged,
+        [switch]$Draft,
+        [string]$HeadSha = ('a' * 40),
+        [string]$HeadRef = 'deputy/task',
+        [string]$BaseRef = 'main',
+        # 'null' for "GitHub has not computed it yet".
+        [ValidateSet('true', 'false', 'null')][string]$Mergeable = 'true',
+        [string]$MergeableState = 'clean',
+        [string]$MergeSha = ('f' * 40)
+    )
+    [ordered]@{
+        number           = $Number
+        state            = if ($Merged) { 'closed' } else { $State }
+        title            = 'Fixture pull request'
+        html_url         = "https://github.com/$Repo/pull/$Number"
+        user             = [ordered]@{ login = 'fixture-bot' }
+        body             = 'Fixture body.'
+        draft            = [bool]$Draft
+        merged           = [bool]$Merged
+        merged_at        = if ($Merged) { '2026-01-02T03:04:05Z' } else { $null }
+        merge_commit_sha = if ($Merged) { $MergeSha } else { $null }
+        mergeable        = switch ($Mergeable) { 'true' { $true } 'false' { $false } default { $null } }
+        mergeable_state  = $MergeableState
+        head             = [ordered]@{ sha = $HeadSha; ref = $HeadRef }
+        base             = [ordered]@{ ref = $BaseRef }
+        additions        = 3
+        deletions        = 1
+        changed_files    = 2
+        commits          = 1
+    }
+}
+
+function New-CheckRunsJson {
+    # The check-runs listing of one commit. Each entry is @{ name; conclusion }
+    # for a finished run, or @{ name; status } for one still queued or running.
+    param([hashtable[]]$Runs = @())
+    [ordered]@{
+        total_count = $Runs.Count
+        check_runs  = @($Runs | ForEach-Object {
+                [ordered]@{
+                    name       = $_.name
+                    status     = if ($_.status) { $_.status } else { 'completed' }
+                    conclusion = $_.conclusion
+                    html_url   = "https://github.com/acme/widgets/runs/$($_.name)"
+                }
+            })
+    }
+}
+
+function New-CommitStatusJson {
+    # The combined status of one commit: @{ context; state } per entry.
+    param([hashtable[]]$Statuses = @())
+    [ordered]@{
+        state       = 'pending'
+        total_count = $Statuses.Count
+        statuses    = @($Statuses | ForEach-Object { [ordered]@{ context = $_.context; state = $_.state; target_url = '' } })
+    }
+}
+
+function New-PrRoutes {
+    <#
+    .SYNOPSIS
+    The fake gh routes of one pull request: the PR itself, and the check runs
+    and commit statuses at its head. -Protection adds the base branch's
+    protection: a hashtable is its body (status 200), a number is the HTTP
+    status GitHub refuses the read with.
+    #>
+    param(
+        [Parameter(Mandatory)]$PullRequest,
+        [hashtable[]]$Runs = @(),
+        [hashtable[]]$Statuses = @(),
+        $Protection
+    )
+    $api = 'repos/' + (($PullRequest.html_url -replace '^https://github\.com/', '') -replace '/pull/\d+$', '')
+    $sha = $PullRequest.head.sha
+    $routes = [ordered]@{
+        "GET $api/pulls/$($PullRequest.number)" = @{ body = $PullRequest }
+        "GET $api/commits/$sha/check-runs"      = @{ body = (New-CheckRunsJson -Runs $Runs) }
+        "GET $api/commits/$sha/status"          = @{ body = (New-CommitStatusJson -Statuses $Statuses) }
+    }
+    if ($Protection -is [System.Collections.IDictionary]) {
+        $routes["GET $api/branches/$($PullRequest.base.ref)/protection"] = @{ body = $Protection }
+    }
+    elseif ($Protection) {
+        $routes["GET $api/branches/$($PullRequest.base.ref)/protection"] = @{
+            status = [int]$Protection
+            body   = @{ message = if ([int]$Protection -eq 403) { 'Resource not accessible by personal access token' } else { 'Not Found' } }
+        }
+    }
+    $routes
 }
