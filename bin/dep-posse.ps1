@@ -38,6 +38,14 @@ function Format-Age([string]$Start, [string]$End) {
     else { '{0:n0}s' -f $span.TotalSeconds }
 }
 
+function Format-Duration($Milliseconds) {
+    # A duration as a person reads it: 45s, 12m 05s, 1h 02m.
+    $span = [timespan]::FromMilliseconds([double]$Milliseconds)
+    if ($span.TotalHours -ge 1) { return '{0}h {1:00}m' -f [math]::Floor($span.TotalHours), $span.Minutes }
+    if ($span.TotalMinutes -ge 1) { return '{0}m {1:00}s' -f [math]::Floor($span.TotalMinutes), $span.Seconds }
+    '{0}s' -f [math]::Floor($span.TotalSeconds)
+}
+
 function Format-Cost($Usd, [string]$Prefix = '') {
     # A cost in USD as text, or nothing when it is not known.
     if ($null -eq $Usd -or "$Usd" -eq '') { return '' }
@@ -63,7 +71,12 @@ function Format-StreamLine($obj) {
             }
         }
         'result' {
-            '[result] {0} turns={1}{2}' -f $obj.subtype, $obj.num_turns, (Format-Cost (Get-EventField $obj 'total_cost_usd') ' cost=')
+            # Turns and time count this segment only (see Read-MemberRun);
+            # the cost is the session's running total.
+            $durationMs = Get-EventField $obj 'duration_ms'
+            '[result] {0} segment: turns={1}{2}{3}' -f $obj.subtype, (Get-EventField $obj 'num_turns'),
+                $(if ($null -ne $durationMs) { ' time=' + (Format-Duration $durationMs) }),
+                (Format-Cost (Get-EventField $obj 'total_cost_usd') ' session cost=')
         }
         'deputy' {
             # dep-send.ps1 marks each follow-up it sends in the member's log.
@@ -91,12 +104,21 @@ function Show-Status {
             Gate   = if ($_.PSObject.Properties['validation'] -and $_.validation) { $_.validation } else { '-' }
             # The session's running total, as of the last result the watcher read.
             Cost   = ($cost = Format-Cost (Get-EventField $_ 'totalCostUsd')) ? $cost : '-'
+            # What it was started with, and what it reports when that differs.
+            Model  = Format-TaskModel $_
             Pr     = if ($_.prUrl -and (Get-EventField $_ 'mergedAt')) { "$($_.prUrl) (merged)" }
                      elseif ($_.prUrl -and (Get-EventField $_ 'prClosedAt')) { "$($_.prUrl) (closed)" }
                      else { $_.prUrl }
             Task   = Limit-Text $_.task 60
         }
-    } | Format-Table -AutoSize
+    } |
+        # Every column by name: without -Property, Format-Table shows only the
+        # first ten, and Task is the eleventh.
+        Format-Table -AutoSize -Property Id, Kind, Status, Alive, Age, Repo, Gate, Cost, Model, Pr, Task |
+        # As wide as the rows are. Left to itself, a table whose output is
+        # redirected - which is how the Deputy reads it - is cut at the
+        # host's width, about 120 columns, and loses its last columns.
+        Out-String -Width 1000 -Stream | ForEach-Object { $_.TrimEnd() }
 }
 
 switch ($Action) {
@@ -180,10 +202,28 @@ switch ($Action) {
         }
         $cost = Format-Cost (Get-EventField $task 'totalCostUsd')
         if ($cost) {
-            $seconds = [double](Get-EventField $task 'durationMs') / 1000
+            # Turns and active time add up every segment of every run (see
+            # Read-MemberRun); waiting on background helpers between segments
+            # is not active time, so this can be far less than the task's age.
+            $usage = @()
+            $turns = Get-EventField $task 'numTurns'
+            if ($null -ne $turns) { $usage += "$turns turn(s)" }
+            $durationMs = Get-EventField $task 'durationMs'
+            if ($null -ne $durationMs) { $usage += "$(Format-Duration $durationMs) active" }
+            $runs = 1 + @(Get-TaskFollowUps $task).Count
             Write-Output ''
-            Write-Output ('Cost: {0} over {1} turn(s), {2:n0}s of member time' -f $cost, (Get-EventField $task 'numTurns'), $seconds)
+            Write-Output ('Cost: {0}{1} over {2} run(s)' -f $cost, $(if ($usage) { ', ' + ($usage -join ', ') }), $runs)
         }
+        $model = [string](Get-EventField $task 'model')
+        $modelSource = Get-EventField $task 'modelSource'
+        $line = 'Model: ' + ($model ? $model : 'account default') + $(if ($modelSource) { " ($modelSource)" })
+        $reported = Get-EventField $task 'reportedModel'
+        $mismatch = Get-TaskModelMismatch $task
+        if ($mismatch) { $line += ". MISMATCH: $mismatch" }
+        elseif ($reported -and -not $model) { $line += "; the member reports $reported" }
+        $effort = Get-EventField $task 'effort'
+        if ($effort) { $line += "; effort $effort" }
+        Write-Output $line
         if ($task.PSObject.Properties['validation'] -and $task.validation) {
             Write-Output ''
             Write-Output "Gate: $($task.validation)"
@@ -222,6 +262,14 @@ switch ($Action) {
         $killed = @(Stop-TaskProcesses $task)
         if ($killed.Count -gt 0) { Write-Output "killed process tree(s) for $Id (pid $($killed -join ', '))" }
         else { Write-Output "$Id has no live process that is provably its own; nothing was killed" }
+        if ($task.status -in @('running', 'stalled')) {
+            # The run ends here, and no wake will account for it: what it did
+            # so far still counts towards the task. A run whose outcome the
+            # watcher already recorded was counted then.
+            $run = Read-MemberRun $task.stdoutLog ([long](Get-EventField $task 'logOffset'))
+            Add-RunUsage $task $run
+            if ($run -and $run.ReportedModel) { Set-TaskField $task 'reportedModel' $run.ReportedModel }
+        }
         Set-TaskField $task 'status' 'killed'
         Set-TaskField $task 'endedAt' (Get-Date -Format o)
         Write-TaskState $task

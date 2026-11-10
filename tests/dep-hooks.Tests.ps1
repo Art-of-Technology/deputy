@@ -642,7 +642,10 @@ Describe 'The hooks in a posse worktree' {
             @{ Script = 'dep-session-start.ps1'; Arguments = @('-Hook'); HookInput = @{ hook_event_name = 'SessionStart'; source = 'compact' } }
             @{ Script = 'dep-hook-guard.ps1'; Arguments = @('-GraceSeconds', '0'); HookInput = @{ hook_event_name = 'Stop' } }
             @{ Script = 'dep-hook-stop.ps1'; Arguments = @(); HookInput = @{ hook_event_name = 'Stop' } }
-            @{ Script = 'dep-hook-stop.ps1'; Arguments = @(); HookInput = @{ hook_event_name = 'StopFailure' } }
+            # No cooldown: in the Deputy home the hook pushes the wake the Stop
+            # case above already announced once more, and by default waits a
+            # minute before it does.
+            @{ Script = 'dep-hook-stop.ps1'; Arguments = @('-RetryCooldownSeconds', '0'); HookInput = @{ hook_event_name = 'StopFailure' } }
         )
 
         function Invoke-EveryHook($Install) {
@@ -672,6 +675,8 @@ Describe 'The hooks in a posse worktree' {
         $runs[0].Output | Should -Match 'Deputy session start'
         $runs[1].ExitCode | Should -Be 2
         $runs[2].ExitCode | Should -Be 2
+        $runs[3].ExitCode | Should -Be 2
+        $runs[3].ErrorOutput | Should -Match 'Repeated'
     }
 
     It 'do nothing when the session was given a task briefing (DEPUTY_POSSE_TASK is set)' {

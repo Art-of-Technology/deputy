@@ -362,8 +362,9 @@ Describe 'dep-watch.ps1 poll cadence' {
     }
 
     It 'reads it again once the interval has passed' {
-        $s = New-PrWatchScenario -CheckedNow -PullRequest (New-PullRequestJson -Merged -HeadSha $script:head)
-        Start-Sleep -Seconds 2
+        # Read two seconds ago, with an interval of one: due again.
+        $s = New-PrWatchScenario -PullRequest (New-PullRequestJson -Merged -HeadSha $script:head) `
+            -Extra @{ prCheckedAt = (Get-Date).AddSeconds(-2).ToString('o') }
         (Invoke-Watch $s @('-PrPollSeconds', '1')).Output | Should -Match ': merged \(ship\)'
     }
 

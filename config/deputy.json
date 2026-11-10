@@ -1,11 +1,17 @@
 {
-  "model": null,
+  "models": {
+    "ship": "claude-opus-5-5",
+    "scout": "claude-opus-5-5"
+  },
+  "effort": {
+    "ship": null,
+    "scout": null
+  },
   "permissionMode": "bypassPermissions",
   "watchIntervalSeconds": 15,
   "stallMinutes": 10,
   "branchPrefix": "deputy/",
   "autoWatch": true,
-  "effort": null,
   "maxBudgetUsd": null,
   "prPollMinutes": 5
 }

@@ -25,7 +25,10 @@ jobs:
   gate:
     name: Lint and tests
     runs-on: windows-latest
-    timeout-minutes: 15
+    # The Pester suite starts hundreds of real pwsh, git and shim processes,
+    # which is slow on a hosted Windows runner (about 11 minutes in November
+    # 2026). Room to grow without a run being cut off half way.
+    timeout-minutes: 30
     steps:
       - name: Check out
         uses: actions/checkout@v7

@@ -558,7 +558,7 @@ Describe 'dep-spawn.ps1' {
         }
 
         It 'takes both from the config, and lets the command line override them' {
-            Set-Content -Path $script:spawnConfig -Encoding utf8 -Value '{ "effort": "low", "maxBudgetUsd": 1.5 }'
+            Set-Content -Path $script:spawnConfig -Encoding utf8 -Value '{ "effort": { "ship": "low" }, "maxBudgetUsd": 1.5 }'
             $fromConfig = Invoke-Spawn @('-Task', 'Config effort and budget')
             Get-FlagValue @($fromConfig.Call.args) '--effort' | Should -Be 'low'
             Get-FlagValue @($fromConfig.Call.args) '--max-budget-usd' | Should -Be '1.5'
@@ -606,13 +606,53 @@ Describe 'dep-spawn.ps1' {
         }
 
         It 'refuses an effort level in the config that claude does not have' {
-            Set-Content -Path $script:spawnConfig -Encoding utf8 -Value '{ "effort": "extreme" }'
+            Set-Content -Path $script:spawnConfig -Encoding utf8 -Value '{ "effort": { "ship": "extreme" } }'
             $leases = Get-LeaseCount
             $spawn = Invoke-Spawn @('-Task', 'Never starts')
             $spawn.Run.ExitCode | Should -Not -Be 0
             $spawn.Run.Output | Should -Match 'not one of: low, medium, high, xhigh, max'
             Get-LeaseCount | Should -Be $leases
             Remove-Item $script:spawnConfig -ErrorAction SilentlyContinue
+        }
+    }
+
+    Context 'a follow-up after the configured model has changed' {
+        BeforeAll {
+            Set-Content -Path $script:spawnConfig -Encoding utf8 `
+                -Value '{ "models": { "ship": "spawn-model" }, "effort": { "ship": "low" } }'
+            $script:pinned = Invoke-Spawn @('-Task', 'Keep your model')
+            Wait-TestProcessGone -ProcessId $script:pinned.State.pid | Should -BeTrue
+            $script:pinnedWatch = Invoke-DeputyScript -InstallRoot $script:spawnInstall -Script 'dep-watch.ps1'
+
+            # Everything a spawn would read now names another model.
+            Set-Content -Path $script:spawnConfig -Encoding utf8 `
+                -Value '{ "models": { "ship": "new-config-model" }, "effort": { "ship": "max" } }'
+            $projectsLocal = Join-Path $script:spawnInstall 'config' 'projects.local.json'
+            Set-Content -Path $projectsLocal -Encoding utf8 `
+                -Value '{ "projects": [ { "match": "repo", "model": "new-project-model", "effort": "high" } ] }'
+            try {
+                $scenario = [pscustomobject]@{ Install = $script:spawnInstall; Id = $script:pinned.Id; Shims = $script:spawnShims }
+                $script:pinnedSend = Invoke-Send $scenario 'Carry on.'
+                $script:spawnCalls++
+                Wait-ResumedRun $scenario -Count $script:spawnCalls
+                $script:pinnedCall = (Get-MemberShimCalls -Path $script:spawnShims)[$script:spawnCalls - 1]
+            }
+            finally {
+                Remove-Item $script:spawnConfig, $projectsLocal -ErrorAction SilentlyContinue
+            }
+        }
+
+        It 'spawned on the configured model' {
+            Get-FlagValue @($script:pinned.Call.args) '--model' | Should -Be 'spawn-model'
+            $script:pinnedWatch.Output | Should -Match ': completed \(ship\)'
+        }
+
+        It 'resumes on the model and effort recorded at spawn, not on what the config says now' {
+            $script:pinnedSend.ExitCode | Should -Be 0 -Because $script:pinnedSend.Output
+            @($script:pinnedCall.args) | Should -Contain '--resume'
+            Get-FlagValue @($script:pinnedCall.args) '--model' | Should -Be 'spawn-model'
+            Get-FlagValue @($script:pinnedCall.args) '--effort' | Should -Be 'low'
+            $script:pinnedSend.Output | Should -Match ([regex]::Escape('model:    spawn-model (recorded at spawn)'))
         }
     }
 }

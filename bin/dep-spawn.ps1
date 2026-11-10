@@ -22,6 +22,14 @@ later:
 - The member is launched isolated from the operator's MCP servers, skills and
   slash commands unless memberIsolation is off in the config; what it was
   launched with is recorded, so a resumed run gets the same.
+- The model and effort are chosen here, once (Resolve-MemberSettings): -Model
+  and -Effort, else the repo's project profile, else the per-kind default in
+  the config (models.<kind>, effort.<kind>), else the flag is left off and the
+  member runs on the account default. Both are recorded with where they came
+  from, and a resumed run reuses them, so a follow-up cannot change the model.
+- A lease that is given back because nothing was launched in it takes its new
+  branch with it. If the branch is still there afterwards, that is said, with
+  the command that removes it.
 
 The session gets an id Deputy chose (--session-id, recorded as sessionId in
 task state) and the task id as its name, so that dep-send.ps1 can resume it
@@ -32,6 +40,7 @@ with a follow-up message once its process has exited.
 .\dep-spawn.ps1 -Task "Why is startup slow?" -Repo C:\src\myapp -Kind scout
 .\dep-spawn.ps1 -Task "Backport the session fix" -Repo C:\src\myapp -BaseBranch release/2.4
 .\dep-spawn.ps1 -Task "Rework the cache layer" -Repo C:\src\myapp -Effort high -MaxBudgetUsd 15
+.\dep-spawn.ps1 -Task "Fix the typo in the README" -Repo C:\src\myapp -Model claude-sonnet-5-5
 #>
 [CmdletBinding()]
 param(
@@ -49,6 +58,9 @@ param(
     # anchors on it and the pull request targets it.
     [string]$BaseBranch,
 
+    # The model for the member (--model). Default: the repo's project profile,
+    # else models.<kind> in the config; when neither names one, the flag is left
+    # off and the member runs on the account default.
     [string]$Model,
 
     [ValidateSet('', 'acceptEdits', 'auto', 'bypassPermissions', 'dontAsk', 'manual', 'plan')]
@@ -60,8 +72,9 @@ param(
     # mode is denied (see README, "Permissions for posse members").
     [string[]]$AllowedTools,
 
-    # Reasoning effort for the member (--effort). Default: the effort key in
-    # the config; when that is null too, the flag is left off.
+    # Reasoning effort for the member (--effort). Default: the repo's project
+    # profile, else effort.<kind> in the config; when neither names one, the
+    # flag is left off.
     [ValidateSet('', 'low', 'medium', 'high', 'xhigh', 'max')]
     [string]$Effort,
 
@@ -100,12 +113,13 @@ if ($config.memberIsolation -isnot [bool]) {
     throw "memberIsolation in the config must be true or false, not '$($config.memberIsolation)'."
 }
 
-if (-not $Model) { $Model = $config.model }
+$legacyWarning = Get-LegacyConfigWarning $config
+if ($legacyWarning) { Write-Warning $legacyWarning }
+$chosen = Resolve-MemberSettings -Kind $Kind -Model $Model -Effort $Effort -Config $config -Project $projProfile
 if (-not $PermissionMode) { $PermissionMode = $config.permissionMode }
-# The config's values go into variables of their own: $Effort and $MaxBudgetUsd
-# are typed parameters, and a bad config value assigned to one of them fails
-# with a message about a variable instead of about the config.
-$memberEffort = $Effort ? $Effort : $config.effort
+# The config's value goes into a variable of its own: $MaxBudgetUsd is a typed
+# parameter, and a bad config value assigned to it fails with a message about a
+# variable instead of about the config.
 $memberBudget = ($null -ne $MaxBudgetUsd) ? $MaxBudgetUsd : $config.maxBudgetUsd
 
 # What the member is launched with. It goes into task state as it is, because
@@ -115,11 +129,11 @@ $member = [pscustomobject]@{
     id              = $id
     kind            = $Kind
     sessionId       = $sessionId
-    model           = $Model
+    model           = $chosen.model
     permissionMode  = $PermissionMode
     allowedTools    = @($AllowedTools | Where-Object { $_ })
     memberIsolation = $config.memberIsolation
-    effort          = $memberEffort ? "$memberEffort" : $null
+    effort          = $chosen.effort
     maxBudgetUsd    = $memberBudget
 }
 $claudeArgs = @(Get-TaskMemberArguments $member)
@@ -185,12 +199,12 @@ catch {
     # Nothing runs in the lease: give it back rather than leave it held, and
     # with it the branch it created, which carries no work.
     $returned = Undo-Lease -Lease $lease -RepoPath $repoPath
-    if ($returned -and $branch) { git -C $repoPath branch -D $branch *> $null }
     $note = if ($returned) { "The lease was returned." }
     else {
         "The lease could NOT be returned: inspect it with 'treehouse status' in $repoPath, and return $($lease.path) by hand."
     }
-    throw "$($failure.Exception.Message)`n$note"
+    $branchNote = if ($branch) { Remove-UnusedTaskBranch -RepoPath $repoPath -Branch $branch -LeaseReturned:$returned }
+    throw ("$($failure.Exception.Message)`n$note" + $(if ($branchNote) { "`n$branchNote" }))
 }
 
 $state = [pscustomobject]@{
@@ -209,11 +223,16 @@ $state = [pscustomobject]@{
     pid             = $launched.ProcessId
     pidStartedAt    = $launched.StartedAt
     sessionId       = $sessionId
-    model           = $Model
+    # What the member was started with, and why; a resumed run reuses both.
+    # reportedModel is what the member itself says it runs on (dep-watch.ps1).
+    model           = $member.model
+    modelSource     = $chosen.modelSource
+    reportedModel   = $null
     permissionMode  = $PermissionMode
     allowedTools    = $member.allowedTools
     memberIsolation = $member.memberIsolation
     effort          = $member.effort
+    effortSource    = $chosen.effortSource
     maxBudgetUsd    = $member.maxBudgetUsd
     status          = 'running'
     result          = $null
@@ -242,6 +261,9 @@ Write-Output "  repo:     $repoPath"
 Write-Output "  worktree: $($lease.path)"
 if ($branch) { Write-Output "  branch:   $branch" }
 if ($taskBase) { Write-Output "  base:     $taskBase$baseNote" }
+Write-Output ('  model:    ' + $(if ($chosen.model) { "$($chosen.model) ($($chosen.modelSource))" }
+        else { "account default (no -Model, no project model and no models.$Kind in the config)" }))
+if ($chosen.effort) { Write-Output "  effort:   $($chosen.effort) ($($chosen.effortSource))" }
 Write-Output "  log:      $stdoutLog"
 Write-Output "  session:  $sessionId"
 Write-Output "Supervise with: pwsh -NoProfile -File `"$(Join-Path $paths.Bin 'dep-watch.ps1')`" -Wait"

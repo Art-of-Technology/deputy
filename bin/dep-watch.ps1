@@ -23,6 +23,12 @@ Only the current run is read: after dep-send.ps1 resumes a member, the log
 holds the earlier runs' results too, and the task's logOffset marks where the
 current one starts.
 
+When a run ends, its usage is added to the task (Read-MemberRun and
+Add-RunUsage, dep-lib.ps1): the turns and duration of every result event in the
+run, since each one covers only its own segment, and the session's running
+cost. The model the member reports in its init event is kept as reportedModel;
+when it is not the model the task was started with, the member's wakes say so.
+
 Once a task has a pull request, the watcher keeps reading it until it is seen
 merged or the task is returned: every prPollMinutes (config, default 5; 0
 switches it off), over REST (`gh api`), so no read:org token scope is needed.
@@ -85,73 +91,6 @@ if ($IntervalSeconds -le 0) { $IntervalSeconds = [int]$config.watchIntervalSecon
 if ($StallMinutes -le 0) { $StallMinutes = [int]$config.stallMinutes }
 if ($PrPollSeconds -le 0) { $PrPollSeconds = [int]([double]$config.prPollMinutes * 60) }
 
-function ConvertFrom-StreamLine([string]$Line) {
-    # One stream-json line as an object, or $null for anything unparseable
-    # (a line the member is still writing, stray non-JSON output).
-    try { $Line | ConvertFrom-Json -ErrorAction Stop } catch { $null }
-}
-
-function Get-SessionResult([string]$LogPath, [long]$Offset = 0) {
-    <#
-    .SYNOPSIS
-    The LAST {"type":"result",...} event in a stream-json log, and whether the
-    session carried on after it.
-
-    A result event is not proof the member is done: a member that started
-    background helpers emits one at the end of each turn, then resumes when a
-    helper reports back and emits another. So the last result is the only
-    candidate for the final one, and it is Interim when assistant or user
-    events follow it. Returns $null when the log holds no result event.
-
-    -Offset is where the current run starts in the log, in bytes. Everything
-    before it belongs to runs that were already handled.
-    #>
-    if (-not (Test-Path $LogPath)) { return $null }
-    $last = $null
-    $continued = $false
-    try {
-        # Share the file with the member, which is still appending to it.
-        $stream = [System.IO.FileStream]::new($LogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
-            [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
-    }
-    catch { return $null }
-    try {
-        if ($Offset -gt 0) {
-            # A log shorter than its recorded offset has no current run yet.
-            if ($Offset -gt $stream.Length) { return $null }
-            $null = $stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
-        }
-        $reader = [System.IO.StreamReader]::new($stream)
-        while ($null -ne ($line = $reader.ReadLine())) {
-            # Cheap substring tests first: logs run to megabytes, and only the
-            # few candidate lines are worth parsing. Nested occurrences of
-            # these keys are escaped inside JSON strings, and the parsed
-            # top-level type is what decides.
-            if ($line.Contains('"type":"result"')) {
-                $parsed = ConvertFrom-StreamLine $line
-                if ($parsed -and $parsed.PSObject.Properties['type'] -and $parsed.type -eq 'result') {
-                    $last = $parsed
-                    $continued = $false
-                }
-            }
-            elseif ($last -and -not $continued -and
-                ($line.Contains('"type":"assistant"') -or $line.Contains('"type":"user"'))) {
-                $parsed = ConvertFrom-StreamLine $line
-                if ($parsed -and $parsed.PSObject.Properties['type'] -and $parsed.type -in @('assistant', 'user')) {
-                    $continued = $true
-                }
-            }
-        }
-    }
-    finally { $stream.Dispose() }
-    if (-not $last) { return $null }
-    [pscustomobject]@{
-        Event   = $last
-        Text    = (Get-MemberOutcome $last).Text
-        Interim = $continued
-    }
-}
-
 function Test-PrUrlBelongsToRepo([string]$RepoPath, [string]$Owner, [string]$Repo) {
     # Only trust a PR URL that points at the task's own repo. The URL comes
     # from the posse member's final message, so a prompt-injected member could
@@ -186,24 +125,8 @@ function Set-TaskPrUrl($Task, [string]$Text, $Report) {
     }
 }
 
-function Set-TaskUsage($Task, $ResultEvent) {
-    # What the run cost, from its final result. total_cost_usd is the cost of
-    # the whole session, earlier runs included (a resumed run reports the
-    # running total), so it replaces the stored figure and never lowers it.
-    # num_turns and duration_ms count the one run, so they add up.
-    $cost = ConvertTo-InvariantNumber (Get-EventField $ResultEvent 'total_cost_usd')
-    if ($null -ne $cost) {
-        $known = ConvertTo-InvariantNumber (Get-EventField $Task 'totalCostUsd')
-        Set-TaskField $Task 'totalCostUsd' ([math]::Max($cost, [double]($known ?? 0)))
-    }
-    foreach ($pair in @(@('num_turns', 'numTurns'), @('duration_ms', 'durationMs'))) {
-        $value = ConvertTo-InvariantNumber (Get-EventField $ResultEvent $pair[0])
-        if ($null -ne $value) {
-            $known = ConvertTo-InvariantNumber (Get-EventField $Task $pair[1])
-            Set-TaskField $Task $pair[1] ([long]($value + ($known ?? 0)))
-        }
-    }
-}
+# The wakes that are about the member's run, as opposed to its pull request.
+$script:MemberWakes = @($script:MemberReportWakes.Values) + @('interrupted', 'died', 'stalled')
 
 function New-Wake($Task, [string]$EventName, [string]$Summary) {
     $report = Get-EventField $Task 'report'
@@ -221,6 +144,10 @@ function New-Wake($Task, [string]$EventName, [string]$Summary) {
         # asked, and how many follow-ups it has been sent already.
         question      = ($EventName -in @('blocked', 'needs-decision') -and $report) ? $report.question : $null
         followUps     = @(Get-TaskFollowUps $Task).Count
+        # The member runs on another model than the one it was started with
+        # (a typo in a model name, or an alias claude resolved). Only on the
+        # wakes about the member itself, not on the pull request's.
+        modelMismatch = ($EventName -in $script:MemberWakes) ? (Get-TaskModelMismatch $Task) : $null
     }
 }
 
@@ -240,11 +167,18 @@ function Invoke-Scan {
             }
         }
 
+        # Only the current run counts: after dep-send.ps1 the log also holds
+        # the earlier runs, which were handled when they ended.
+        $run = Read-MemberRun $task.stdoutLog ([long](Get-EventField $task 'logOffset'))
+        $session = $run ? $run.Result : $null
+        # The model the member says it runs on, as soon as its init event is
+        # there, so dep-posse.ps1 status can show it while it works.
+        if ($run -and $run.ReportedModel) { Set-TaskField $task 'reportedModel' $run.ReportedModel }
+
         # Completion needs BOTH signals: the last result event with nothing
         # after it, and no member process. A result seen while the process is
         # alive is interim - the member may be waiting on background helpers
         # and go on to do more work - so it must not wake the Deputy.
-        $session = Get-SessionResult $task.stdoutLog ([long](Get-EventField $task 'logOffset'))
         if ($session -and -not $session.Interim -and -not $alive) {
             # The wake and the task's status share one name: completed, failed,
             # interrupted, blocked or needs-decision.
@@ -254,7 +188,7 @@ function Invoke-Scan {
             Set-TaskField $task 'result' $outcome.Text
             Set-TaskField $task 'report' $outcome.Report
             Set-TaskPrUrl $task $outcome.Text $outcome.Report
-            Set-TaskUsage $task $session.Event
+            Add-RunUsage $task $run
             # The wake carries the question on a line of its own (New-Wake), so
             # the summary does not repeat it.
             $said = $outcome.Report ? (Format-MemberReport $outcome.Report -NoQuestion) : $outcome.Text
@@ -269,6 +203,9 @@ function Invoke-Scan {
             # process is the real death signal.
             Set-TaskField $task 'status' 'died'
             Set-TaskField $task 'endedAt' (Get-Date -Format o)
+            # The run is over all the same, and what it did before it died
+            # counts towards the task.
+            Add-RunUsage $task $run
             $errTail = if (Test-Path $task.stderrLog) {
                 (Get-Content $task.stderrLog -Tail 3 -ErrorAction SilentlyContinue) -join ' | '
             } else { '' }

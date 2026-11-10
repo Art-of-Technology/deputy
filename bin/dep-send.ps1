@@ -14,7 +14,9 @@ It refuses unless the task's process is gone and its worktree still exists:
 you cannot type into a running member, and a returned task has no worktree to
 work in. The resumed run is started with the same flags as the first one
 (permissions, isolation, model, effort, budget, report schema), reads the
-message on stdin, and appends to the same log. The task goes back to
+message on stdin, and appends to the same log. The model and effort are the
+ones recorded at spawn, never resolved again from the config, so a follow-up
+cannot move a task to another model halfway. The task goes back to
 `running`, and the watcher reports the resumed run's result as a new wake.
 Each follow-up is recorded in task state (followUps).
 
@@ -112,6 +114,9 @@ Write-TaskState $task
 
 Write-Output "sent follow-up #$number to $Id (was $previousStatus) pid=$($launched.ProcessId)"
 Write-Output "  session:  $sessionId"
+# Never re-resolved: the run goes on with what the task was spawned with.
+$recordedModel = [string](Get-EventField $task 'model')
+Write-Output ("  model:    {0} (recorded at spawn)" -f ($recordedModel ? $recordedModel : 'account default'))
 Write-Output "  worktree: $($task.worktree)"
 Write-Output "  log:      $($task.stdoutLog)"
 if ($hadVerdict) {
