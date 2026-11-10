@@ -34,7 +34,7 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
    `pwsh -NoProfile -File bin/dep-watch.ps1 -Wait`
    Then end your turn or continue conversing. When the watcher exits you are notified with the wake events. If tasks are still active after handling a wake, start the watcher again.
    Exception: if you are running non-interactively (print mode, one-shot invocation), there is no later turn to notify - run the watcher in the foreground instead and complete the full delivery loop before finishing your reply.
-4. **Handle wakes.**
+4. **Handle wakes.** A `completed` or `failed` wake means the member's final result has arrived and its process has exited, and it carries the member's last result. A result a member emits while it is still alive (for example while it waits on background helpers) is interim and does not wake you.
    - `completed` (ship, no-mistakes delivery): run `dep-validate.ps1 <id>`. It has three outcomes, and they are not interchangeable:
      - **passed** (exit 0): run `dep-publish.ps1 <id>`, then verify with `dep-pr.ps1 checks <id>` and skim `dep-pr.ps1 diff <id>`; present the PR to the Sheriff. On a single-commit branch the title `dep-publish.ps1` opened the PR with is the member's commit subject, sanitised and capped, not the Sheriff's words - so check it actually describes the diff you skimmed, and say so to the Sheriff if it does not.
      - **failed** (exit 1): read the recorded `validationError`, respawn the task with the failure output included in an amended briefing (return the old worktree first). After two failed respawns, escalate to the Sheriff with your diagnosis instead of trying again.
@@ -44,7 +44,7 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
    - `completed` (ship, direct-pr delivery): verify the PR is real - `dep-pr.ps1 view <id>` and `dep-pr.ps1 checks <id>`. Skim `dep-pr.ps1 diff <id>` for obvious problems. Present the PR to the Sheriff.
    - `completed` (scout): read the report (`dep-posse.ps1 result <id>`, full report in `state\<id>-report.md`) and give the Sheriff the distilled findings.
    - `failed` / `died`: read `dep-posse.ps1 logs <id>` and the stderr tail, diagnose, and either respawn with an amended briefing or escalate to the Sheriff with your diagnosis.
-   - `stalled`: check `dep-posse.ps1 logs <id>` to judge whether it is genuinely stuck or just slow. Kill and respawn only if stuck.
+   - `stalled`: check `dep-posse.ps1 logs <id>` to judge whether it is genuinely stuck or just slow. Kill and respawn only if stuck. If the wake says a result event is present but the process is still alive, the member may be waiting on background helpers, or it finished talking and never exited. Use the logs to tell which. If it exits on its own, the next scan emits the `completed` wake. If you have to `dep-posse.ps1 kill <id>`, the task ends as `killed` and no `completed` wake follows: take the member's report from the logs, tell the Sheriff the member was killed after its last result, and only then carry on as you would for `completed`.
 5. **Deliver and tear down.** After the Sheriff is satisfied (PR merged or findings received), run `dep-return.ps1 <id>`. Do not return a worktree while its work might still be needed for inspection.
 
 ## House rules

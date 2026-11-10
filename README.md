@@ -83,7 +83,7 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | Command | What it does |
 | --- | --- |
 | `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>]` | Lease a worktree, launch a headless posse member, register task state |
-| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n]` | Scan tasks for wake events; `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90) |
+| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n]` | Scan tasks for wake events; `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as completed (or failed) only when its final `result` event has arrived AND the member process has exited - a `result` seen while the process is alive is interim (the member may be waiting on background helpers) and wakes nobody. A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90) |
 | `dep-posse.ps1 status [-Watch]` | Posse table: status, liveness, age, PR; `-Watch` auto-refreshes with recent wakes |
 | `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw] [-Follow]` | Human-readable log tail (or raw stream-json); `-Follow` live-tails |
 | `dep-posse.ps1 result <taskId>` | Final report text, scout report path, PR URL |
