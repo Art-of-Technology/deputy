@@ -1,0 +1,57 @@
+name: CI
+
+# Deputy's own gate (lint + Pester), run on every pull request and on the
+# default branch, so a change is checked no matter how its PR was opened.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# A newer run on the same ref supersedes the older one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  gate:
+    name: Lint and tests
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Only the two pinned modules, in the current-user module path that
+      # Install-GateModules.ps1 installs into. The key follows the pin file, so
+      # a version bump there misses the cache and installs fresh.
+      - name: Cache PowerShell modules
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~\Documents\PowerShell\Modules\PSScriptAnalyzer
+            ~\Documents\PowerShell\Modules\Pester
+          key: ${{ runner.os }}-gate-modules-${{ hashFiles('tools/gate-modules.psd1') }}
+
+      # Always runs: it skips whatever the cache restored, and repairs a
+      # partial or missing cache instead of trusting it.
+      - name: Install pinned PSScriptAnalyzer and Pester
+        run: pwsh -NoProfile -File tools\Install-GateModules.ps1
+
+      - name: Lint
+        run: pwsh -NoProfile -File tools\Invoke-Lint.ps1
+
+      # Run the suite even when lint found something, so one push reports both.
+      - name: Tests
+        if: ${{ success() || failure() }}
+        run: pwsh -NoProfile -File tools\Invoke-Tests.ps1
