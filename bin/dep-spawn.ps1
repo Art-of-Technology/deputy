@@ -155,12 +155,21 @@ $argString = ($claudeArgs | ForEach-Object {
     if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
 }) -join ' '
 
-$proc = Start-Process -FilePath $exe -ArgumentList $argString `
-    -WorkingDirectory $lease.path `
-    -RedirectStandardInput $briefingFile `
-    -RedirectStandardOutput $stdoutLog `
-    -RedirectStandardError $stderrLog `
-    -WindowStyle Hidden -PassThru
+# Mark the member's environment (it is inherited from this process) so that
+# Deputy's own session hooks can tell a posse member from the Deputy: a member
+# working on the Deputy repository itself loads the same .claude\settings.json,
+# and there the hooks must do nothing (see Test-DeputyHome).
+$previousMarker = $env:DEPUTY_POSSE_TASK
+$env:DEPUTY_POSSE_TASK = $id
+try {
+    $proc = Start-Process -FilePath $exe -ArgumentList $argString `
+        -WorkingDirectory $lease.path `
+        -RedirectStandardInput $briefingFile `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
+        -WindowStyle Hidden -PassThru
+}
+finally { $env:DEPUTY_POSSE_TASK = $previousMarker }
 
 $state = [pscustomobject]@{
     id             = $id

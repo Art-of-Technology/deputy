@@ -15,7 +15,46 @@ function Get-DeputyPaths {
         Logs       = Join-Path $root 'logs'
         ConfigFile = Join-Path $root 'config' 'deputy.json'
         WakeQueue  = Join-Path $root 'state' 'wake-queue.jsonl'
+        # Runtime files beside the queue. None of them may end in .json: every
+        # state\*.json is read as a task (Get-AllTasks).
+        WakeSeq       = Join-Path $root 'state' 'wake-queue.seq'
+        StateLock     = Join-Path $root 'state' 'state.lock'
+        WatcherLock   = Join-Path $root 'state' 'watcher.lock'
+        WatcherBeat   = Join-Path $root 'state' 'watcher.beat'
+        GuardBlocks   = Join-Path $root 'state' 'hook-guard.blocks'
+        WakeAnnounced = Join-Path $root 'state' 'hook-stop.announced'
     }
+}
+
+function Test-DeputyHome {
+    <#
+    .SYNOPSIS
+    Is this checkout the Deputy home, as opposed to a posse worktree of the
+    Deputy repository?
+
+    The tracked hooks in .claude\settings.json are loaded by every Claude
+    session started in a checkout of this repo, and that includes posse members
+    working on Deputy itself in a leased worktree. There the hooks must do
+    nothing at all: a member that blocked its own stop, or ran a watcher, would
+    be acting as a second Deputy. Three independent signs, any one of which
+    means "not the home":
+
+    - the session was given a task briefing: dep-spawn.ps1 marks every member
+      it launches with DEPUTY_POSSE_TASK in its environment;
+    - there is no state\ beside bin\: state\ is untracked runtime data that only
+      the toolbelt creates, so a fresh worktree does not have one;
+    - .git is a file, not a directory: a leased worktree is a linked git
+      worktree, the home is a clone. This still holds for a member that ran a
+      toolbelt script in its worktree and so grew a state\ of its own.
+
+    Deliberately free of side effects - it must be safe to call before
+    Initialize-Deputy, which would create the very state\ it looks for.
+    #>
+    if ($env:DEPUTY_POSSE_TASK) { return $false }
+    $p = Get-DeputyPaths
+    if (-not (Test-Path -LiteralPath $p.State -PathType Container)) { return $false }
+    if (Test-Path -LiteralPath (Join-Path $p.Root '.git') -PathType Leaf) { return $false }
+    $true
 }
 
 function Initialize-Deputy {
@@ -32,6 +71,10 @@ function Get-DeputyConfig {
         watchIntervalSeconds = 15
         stallMinutes         = 10
         branchPrefix         = 'deputy/'
+        # Whether the Stop / StopFailure hook runs the watcher itself and
+        # rewakes the session (dep-hook-stop.ps1). Off leaves the queue, the
+        # session-start report and the stop guard in place.
+        autoWatch            = $true
     }
     $p = Get-DeputyPaths
     if (Test-Path $p.ConfigFile) {
@@ -226,9 +269,494 @@ function Get-AllTasks {
         Sort-Object spawnedAt
 }
 
+function Get-ActiveTasks {
+    # Tasks a watcher still has to watch.
+    @(Get-AllTasks | Where-Object { $_.status -in @('running', 'stalled') })
+}
+
+# ---------------------------------------------------------------------------
+# State lock. One short-lived mutex for every read-modify-write of the runtime
+# files beside the task records: the wake queue and its sequence counter, the
+# watcher lock, the hook counters. It is an exclusively opened file, so the OS
+# releases it when the holder exits, however it exits - there is no stale lock
+# to reclaim.
+# ---------------------------------------------------------------------------
+
+$script:StateLockDepth = 0
+
+function Invoke-WithStateLock {
+    param(
+        [Parameter(Mandatory, Position = 0)][scriptblock]$Body,
+        [int]$TimeoutSeconds = 30
+    )
+    # Re-entrant within a process: a second exclusive open of the same file
+    # would block on itself.
+    if ($script:StateLockDepth -gt 0) { return (& $Body) }
+
+    $lockPath = (Get-DeputyPaths).StateLock
+    $lockDeadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lockHandle = $null
+    while (-not $lockHandle) {
+        try {
+            $lockHandle = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate,
+                [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        }
+        catch [System.IO.IOException] {
+            if ([datetime]::UtcNow -gt $lockDeadline) {
+                throw "Timed out after $TimeoutSeconds seconds waiting for the state lock $lockPath."
+            }
+            Start-Sleep -Milliseconds 40
+        }
+    }
+    $script:StateLockDepth++
+    try { & $Body }
+    finally {
+        $script:StateLockDepth--
+        $lockHandle.Dispose()
+    }
+}
+
+function Write-FileAtomic([string]$Path, [string]$Content) {
+    # Write beside the target, then rename over it, so a reader sees the old
+    # file or the new one and never a half-written one. The rename is retried
+    # briefly: a reader with the target open (a dashboard tailing the queue)
+    # makes it fail for as long as that read lasts.
+    $tmp = "$Path.tmp"
+    [System.IO.File]::WriteAllText($tmp, $Content)
+    for ($attempt = 1; ; $attempt++) {
+        try { Move-Item -Force -LiteralPath $tmp -Destination $Path -ErrorAction Stop; return }
+        catch {
+            if ($attempt -ge 10) { throw }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Durable wake queue. The watcher appends every wake to state\wake-queue.jsonl
+# with a sequence number that only ever grows, and a wake stays there until it
+# is acknowledged (dep-wake.ps1 ack). So a wake nobody was listening for - the
+# session restarted, the turn ended on an API error, the watcher's output was
+# lost - is still there for the next drain.
+# ---------------------------------------------------------------------------
+
+function Read-WakeQueueRows {
+    # Every non-empty queue line, parsed. Seq is 0 for a row that cannot be
+    # acknowledged by sequence: one written before the queue was sequenced, or
+    # a torn line. Call under the state lock.
+    $path = (Get-DeputyPaths).WakeQueue
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    foreach ($line in [System.IO.File]::ReadAllLines($path)) {
+        if (-not $line.Trim()) { continue }
+        $wake = try { $line | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+        $seq = 0L
+        if ($wake -is [pscustomobject] -and $wake.PSObject.Properties['seq'] -and
+            $wake.PSObject.Properties['taskId'] -and $wake.PSObject.Properties['event']) {
+            $parsed = 0L
+            if ([long]::TryParse([string]$wake.seq, [ref]$parsed) -and $parsed -gt 0) { $seq = $parsed }
+        }
+        [pscustomobject]@{ Seq = $seq; Wake = $wake; Line = $line }
+    }
+}
+
+function Write-WakeQueueRows($Rows) {
+    # Rows keep their original text: re-serialising would reformat timestamps.
+    $rows = @($Rows)
+    $text = if ($rows.Count -gt 0) {
+        (($rows | ForEach-Object { $_.Line }) -join [Environment]::NewLine) + [Environment]::NewLine
+    } else { '' }
+    Write-FileAtomic (Get-DeputyPaths).WakeQueue $text
+}
+
+function Get-WakeSeqCounter {
+    # The last sequence number handed out, or 0 when the counter is missing or
+    # unreadable. Never trusted alone: see Get-HighestWakeSeq.
+    $path = (Get-DeputyPaths).WakeSeq
+    $value = 0L
+    if (Test-Path -LiteralPath $path) {
+        $text = try { [System.IO.File]::ReadAllText($path) } catch { '' }
+        if (-not [long]::TryParse($text.Trim(), [ref]$value) -or $value -lt 0) { $value = 0L }
+    }
+    $value
+}
+
+function Get-HighestWakeSeq($Rows) {
+    # The highest sequence in use: the counter or any queued row, whichever is
+    # larger. Numbering past every queued row means a lost or corrupt counter
+    # can never hand out a number that an outstanding ack would then consume.
+    $highest = Get-WakeSeqCounter
+    foreach ($row in @($Rows)) { if ($row.Seq -gt $highest) { $highest = $row.Seq } }
+    $highest
+}
+
+function Test-FileEndsWithNewline([string]$Path) {
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::ReadWrite)
+    try {
+        if ($stream.Length -eq 0) { return $true }
+        $null = $stream.Seek(-1, [System.IO.SeekOrigin]::End)
+        $stream.ReadByte() -eq 10
+    }
+    finally { $stream.Dispose() }
+}
+
 function Add-WakeEvent($WakeEvent) {
+    # Give the wake the next sequence number and append it. Returns the wake
+    # with its seq set. The counter is written before the row, so a crash
+    # between the two skips a number rather than reusing one.
     $p = Get-DeputyPaths
-    ($WakeEvent | ConvertTo-Json -Compress -Depth 8) | Add-Content -Path $p.WakeQueue -Encoding utf8
+    Invoke-WithStateLock {
+        $seq = (Get-HighestWakeSeq (Read-WakeQueueRows)) + 1
+        Write-FileAtomic $p.WakeSeq "$seq"
+        if ($WakeEvent.PSObject.Properties['seq']) { $WakeEvent.seq = $seq }
+        else { $WakeEvent | Add-Member -NotePropertyName 'seq' -NotePropertyValue $seq }
+        $line = $WakeEvent | ConvertTo-Json -Compress -Depth 8
+        # A writer killed mid-append leaves a line without its newline. Start a
+        # fresh line so the torn one stays alone (drain retires it) instead of
+        # swallowing this wake too.
+        $prefix = ''
+        if ((Test-Path -LiteralPath $p.WakeQueue) -and -not (Test-FileEndsWithNewline $p.WakeQueue)) {
+            $prefix = [Environment]::NewLine
+        }
+        [System.IO.File]::AppendAllText($p.WakeQueue, $prefix + $line + [Environment]::NewLine)
+    }
+    $WakeEvent
+}
+
+function Get-PendingWakes {
+    # Unacknowledged wakes, oldest first. Read only.
+    Invoke-WithStateLock {
+        Read-WakeQueueRows | Where-Object { $_.Seq -gt 0 } | Sort-Object Seq | ForEach-Object { $_.Wake }
+    }
+}
+
+function Receive-Wakes {
+    # The drain: unacknowledged wakes, oldest first, plus the text of any row
+    # that could never be acknowledged. Those are retired here - the caller
+    # must report them, because the queue was their only record.
+    Invoke-WithStateLock {
+        $rows = @(Read-WakeQueueRows)
+        $unusable = @($rows | Where-Object { $_.Seq -le 0 })
+        $usable = @($rows | Where-Object { $_.Seq -gt 0 } | Sort-Object Seq)
+        if ($unusable.Count -gt 0) { Write-WakeQueueRows $usable }
+        [pscustomobject]@{
+            Wakes   = @($usable | ForEach-Object { $_.Wake })
+            Retired = @($unusable | ForEach-Object { $_.Line })
+        }
+    }
+}
+
+function Complete-Wakes([long]$Through) {
+    # The ack: remove every wake at or below $Through. A number that was never
+    # handed out is refused - acknowledging it would also consume wakes that
+    # have not happened yet, sight unseen.
+    Invoke-WithStateLock {
+        $rows = @(Read-WakeQueueRows)
+        $highest = Get-HighestWakeSeq $rows
+        if ($Through -gt $highest) {
+            throw "Cannot acknowledge through seq $Through`: the highest wake sequence handed out is $highest. Run dep-wake.ps1 drain and use the command it prints."
+        }
+        $removed = @($rows | Where-Object { $_.Seq -gt 0 -and $_.Seq -le $Through })
+        $kept = @($rows | Where-Object { $_.Seq -le 0 -or $_.Seq -gt $Through })
+        if ($removed.Count -gt 0) { Write-WakeQueueRows $kept }
+        [pscustomobject]@{
+            Removed   = $removed.Count
+            Remaining = @($kept | Where-Object { $_.Seq -gt 0 }).Count
+        }
+    }
+}
+
+function Get-TaskStatusNow([string]$Id) {
+    # What a queued wake's task looks like right now: a wake can sit in the
+    # queue long after the task moved on.
+    try {
+        $p = Get-DeputyPaths
+        $name = "$(Assert-TaskId $Id).json"
+        $active = Join-Path $p.State $name
+        if (Test-Path -LiteralPath $active) { return [string](Get-Content $active -Raw | ConvertFrom-Json).status }
+        if (Test-Path -LiteralPath (Join-Path $p.Archive $name)) { return 'returned' }
+    }
+    catch { $null = $_ }
+    'unknown'
+}
+
+function Format-Wake {
+    # One wake as the lines the Deputy reads. -Queued adds when it happened and
+    # what its task looks like now, for a wake read back out of the queue.
+    param([Parameter(Mandatory)]$Wake, [switch]$Queued)
+    $head = '[wake] {0}: {1} ({2})' -f $Wake.taskId, $Wake.event, $Wake.kind
+    if ($Wake.PSObject.Properties['seq'] -and $Wake.seq) { $head += " seq=$($Wake.seq)" }
+    $head
+    if ($Queued) {
+        $at = ConvertTo-UtcDateTime $Wake.at
+        $when = $at ? $at.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss') : 'unknown time'
+        '  queued: {0}; task now: {1}' -f $when, (Get-TaskStatusNow $Wake.taskId)
+    }
+    if ($Wake.prUrl) { '  pr: {0}' -f $Wake.prUrl }
+    if ($Wake.prUrlRejected) { "  pr REJECTED (not this task's repo): {0}" -f $Wake.prUrlRejected }
+    if ($Wake.summary) { '  {0}' -f $Wake.summary }
+}
+
+function Get-WakeCommand([string]$Arguments) {
+    'pwsh -NoProfile -File "{0}" {1}' -f (Join-Path (Get-DeputyPaths).Bin 'dep-wake.ps1'), $Arguments
+}
+
+function Format-WakeReport($Wakes) {
+    # The drain report. Its LAST line is the exact command that acknowledges
+    # everything above it - and nothing that arrives later.
+    $wakes = @($Wakes)
+    foreach ($wake in $wakes) { Format-Wake $wake -Queued }
+    $through = ($wakes | ForEach-Object { [long]$_.seq } | Measure-Object -Maximum).Maximum
+    "$($wakes.Count) unacknowledged wake(s). Handle each one, then acknowledge them with exactly this command:"
+    Get-WakeCommand "ack -Through $through"
+}
+
+# ---------------------------------------------------------------------------
+# Watcher singleton and heartbeat. One process scans at a time: it holds
+# state\watcher.lock (its pid and start time, so a recycled pid is never
+# mistaken for it) and touches state\watcher.beat on every poll. A watcher is
+# healthy when the process in the lock is alive AND its heartbeat is fresh; a
+# live process with a stale heartbeat is wedged, which is not the same thing.
+# ---------------------------------------------------------------------------
+
+function Get-WatcherStaleSeconds {
+    # A scan can take a while (process checks, megabyte logs), so the heartbeat
+    # gets generous room before the watcher counts as wedged.
+    [math]::Max(120, 4 * [int](Get-DeputyConfig).watchIntervalSeconds)
+}
+
+function Read-WatcherLock {
+    # The lock record, or $null when there is none or it cannot be read as one.
+    $path = (Get-DeputyPaths).WatcherLock
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $lock = try { Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+    if ($lock -isnot [pscustomobject]) { return $null }
+    $lockPid = 0
+    if (-not $lock.PSObject.Properties['pid'] -or -not [int]::TryParse([string]$lock.pid, [ref]$lockPid) -or $lockPid -le 0) {
+        return $null
+    }
+    [pscustomobject]@{
+        ProcessId = $lockPid
+        StartedAt = $lock.PSObject.Properties['startedAt'] ? $lock.startedAt : $null
+        Session   = $lock.PSObject.Properties['session'] ? [string]$lock.session : ''
+    }
+}
+
+function Get-WatcherHealth {
+    $p = Get-DeputyPaths
+    $health = [pscustomobject]@{
+        Healthy   = $false   # alive and polling
+        Live      = $false   # the process in the lock is alive
+        ProcessId = 0
+        Session   = ''       # the Claude session whose stop hook started it, if any
+        Reason    = 'no watcher is running'
+    }
+    $lock = Read-WatcherLock
+    if (-not $lock) { return $health }
+    $health.ProcessId = $lock.ProcessId
+    $health.Session = $lock.Session
+
+    $proc = Get-Process -Id $lock.ProcessId -ErrorAction SilentlyContinue
+    $started = if ($proc) { try { $proc.StartTime } catch { $null } } else { $null }
+    if (-not $proc -or -not (Test-ProcessStartMatch $started $lock.StartedAt)) {
+        $health.Reason = "the watcher that held the lock (pid $($lock.ProcessId)) is gone"
+        return $health
+    }
+    $health.Live = $true
+
+    if (-not (Test-Path -LiteralPath $p.WatcherBeat)) {
+        $health.Reason = "watcher pid $($lock.ProcessId) has not written a heartbeat"
+        return $health
+    }
+    $age = ([datetime]::UtcNow - (Get-Item -LiteralPath $p.WatcherBeat).LastWriteTimeUtc).TotalSeconds
+    if ($age -gt (Get-WatcherStaleSeconds)) {
+        $health.Reason = 'watcher pid {0} has not polled for {1:n0} seconds' -f $lock.ProcessId, $age
+        return $health
+    }
+    $health.Healthy = $true
+    $health.Reason = "watcher pid $($lock.ProcessId) is polling"
+    $health
+}
+
+function Test-WatcherHealthy {
+    (Get-WatcherHealth).Healthy
+}
+
+function Test-WatcherServes($Health, [string]$Session) {
+    # Will this watcher's wake reach the given Claude session? A watcher the
+    # Deputy started by hand (no session recorded) reports to whoever started
+    # it. One started by a stop hook wakes only the session that hook belongs
+    # to - if that session has ended, its watcher is an orphan and its wakes go
+    # nowhere but the queue.
+    if (-not $Health.Healthy) { return $false }
+    -not ($Session -and $Health.Session -and ($Health.Session -ne $Session))
+}
+
+function Set-WatcherBeat {
+    [System.IO.File]::WriteAllText((Get-DeputyPaths).WatcherBeat, (Get-Date -Format o))
+}
+
+function Stop-Watcher([int]$ProcessId) {
+    # Stop a watcher that has to be replaced. Only ever called for the process
+    # the lock names (pid and start time already matched); it must also still
+    # read as a watcher, or it is left alone. Killing one mid-scan is safe: a
+    # wake is appended to the queue before its task record is written, so the
+    # worst case is the same wake twice, never a lost one.
+    $info = Get-ProcessInfo $ProcessId
+    if (-not $info) { return $true }
+    if ("$($info.CommandLine)" -notmatch 'dep-watch\.ps1') { return $false }
+    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 50; $i++) {
+        if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return $true }
+        Start-Sleep -Milliseconds 100
+    }
+    $false
+}
+
+function Enter-WatcherLock([string]$Session) {
+    <#
+    .SYNOPSIS
+    Become the one watcher. Returns Acquired, the Holder's health when someone
+    else keeps the lock, and a Note when the lock was reclaimed or taken over.
+
+    The lock of a watcher that is gone is reclaimed. A live watcher keeps it,
+    with two exceptions where it is stopped and replaced: it is wedged (alive
+    but not polling), or it was started by the stop hook of a different Claude
+    session than the one asking, so its wake would reach nobody.
+    #>
+    $p = Get-DeputyPaths
+    Invoke-WithStateLock {
+        $note = ''
+        $holder = Get-WatcherHealth
+        if ($holder.Live) {
+            if ($holder.Healthy -and (Test-WatcherServes $holder $Session)) {
+                return [pscustomobject]@{ Acquired = $false; Holder = $holder; Note = '' }
+            }
+            $why = $holder.Healthy ? "it reports to another session ($($holder.Session))" : $holder.Reason
+            if (-not (Stop-Watcher $holder.ProcessId)) {
+                return [pscustomobject]@{
+                    Acquired = $false; Holder = $holder
+                    Note     = "pid $($holder.ProcessId) holds the watcher lock and should be replaced ($why), but it could not be stopped"
+                }
+            }
+            $note = "took over from watcher pid $($holder.ProcessId): $why"
+        }
+        elseif ($holder.ProcessId) {
+            $note = "reclaimed the lock: $($holder.Reason)"
+        }
+        $record = [ordered]@{
+            pid       = $PID
+            startedAt = (Get-Process -Id $PID).StartTime.ToString('o')
+            session   = $Session
+        }
+        # The predecessor's heartbeat goes before the new identity is written,
+        # so this watcher is never vouched for by a beat it did not write.
+        Remove-Item -LiteralPath $p.WatcherBeat -Force -ErrorAction SilentlyContinue
+        Write-FileAtomic $p.WatcherLock ($record | ConvertTo-Json -Compress)
+        Set-WatcherBeat
+        [pscustomobject]@{ Acquired = $true; Holder = $null; Note = $note }
+    }
+}
+
+function Exit-WatcherLock {
+    # Release the lock, if it is still this process's.
+    $p = Get-DeputyPaths
+    Invoke-WithStateLock {
+        $lock = Read-WatcherLock
+        if ($lock -and $lock.ProcessId -eq $PID) {
+            Remove-Item -LiteralPath $p.WatcherLock, $p.WatcherBeat -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Session hooks (.claude\settings.json). Shared pieces of dep-hook-guard.ps1
+# and dep-hook-stop.ps1.
+# ---------------------------------------------------------------------------
+
+# How many times in a row the stop guard may refuse a stop before it gives up
+# and lets the session end, loudly.
+$script:GuardMaxBlocks = 3
+
+function Read-HookInput {
+    # The JSON Claude Code hands a hook on stdin, or an empty object when there
+    # is none (the script was run by hand) or it cannot be parsed.
+    $empty = [pscustomobject]@{}
+    if (-not [Console]::IsInputRedirected) { return $empty }
+    $text = try { [Console]::In.ReadToEnd() } catch { '' }
+    if (-not $text.Trim()) { return $empty }
+    $parsed = try { $text | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+    if ($parsed -is [pscustomobject]) { $parsed } else { $empty }
+}
+
+function Get-HookField($HookInput, [string]$Name) {
+    if ($HookInput -and $HookInput.PSObject.Properties[$Name]) { [string]$HookInput.$Name } else { '' }
+}
+
+function Get-StateCounter([string]$Path) {
+    $value = 0
+    if (Test-Path -LiteralPath $Path) {
+        $text = try { [System.IO.File]::ReadAllText($Path) } catch { '' }
+        if (-not [int]::TryParse($text.Trim(), [ref]$value) -or $value -lt 0) { $value = 0 }
+    }
+    $value
+}
+
+function Get-StopGuardDecision {
+    <#
+    .SYNOPSIS
+    The stop guard's decision table, as a pure function.
+
+    | tasks active | watcher healthy | blocks so far | action  | blocks after |
+    | no           | any             | any           | allow   | 0            |
+    | yes          | yes             | any           | allow   | 0            |
+    | yes          | no              | below the max | block   | +1           |
+    | yes          | no              | at the max    | release | unchanged    |
+
+    'release' lets the stop through although nothing is watching, and says so.
+    The count stays at the max afterwards, so a session that will not start a
+    watcher is nagged a bounded number of times, not on every stop for ever;
+    only a healthy watcher (or no tasks left) starts a new budget.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ActiveTasks,
+        [Parameter(Mandatory)][bool]$WatcherHealthy,
+        [Parameter(Mandatory)][int]$Blocks,
+        [int]$MaxBlocks = $script:GuardMaxBlocks
+    )
+    if ($ActiveTasks -le 0 -or $WatcherHealthy) {
+        return [pscustomobject]@{ Action = 'allow'; Blocks = 0 }
+    }
+    if ($Blocks -lt $MaxBlocks) {
+        return [pscustomobject]@{ Action = 'block'; Blocks = $Blocks + 1 }
+    }
+    [pscustomobject]@{ Action = 'release'; Blocks = $Blocks }
+}
+
+function Get-WakeAnnounced {
+    # What the stop hook has already pushed at the session: the highest wake
+    # sequence it announced, and how often it repeated that after API errors.
+    $record = [pscustomobject]@{ Seq = 0L; Retries = 0 }
+    $path = (Get-DeputyPaths).WakeAnnounced
+    if (-not (Test-Path -LiteralPath $path)) { return $record }
+    $parsed = try { Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+    if ($parsed -is [pscustomobject]) {
+        $seq = 0L; $retries = 0
+        if ($parsed.PSObject.Properties['seq'] -and [long]::TryParse([string]$parsed.seq, [ref]$seq)) { $record.Seq = $seq }
+        if ($parsed.PSObject.Properties['retries'] -and [int]::TryParse([string]$parsed.retries, [ref]$retries)) { $record.Retries = $retries }
+    }
+    $record
+}
+
+function Test-WakeAnnouncedSince([datetime]$SinceUtc) {
+    # Did the stop hook push a wake at the session at or after this moment?
+    $path = (Get-DeputyPaths).WakeAnnounced
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    (Get-Item -LiteralPath $path).LastWriteTimeUtc -ge $SinceUtc
+}
+
+function Set-WakeAnnounced([long]$Seq, [int]$Retries) {
+    Write-FileAtomic (Get-DeputyPaths).WakeAnnounced (([ordered]@{ seq = $Seq; retries = $Retries }) | ConvertTo-Json -Compress)
 }
 
 # ---------------------------------------------------------------------------

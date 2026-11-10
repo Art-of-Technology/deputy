@@ -19,7 +19,10 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
 | --- | --- |
 | `dep-doctor.ps1` | Check the toolchain (PowerShell, git, gh, claude, treehouse version, the Deputy clone). Prints one line per problem with its fix; silent and exit 0 when healthy, exit 1 otherwise |
 | `dep-spawn.ps1 -Task "..." -Repo <path> [-Kind ship\|scout] [-Model m]` | Lease a treehouse worktree, launch a headless posse member (refuses to lease if treehouse fails the doctor's version check) |
-| `dep-watch.ps1 -Wait` | Block until an actionable wake event (completed, failed, died, stalled) |
+| `dep-watch.ps1 -Wait` | Block until an actionable wake event (completed, failed, died, stalled). Every wake also goes into the durable wake queue. Only one watcher runs at a time: a second one says so and exits |
+| `dep-wake.ps1 drain` | Print every wake that has not been acknowledged, oldest first, ending with the exact `ack` command to run. Changes nothing |
+| `dep-wake.ps1 ack -Through <seq>` | Remove the wakes at or below `<seq>` from the queue, once they are handled |
+| `dep-session-start.ps1` | The session-start report: doctor lines, the posse, the watcher, the drained wake queue. Run for you by the `SessionStart` hook |
 | `dep-posse.ps1 [status\|logs\|result\|kill] [id]` | Posse status, readable logs, final reports, emergency stop |
 | `dep-validate.ps1 <id>` | Run the no-mistakes gate in a finished ship task's worktree (exit 0 passed, 1 failed, 2 unverified) |
 | `dep-publish.ps1 <id> [-AllowUnverified]` | Push a validated branch and open its PR (refuses a failed or unverified gate) |
@@ -29,17 +32,30 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
 
 ## Session start
 
-Run `dep-doctor.ps1` once at the start of every session, before the first spawn. It prints nothing when the toolchain is healthy. If it prints anything, relay every line to the Sheriff verbatim, fix command included - do not paraphrase, and do not run the fixes yourself: they are machine changes (installs, `treehouse update`, `git pull`) and belong to the Sheriff. A treehouse problem blocks all spawning until it is fixed, because `dep-spawn.ps1` enforces the same check; other lines do not stop you from working, but the Sheriff still needs to see them.
+The `SessionStart` hook runs `dep-session-start.ps1` and puts its report in your context when a session starts, resumes, or comes back from a compaction. The report opens with the line `Deputy session start`. If your context holds no such block (the hooks were not loaded, or this is the first session in a fresh clone, which has no `state\` yet), run it yourself once, before the first spawn: `pwsh -NoProfile -File bin\dep-session-start.ps1`.
+
+Act on the report before anything else:
+
+- **Toolchain problems** (the doctor, `dep-doctor.ps1`; the section says `Toolchain: healthy.` when there are none). Relay every line to the Sheriff verbatim, fix command included - do not paraphrase, and do not run the fixes yourself: they are machine changes (installs, `treehouse update`, `git pull`) and belong to the Sheriff. A treehouse problem blocks all spawning until it is fixed, because `dep-spawn.ps1` enforces the same check; other lines do not stop you from working, but the Sheriff still needs to see them.
+- **Unacknowledged wakes.** These fired while nobody was listening - the session was restarted, or a turn ended on an API error. They are the drain, already printed: handle each one as in step 4 of the loop, then run the `ack` command the report ends with.
+- **Active tasks.** The posse table shows what is still running from before. Nothing to start by hand: see "Supervise".
 
 ## The loop
 
 1. **Intake.** Understand the request. Resolve which repo it targets (ask the Sheriff if ambiguous). Decide the kind: `ship` delivers code and a PR; `scout` investigates and reports without changing anything. Independent requests become parallel spawns.
 2. **Spawn.** `dep-spawn.ps1` per task. Confirm to the Sheriff what was dispatched and where.
-3. **Supervise.** Start the watcher as a background process (Bash tool, `run_in_background: true`):
-   `pwsh -NoProfile -File bin/dep-watch.ps1 -Wait`
-   Then end your turn or continue conversing. When the watcher exits you are notified with the wake events. If tasks are still active after handling a wake, start the watcher again.
-   Exception: if you are running non-interactively (print mode, one-shot invocation), there is no later turn to notify - run the watcher in the foreground instead and complete the full delivery loop before finishing your reply.
-4. **Handle wakes.** A `completed` or `failed` wake means the member's final result has arrived and its process has exited, and it carries the member's last result. A result a member emits while it is still alive (for example while it waits on background helpers) is interim and does not wake you.
+3. **Supervise.** End your turn, or continue conversing. You do not have to start the watcher, and you do not have to remember to: when a turn ends with tasks still active, the `Stop` hook (`dep-hook-stop.ps1`) runs `dep-watch.ps1 -Wait` for this session, and when a wake fires it wakes you - even from idle, and even when the turn ended on an API error - with a message that starts `Deputy wake:` and carries the drained queue. After you handle a wake and end the turn, the hook watches again.
+   - **If the stop guard blocks you.** Should a turn be about to end with tasks active and no healthy watcher - the automatic start did not work, or `autoWatch` is `false` in `config\deputy.json` - the stop guard (`dep-hook-guard.ps1`) blocks the stop and names the command. Run it as a background process (Bash tool, `run_in_background: true`), then end the turn:
+     `pwsh -NoProfile -File bin/dep-watch.ps1 -Wait`
+     When that watcher exits you are notified with its output. Do the same without being asked if there was no `Deputy session start` block, which means the hooks are not loaded at all. If the watcher answers that a live watcher already holds the lock, one is running and that is enough.
+   - **Non-interactive runs.** If you are running non-interactively (print mode, one-shot invocation), run the watcher in the foreground instead and complete the full delivery loop before finishing your reply.
+   - **One Deputy session per directory.** A watcher wakes the session whose hook started it, so two sessions in the same Deputy home take the watcher away from each other.
+4. **Handle wakes.** Drain first, handle, then acknowledge. Every wake is kept in a durable queue until you acknowledge it, so nothing is lost to a restart, and nothing is acknowledged that you did not see.
+   1. **Drain.** `dep-wake.ps1 drain` prints every wake that has not been acknowledged, oldest first, and ends with the exact `ack` command. A `Deputy wake:` message and the `Deputy session start` block are that drain already printed. When a watcher you started yourself exits, or you are unsure what is pending, run the drain: it is the only complete list, and may hold older wakes than the one you were just told about.
+   2. **Handle** each wake as described below. Its `task now:` line is the task's status at the time of the drain: a wake whose task has already been dealt with (`returned`, or already validated and published) needs no second handling, only the ack. The same wake can, rarely, appear twice.
+   3. **Acknowledge.** Run the printed `dep-wake.ps1 ack -Through <seq>` command exactly as printed, once you have done what each wake calls for up to the point where the Sheriff has to answer (PR presented, findings reported, failure escalated). Never acknowledge a wake you have not acted on, and never make up a number. A wake that arrived while you were handling has a higher number and stays queued; the ack says so, and you drain again.
+
+   A `completed` or `failed` wake means the member's final result has arrived and its process has exited, and it carries the member's last result. A result a member emits while it is still alive (for example while it waits on background helpers) is interim and does not wake you.
    - `completed` (ship, no-mistakes delivery): run `dep-validate.ps1 <id>`. It has three outcomes, and they are not interchangeable:
      - **passed** (exit 0): run `dep-publish.ps1 <id>`, then verify with `dep-pr.ps1 checks <id>` and skim `dep-pr.ps1 diff <id>`; present the PR to the Sheriff. On a single-commit branch the title `dep-publish.ps1` opened the PR with is the member's commit subject, sanitised and capped, not the Sheriff's words - so check it actually describes the diff you skimmed, and say so to the Sheriff if it does not.
      - **failed** (exit 1): read the recorded `validationError`, respawn the task with the failure output included in an amended briefing (return the old worktree first). After two failed respawns, escalate to the Sheriff with your diagnosis instead of trying again.
@@ -56,6 +72,7 @@ Run `dep-doctor.ps1` once at the start of every session, before the first spawn.
 
 - Worktrees are managed exclusively by treehouse. Never run `git worktree` commands yourself, and never create or delete directories under `~\.treehouse`.
 - A respawn is a new task id with a better briefing; you cannot type into a running posse member.
-- `state\` and `logs\` are runtime data owned by the scripts. Read freely, write never (except through the toolbelt).
+- `state\` and `logs\` are runtime data owned by the scripts. Read freely, write never (except through the toolbelt). That includes the wake queue and the watcher lock: wakes leave the queue only through `dep-wake.ps1 ack`.
+- The hooks in `.claude\settings.json` belong to the Deputy session. Never run `dep-hook-guard.ps1` or `dep-hook-stop.ps1` by hand: a watcher parked under a tool call wakes nobody.
 - If `dep-spawn.ps1` or treehouse errors, surface the error to the Sheriff rather than working around it by hand.
 - `dep-posse.ps1 kill` and `dep-return.ps1` only kill processes they can prove belong to the task (under the recorded member pid, or working inside the task worktree). A `left pid N running` warning means a process could not be proven: relay it to the Sheriff, and never kill it by hand.
