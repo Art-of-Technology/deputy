@@ -231,8 +231,292 @@ function Add-WakeEvent($WakeEvent) {
     ($WakeEvent | ConvertTo-Json -Compress -Depth 8) | Add-Content -Path $p.WakeQueue -Encoding utf8
 }
 
+# ---------------------------------------------------------------------------
+# Toolchain health. Everything Deputy does stands on treehouse behaving, so the
+# version floor lives here, once, and both dep-doctor.ps1 (which reports) and
+# dep-spawn.ps1 (which refuses to lease) read it through the same functions.
+# ---------------------------------------------------------------------------
+
+# The oldest treehouse Deputy will lease from. Older releases can mislist the
+# processes in a worktree on Windows, and Deputy kills what treehouse lists.
+$script:TreehouseMinVersion = [version]'3.0.1'
+
+# The one fix for an old treehouse. `treehouse update` goes to the latest
+# release, which is the point: 3.0.0 is below the floor, so never stop there.
+$script:TreehouseUpdateFix = 'treehouse update (with no tasks leased; it must go straight to the latest release, never to 3.0.0)'
+
+function ConvertTo-TreehouseVersion([string]$Text) {
+    # The version in `treehouse --version` output ('v3.1.8', 'treehouse version
+    # 3.1.8', ...), or $null when there is none to find. A pre-release tag is
+    # kept, because 3.0.1-rc1 sorts before 3.0.1 and so is below the floor.
+    if (-not $Text) { return $null }
+    if ($Text -notmatch '(?<![\w.])v?(?<core>\d+\.\d+\.\d+)(?<pre>-[0-9A-Za-z.-]+)?(?![\w.])') { return $null }
+    $core = $null
+    if (-not [version]::TryParse($Matches['core'], [ref]$core)) { return $null }
+    [pscustomobject]@{
+        Version    = $core
+        PreRelease = [bool]$Matches['pre']
+        Text       = $Matches['core'] + $Matches['pre']
+    }
+}
+
+function Test-TreehouseVersion([string]$Text) {
+    # True only when the text carries a version at or above the floor. Output
+    # that cannot be parsed is incompatible: Deputy never guesses a version up.
+    $parsed = ConvertTo-TreehouseVersion $Text
+    if (-not $parsed) { return $false }
+    if ($parsed.Version -gt $script:TreehouseMinVersion) { return $true }
+    ($parsed.Version -eq $script:TreehouseMinVersion) -and -not $parsed.PreRelease
+}
+
+function Test-CommandOnPath([string]$Name) {
+    [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Get-TreehouseProblems {
+    # One line per treehouse problem, nothing when it is fit to lease from.
+    if (-not (Test-CommandOnPath 'treehouse')) {
+        'treehouse is not on PATH. Fix: irm https://kunchenguid.github.io/treehouse/install.ps1 | iex'
+        return
+    }
+    $min = $script:TreehouseMinVersion
+    $text = try { (treehouse --version 2>&1 | Out-String).Trim() } catch { '' }
+    $parsed = ConvertTo-TreehouseVersion $text
+    if (-not $parsed) {
+        "treehouse --version printed '$(Limit-Text $text 60)', which is not a version Deputy can read, so it is treated as incompatible (need $min or later). Fix: $script:TreehouseUpdateFix"
+    }
+    elseif (-not (Test-TreehouseVersion $text)) {
+        "treehouse $($parsed.Text) is older than the minimum $min. Fix: $script:TreehouseUpdateFix"
+    }
+    $help = try { (treehouse get --help 2>&1 | Out-String) } catch { '' }
+    if ($help -notmatch '--lease(?![\w-])') {
+        "treehouse get --help does not list --lease, which Deputy needs to lease worktrees. Fix: $script:TreehouseUpdateFix"
+    }
+}
+
+function Get-DeputyCloneProblems([string]$Root) {
+    # Is the Deputy clone on its default branch, and not behind origin? Report
+    # only: this never fetches, pulls or switches. ls-remote reads the remote
+    # without touching a single local ref.
+    git -C $Root rev-parse --is-inside-work-tree *> $null
+    if ($LASTEXITCODE -ne 0) {
+        "The Deputy directory $Root is not a git clone, so it cannot be checked for updates. Fix: reinstall with git clone (see ONBOARDING.md, 'Get Deputy')"
+        return
+    }
+    $branch = (Resolve-DefaultRef $Root).Branch
+    if (-not $branch) {
+        "The default branch of the Deputy clone at $Root cannot be resolved. Fix: git -C `"$Root`" remote set-head origin -a"
+        return
+    }
+    $current = (git -C $Root branch --show-current 2>$null | Out-String).Trim()
+    if ($current -ne $branch) {
+        $where = $current ? "branch '$current'" : 'a detached HEAD'
+        "The Deputy clone at $Root is on $where, not its default branch '$branch'. Fix: git -C `"$Root`" switch $branch"
+    }
+    $remotes = @(git -C $Root remote 2>$null)
+    if ($remotes -notcontains 'origin') { return }
+
+    $previousPrompt = $env:GIT_TERMINAL_PROMPT
+    $env:GIT_TERMINAL_PROMPT = '0'  # a doctor must fail, not sit at a credential prompt
+    try { $listing = git -C $Root ls-remote origin "refs/heads/$branch" 2>$null; $code = $LASTEXITCODE }
+    finally { $env:GIT_TERMINAL_PROMPT = $previousPrompt }
+    if ($code -ne 0) {
+        "Could not reach origin to check whether the Deputy clone at $Root is behind. Fix: git -C `"$Root`" ls-remote origin (resolve the error it prints)"
+        return
+    }
+    $remoteSha = (("$($listing | Select-Object -First 1)") -split '\s+')[0]
+    if (-not $remoteSha) {
+        "origin has no branch '$branch' for the Deputy clone at $Root. Fix: git -C `"$Root`" remote set-head origin -a"
+        return
+    }
+    # Behind means origin's tip is not already contained in the local default
+    # branch. A commit this clone has never fetched is an unknown object, which
+    # fails the ancestry test too - also behind.
+    $local = (Test-GitRef $Root "refs/heads/$branch") ? "refs/heads/$branch" : 'HEAD'
+    git -C $Root merge-base --is-ancestor $remoteSha $local *> $null
+    if ($LASTEXITCODE -ne 0) {
+        "The Deputy clone at $Root is behind origin/$branch. Fix: git -C `"$Root`" pull --ff-only"
+    }
+}
+
+function Get-DoctorProblems {
+    # Every toolchain problem dep-doctor.ps1 reports, one line each, each line
+    # naming its exact fix. Empty when healthy. (The PowerShell version check is
+    # in dep-doctor.ps1 itself: this file cannot even be parsed below 7.)
+    $installFix = [ordered]@{
+        git    = 'winget install --id Git.Git -e'
+        gh     = 'winget install --id GitHub.cli -e'
+        claude = 'irm https://claude.ai/install.ps1 | iex'
+    }
+    foreach ($tool in $installFix.Keys) {
+        if (-not (Test-CommandOnPath $tool)) { "$tool is not on PATH. Fix: $($installFix[$tool])" }
+    }
+    if (Test-CommandOnPath 'gh') {
+        gh auth status *> $null
+        if ($LASTEXITCODE -ne 0) { 'gh is not authenticated (gh auth status failed). Fix: gh auth login' }
+    }
+    Get-TreehouseProblems
+    if (Test-CommandOnPath 'git') { Get-DeputyCloneProblems (Get-DeputyPaths).Root }
+}
+
+# ---------------------------------------------------------------------------
+# Process handling. Deputy force-kills process trees, so every pid is treated
+# as a claim to be checked: treehouse's listing is evidence of where to look,
+# never by itself a licence to kill.
+# ---------------------------------------------------------------------------
+
+# More processes than this in one worktree is not a posse member, it is
+# treehouse mislisting (an old version can report the whole machine).
+$script:MaxWorktreeProcesses = 50
+
+# Pids that are never a posse member: the System Idle Process and System.
+$script:ReservedProcessIds = @(0, 4)
+
+function Get-ProcessInfo([int]$ProcessId) {
+    # What Deputy can read about a live process, or $null when it is gone or
+    # unreadable. ExecutablePath and CommandLine come back empty for processes
+    # this user may not inspect, which is exactly what callers test for.
+    $proc = try {
+        Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+    }
+    catch { $null }
+    if (-not $proc) { return $null }
+    [pscustomobject]@{
+        ProcessId       = [int]$proc.ProcessId
+        ParentProcessId = [int]$proc.ParentProcessId
+        ExecutablePath  = $proc.ExecutablePath
+        CommandLine     = $proc.CommandLine
+        StartTime       = $proc.CreationDate
+    }
+}
+
+function Get-ProcessWorkingDirectory([int]$ProcessId) {
+    # The current directory of another process, read from its PEB, or $null
+    # when it cannot be read (gone, protected, 32-bit, or this is not 64-bit
+    # Windows). Deputy reads it itself rather than taking treehouse's word, so
+    # a mislisted pid is caught here instead of being killed.
+    if (-not ('Deputy.ProcessCwd' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace Deputy {
+    public static class ProcessCwd {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessBasicInformation {
+            public IntPtr ExitStatus;
+            public IntPtr PebBaseAddress;
+            public IntPtr AffinityMask;
+            public IntPtr BasePriority;
+            public IntPtr UniqueProcessId;
+            public IntPtr InheritedFromUniqueProcessId;
+        }
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtQueryInformationProcess(IntPtr process, int infoClass,
+            ref ProcessBasicInformation info, int size, out int returned);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool ReadProcessMemory(IntPtr process, IntPtr address, byte[] buffer,
+            IntPtr size, out IntPtr read);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool IsWow64Process(IntPtr process, out bool wow64);
+
+        private static byte[] Read(IntPtr process, IntPtr address, int size) {
+            byte[] buffer = new byte[size];
+            IntPtr read;
+            if (!ReadProcessMemory(process, address, buffer, (IntPtr)size, out read)) return null;
+            return read.ToInt64() == size ? buffer : null;
+        }
+
+        public static string Get(int processId) {
+            // The offsets below are the 64-bit PEB layout; anything else is
+            // reported as unreadable rather than guessed at.
+            if (IntPtr.Size != 8) return null;
+            const uint QueryInformation = 0x0400, VmRead = 0x0010;
+            IntPtr process = OpenProcess(QueryInformation | VmRead, false, processId);
+            if (process == IntPtr.Zero) return null;
+            try {
+                bool wow64;
+                if (!IsWow64Process(process, out wow64) || wow64) return null;
+                ProcessBasicInformation info = new ProcessBasicInformation();
+                int returned;
+                if (NtQueryInformationProcess(process, 0, ref info, Marshal.SizeOf(info), out returned) != 0) return null;
+                if (info.PebBaseAddress == IntPtr.Zero) return null;
+
+                // PEB.ProcessParameters
+                byte[] pointer = Read(process, IntPtr.Add(info.PebBaseAddress, 0x20), 8);
+                if (pointer == null) return null;
+                IntPtr parameters = (IntPtr)BitConverter.ToInt64(pointer, 0);
+                if (parameters == IntPtr.Zero) return null;
+
+                // RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.DosPath (UNICODE_STRING)
+                byte[] unicodeString = Read(process, IntPtr.Add(parameters, 0x38), 16);
+                if (unicodeString == null) return null;
+                int length = BitConverter.ToUInt16(unicodeString, 0);
+                IntPtr text = (IntPtr)BitConverter.ToInt64(unicodeString, 8);
+                if (length == 0 || (length % 2) != 0 || text == IntPtr.Zero) return null;
+
+                byte[] chars = Read(process, text, length);
+                return chars == null ? null : Encoding.Unicode.GetString(chars);
+            }
+            finally { CloseHandle(process); }
+        }
+    }
+}
+'@
+    }
+    try { [Deputy.ProcessCwd]::Get($ProcessId) } catch { $null }
+}
+
+function Test-PathUnder([string]$Path, [string]$Root) {
+    # Is $Path the directory $Root or somewhere beneath it? Compared on whole
+    # path segments, so C:\pool\10 is not under C:\pool\1.
+    if (-not $Path -or -not $Root) { return $false }
+    try {
+        $p = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+        $r = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    }
+    catch { return $false }
+    if (-not $r) { return $false }
+    $p.Equals($r, [StringComparison]::OrdinalIgnoreCase) -or
+        $p.StartsWith($r + [System.IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function ConvertTo-UtcDateTime($Value) {
+    # Task state round-trips through JSON, and ConvertFrom-Json hands an ISO
+    # timestamp back as a DateTime, not a string. Take either, and never turn a
+    # DateTime back into text to re-parse it: that goes through the current
+    # culture and loses the sub-second part.
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    $parsed = [datetimeoffset]::MinValue
+    $ok = [datetimeoffset]::TryParse([string]$Value, [cultureinfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$parsed)
+    if ($ok) { $parsed.UtcDateTime } else { $null }
+}
+
+function Test-ProcessStartMatch($Started, $Recorded) {
+    # Windows recycles pids, so a pid is only the recorded process when its
+    # start time is the recorded one (within a small tolerance).
+    $a = ConvertTo-UtcDateTime $Started
+    $b = ConvertTo-UtcDateTime $Recorded
+    if ($null -eq $a -or $null -eq $b) { return $false }
+    [math]::Abs(($a - $b).TotalSeconds) -le 2
+}
+
 function Get-WorktreeProcessIds([string]$RepoPath, [string]$WorktreePath) {
-    # Processes treehouse sees running inside a worktree (matched by CWD).
+    # Processes treehouse sees running inside a worktree (matched by CWD),
+    # filtered down to pids that can plausibly be a posse member's.
     Push-Location $RepoPath
     try { $raw = treehouse status --json 2>$null }
     finally { Pop-Location }
@@ -240,11 +524,20 @@ function Get-WorktreeProcessIds([string]$RepoPath, [string]$WorktreePath) {
     $pool = try { ($raw -join "`n") | ConvertFrom-Json } catch { return @() }
     $entry = $pool | Where-Object { $_.path -ieq $WorktreePath } | Select-Object -First 1
     if (-not $entry -or -not $entry.processes) { return @() }
-    @($entry.processes | ForEach-Object {
+    $listed = @($entry.processes | ForEach-Object {
         if ($_ -is [string]) { if ($_ -match '\((\d+)\)') { [int]$Matches[1] } }
         elseif ($_.PSObject.Properties['pid']) { [int]$_.pid }
         elseif ($_.PSObject.Properties['id']) { [int]$_.id }
-    } | Where-Object { $_ })
+    } | Where-Object { $_ -and $script:ReservedProcessIds -notcontains $_ } | Select-Object -Unique)
+
+    if ($listed.Count -gt $script:MaxWorktreeProcesses) {
+        Write-Warning ("treehouse lists $($listed.Count) processes in $WorktreePath, more than the " +
+            "$script:MaxWorktreeProcesses a worktree can plausibly hold. Treating the listing as wrong and " +
+            "ignoring all of it. Run dep-doctor.ps1 to check the treehouse version.")
+        return @()
+    }
+    # A pid that cannot be read is gone, or was never ours to look at.
+    @($listed | Where-Object { Get-ProcessInfo $_ })
 }
 
 function Test-TaskProcessAlive($State) {
@@ -258,11 +551,7 @@ function Test-TaskProcessAlive($State) {
             $recorded = $State.PSObject.Properties['pidStartedAt'] ? $State.pidStartedAt : $null
             if (-not $recorded) { return $true }  # pre-pidStartedAt record: cannot verify
             $started = try { $proc.StartTime } catch { $null }
-            if ($started) {
-                $expected = [datetime]::Parse($recorded, [cultureinfo]::InvariantCulture,
-                    [System.Globalization.DateTimeStyles]::RoundtripKind)
-                if ([math]::Abs(($started - $expected).TotalSeconds) -le 2) { return $true }
-            }
+            if (Test-ProcessStartMatch $started $recorded) { return $true }
         }
     }
     if ($State.worktree -and (Test-Path $State.worktree) -and (Test-Path $State.repo)) {
@@ -271,9 +560,101 @@ function Test-TaskProcessAlive($State) {
     $false
 }
 
+function Test-ProcessDescendsFromMember($Info, $State) {
+    # Does this process sit in the tree under the recorded member pid? Walks
+    # parent links upward. Every hop is checked against pid recycling: a parent
+    # must have started no later than its child, and the member pid itself must
+    # carry the recorded start time.
+    $memberPid = [int]($State.pid ?? 0)
+    $recorded = $State.PSObject.Properties['pidStartedAt'] ? $State.pidStartedAt : $null
+    if (-not $memberPid -or -not $recorded) { return $false }  # no verifiable root
+
+    $current = $Info
+    for ($hop = 0; $hop -lt 32 -and $current; $hop++) {
+        if ($current.ProcessId -eq $memberPid) {
+            return Test-ProcessStartMatch $current.StartTime $recorded
+        }
+        $childStart = ConvertTo-UtcDateTime $current.StartTime
+        if ($null -eq $childStart -or -not $current.ParentProcessId) { return $false }
+        $parent = Get-ProcessInfo $current.ParentProcessId
+        $parentStart = $parent ? (ConvertTo-UtcDateTime $parent.StartTime) : $null
+        $parentIsOriginal = ($null -ne $parentStart) -and ($parentStart -le $childStart)
+        if (-not $parentIsOriginal) {
+            # The parent has exited (its pid is free, or reused by something
+            # younger). Only a child of the member itself can still be placed:
+            # it names the member pid and was born after the member started.
+            $recordedStart = ConvertTo-UtcDateTime $recorded
+            return ($current.ParentProcessId -eq $memberPid) -and ($null -ne $recordedStart) -and
+                ($childStart -ge $recordedStart.AddSeconds(-2))
+        }
+        $current = $parent
+    }
+    $false
+}
+
+function Test-TaskOwnsProcess($State, [int]$ProcessId) {
+    # The whole licence to kill. A pid is the task's only when Deputy can read
+    # what it is (executable path or command line) AND can place it: in the
+    # process tree under the recorded member pid, or working inside the task's
+    # worktree. Anything unreadable or unplaceable is left alone.
+    if ($script:ReservedProcessIds -contains $ProcessId) { return $false }
+    $info = Get-ProcessInfo $ProcessId
+    if (-not $info) { return $false }
+    if (-not $info.ExecutablePath -and -not $info.CommandLine) { return $false }
+    if (Test-ProcessDescendsFromMember $info $State) { return $true }
+    if (-not $State.worktree) { return $false }
+    Test-PathUnder (Get-ProcessWorkingDirectory $ProcessId) $State.worktree
+}
+
+function Get-OwnProcessChain {
+    # This process and its ancestors. Killing any of them takes the caller
+    # down with it, so they are never a kill target whatever else is true.
+    $chain = @()
+    $current = Get-ProcessInfo $PID
+    for ($hop = 0; $hop -lt 32 -and $current; $hop++) {
+        $chain += $current.ProcessId
+        $childStart = ConvertTo-UtcDateTime $current.StartTime
+        $parent = $current.ParentProcessId ? (Get-ProcessInfo $current.ParentProcessId) : $null
+        $parentStart = $parent ? (ConvertTo-UtcDateTime $parent.StartTime) : $null
+        if ($null -eq $parentStart -or $null -eq $childStart -or $parentStart -gt $childStart) { break }
+        $current = $parent
+    }
+    if ($chain -notcontains $PID) { $chain += $PID }
+    $chain
+}
+
 function Stop-TaskProcessTree([int]$ProcessId) {
     # taskkill /T takes the whole child tree down (claude spawns helpers)
     taskkill /PID $ProcessId /T /F 2>$null | Out-Null
+}
+
+function Stop-TaskProcesses($State) {
+    # Stop a task's processes: the recorded member pid, plus whatever treehouse
+    # lists in the worktree (the recorded pid may be a dead launcher). Each
+    # candidate must pass Test-TaskOwnsProcess first; the rest are reported and
+    # left running. Returns the pids whose trees were killed.
+    $candidates = @()
+    if ($State.pid) { $candidates += [int]$State.pid }
+    if ($State.worktree -and $State.repo -and (Test-Path $State.worktree) -and (Test-Path $State.repo)) {
+        $candidates += @(Get-WorktreeProcessIds $State.repo $State.worktree)
+    }
+    $own = @(Get-OwnProcessChain)
+    $killed = @()
+    foreach ($candidate in @($candidates | Select-Object -Unique)) {
+        if ($own -contains $candidate) { continue }
+        # Checked one at a time, in order: killing a tree usually takes later
+        # candidates with it, and those then read as gone rather than as ours.
+        if (-not (Get-ProcessInfo $candidate)) { continue }
+        if (Test-TaskOwnsProcess $State $candidate) {
+            Stop-TaskProcessTree $candidate
+            $killed += $candidate
+        }
+        else {
+            Write-Warning ("left pid $candidate running: it could not be shown to belong to $($State.id) " +
+                "(not readable, not under the member pid, and not working in the task worktree)")
+        }
+    }
+    $killed
 }
 
 function Limit-Text([string]$Text, [int]$Max = 200) {

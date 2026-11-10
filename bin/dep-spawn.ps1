@@ -39,6 +39,14 @@ $repoPath = (Resolve-Path $Repo).Path
 git -C $repoPath rev-parse --is-inside-work-tree *> $null
 if ($LASTEXITCODE -ne 0) { throw "'$repoPath' is not a git repository." }
 
+# Never lease from a treehouse Deputy cannot trust: the same check dep-doctor.ps1
+# reports, enforced here before anything is leased or launched.
+$treehouseProblems = @(Get-TreehouseProblems)
+if ($treehouseProblems.Count -gt 0) {
+    throw ("Refusing to lease a worktree: treehouse is not fit for use.`n  " +
+        ($treehouseProblems -join "`n  ") + "`nRun dep-doctor.ps1 for the full toolchain check.")
+}
+
 $id = New-TaskId
 if (-not $Model) { $Model = $config.model }
 if (-not $PermissionMode) { $PermissionMode = $config.permissionMode }

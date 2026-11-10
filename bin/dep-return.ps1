@@ -19,9 +19,11 @@ Initialize-Deputy
 $paths = Get-DeputyPaths
 $task = Read-TaskState $Id
 
-if (Test-TaskProcessAlive $task) {
-    Stop-TaskProcessTree $task.pid
-    Write-Output "stopped live process tree (pid $($task.pid))"
+# Only pids proven to belong to this task are killed (see Test-TaskOwnsProcess):
+# a recycled member pid, or a process treehouse mislists, is left alone.
+$stopped = @(Stop-TaskProcesses $task)
+if ($stopped.Count -gt 0) {
+    Write-Output "stopped live process tree(s) (pid $($stopped -join ', '))"
 }
 
 if ($task.worktree -and (Test-Path $task.worktree)) {
