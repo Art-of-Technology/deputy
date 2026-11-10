@@ -4,6 +4,10 @@
 Watch running posse tasks and surface actionable wake events: completed,
 failed, died, stalled.
 
+A task is completed (or failed) only when its final result event has arrived
+AND the member process has exited. A result event seen while the process is
+still alive is interim and produces no wake on its own.
+
 Default: one scan, print any events, exit.
 -Wait: block (polling) until at least one actionable event occurs, print it,
 exit 0. Exits 0 immediately if no tasks are active; exits 2 on timeout.
@@ -27,15 +31,63 @@ $config = Get-DeputyConfig
 if ($IntervalSeconds -le 0) { $IntervalSeconds = [int]$config.watchIntervalSeconds }
 if ($StallMinutes -le 0) { $StallMinutes = [int]$config.stallMinutes }
 
-function Get-ResultEvent([string]$LogPath) {
-    # A finished stream-json session ends with a single {"type":"result",...} line
+function ConvertFrom-StreamLine([string]$Line) {
+    # One stream-json line as an object, or $null for anything unparseable
+    # (a line the member is still writing, stray non-JSON output).
+    try { $Line | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+}
+
+function Get-SessionResult([string]$LogPath) {
+    <#
+    .SYNOPSIS
+    The LAST {"type":"result",...} event in a stream-json log, and whether the
+    session carried on after it.
+
+    A result event is not proof the member is done: a member that started
+    background helpers emits one at the end of each turn, then resumes when a
+    helper reports back and emits another. So the last result is the only
+    candidate for the final one, and it is Interim when assistant or user
+    events follow it. Returns $null when the log holds no result event.
+    #>
     if (-not (Test-Path $LogPath)) { return $null }
-    foreach ($line in (Get-Content $LogPath -Tail 5 -ErrorAction SilentlyContinue)) {
-        if ($line -and $line -like '*"type":"result"*') {
-            try { return $line | ConvertFrom-Json } catch { return $null }
+    $last = $null
+    $continued = $false
+    try {
+        # Share the file with the member, which is still appending to it.
+        $stream = [System.IO.FileStream]::new($LogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+    }
+    catch { return $null }
+    try {
+        $reader = [System.IO.StreamReader]::new($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            # Cheap substring tests first: logs run to megabytes, and only the
+            # few candidate lines are worth parsing. Nested occurrences of
+            # these keys are escaped inside JSON strings, and the parsed
+            # top-level type is what decides.
+            if ($line.Contains('"type":"result"')) {
+                $parsed = ConvertFrom-StreamLine $line
+                if ($parsed -and $parsed.PSObject.Properties['type'] -and $parsed.type -eq 'result') {
+                    $last = $parsed
+                    $continued = $false
+                }
+            }
+            elseif ($last -and -not $continued -and
+                ($line.Contains('"type":"assistant"') -or $line.Contains('"type":"user"'))) {
+                $parsed = ConvertFrom-StreamLine $line
+                if ($parsed -and $parsed.PSObject.Properties['type'] -and $parsed.type -in @('assistant', 'user')) {
+                    $continued = $true
+                }
+            }
         }
     }
-    $null
+    finally { $stream.Dispose() }
+    if (-not $last) { return $null }
+    [pscustomobject]@{
+        Event   = $last
+        Text    = $last.PSObject.Properties['result'] ? [string]$last.result : ''
+        Interim = $continued
+    }
 }
 
 function Test-PrUrlBelongsToRepo([string]$RepoPath, [string]$Owner, [string]$Repo) {
@@ -79,12 +131,16 @@ function Invoke-Scan {
             }
         }
 
-        $result = Get-ResultEvent $task.stdoutLog
-        if ($result) {
-            $ok = -not $result.is_error
+        # Completion needs BOTH signals: the last result event with nothing
+        # after it, and no member process. A result seen while the process is
+        # alive is interim - the member may be waiting on background helpers
+        # and go on to do more work - so it must not wake the Deputy.
+        $session = Get-SessionResult $task.stdoutLog
+        if ($session -and -not $session.Interim -and -not $alive) {
+            $ok = -not ($session.Event.PSObject.Properties['is_error'] -and $session.Event.is_error)
             Set-TaskField $task 'status' ($ok ? 'completed' : 'failed')
             Set-TaskField $task 'endedAt' (Get-Date -Format o)
-            $text = if ($result.PSObject.Properties['result']) { [string]$result.result } else { '' }
+            $text = $session.Text
             Set-TaskField $task 'result' $text
             if ($text -match 'https://github\.com/([^/\s)"'']+)/([^/\s)"'']+)/pull/\d+') {
                 if (Test-PrUrlBelongsToRepo $task.repo $Matches[1] $Matches[2]) {
@@ -108,14 +164,28 @@ function Invoke-Scan {
             $errTail = if (Test-Path $task.stderrLog) {
                 (Get-Content $task.stderrLog -Tail 3 -ErrorAction SilentlyContinue) -join ' | '
             } else { '' }
-            $events += New-Wake $task 'died' ("process exited without a result. stderr: " + (Limit-Text $errTail 300))
+            # Reaching here with a result means it was interim: the session
+            # carried on after it and never produced a final one.
+            $summary = if ($session) {
+                "process exited without a final result; its only result was an interim result: " +
+                (Limit-Text $session.Text 200) + " | stderr: "
+            } else { "process exited without a result. stderr: " }
+            $events += New-Wake $task 'died' ($summary + (Limit-Text $errTail 300))
         }
         elseif ($task.status -eq 'running' -and -not $task.stallNotified) {
             $idleMinutes = ((Get-Date) - [datetime]$task.lastActivityAt).TotalMinutes
             if ($idleMinutes -ge $StallMinutes) {
                 Set-TaskField $task 'status' 'stalled'
                 Set-TaskField $task 'stallNotified' $true
-                $events += New-Wake $task 'stalled' ("no log activity for {0:n0} minutes; process still alive" -f $idleMinutes)
+                $summary = "no log activity for {0:n0} minutes; process still alive" -f $idleMinutes
+                if ($session -and -not $session.Interim) {
+                    # A member that never exits after its last result lands
+                    # here rather than hanging forever as 'running'.
+                    $summary += ". A result event is present but the task is not completed until the " +
+                        "process exits (it may be waiting on background helpers, or hung): " +
+                        (Limit-Text $session.Text 200)
+                }
+                $events += New-Wake $task 'stalled' $summary
             }
         }
 
