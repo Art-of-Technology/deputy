@@ -3,8 +3,8 @@
 .SYNOPSIS
 Deputy's test gate: the Pester suite under tests\.
 
-Exits non-zero on any failure, and also when Pester 5+ is unavailable - a gate
-that cannot run its tests must not report success.
+Exits non-zero on any failure, and also when the pinned Pester version is
+unavailable - a gate that cannot run its tests must not report success.
 #>
 [CmdletBinding()]
 param(
@@ -15,12 +15,14 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
+# The gate runs on one pinned version (tools\gate-modules.psd1), so a local run,
+# the Deputy's gate and CI cannot disagree because of the Pester they found.
+$pinned = [version](Import-PowerShellDataFile (Join-Path $PSScriptRoot 'gate-modules.psd1')).Pester
 $pester = Get-Module -ListAvailable Pester |
-    Where-Object { $_.Version.Major -ge 5 } |
-    Sort-Object Version -Descending |
+    Where-Object { $_.Version -eq $pinned } |
     Select-Object -First 1
 if (-not $pester) {
-    Write-Output 'Pester 5+ is required and not installed. Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser -Force -SkipPublisherCheck'
+    Write-Output "Pester $pinned is required and not installed. Run: pwsh -NoProfile -File tools\Install-GateModules.ps1"
     exit 1
 }
 Import-Module $pester.Path -Force

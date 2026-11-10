@@ -36,8 +36,11 @@ Describe 'unreachable' { It 'never runs' { $true | Should -BeTrue } }
     New-Item -ItemType Directory -Force (Join-Path $gateRoot 'tests') | Out-Null
     # A byte-for-byte copy, so the script under test is the real gate; it
     # resolves tests\ relative to itself, which is the throwaway root here.
-    Copy-Item -Force (Join-Path (Split-Path -Parent $PSScriptRoot) 'tools' 'Invoke-Tests.ps1') `
-        (Join-Path $gateRoot 'tools' 'Invoke-Tests.ps1')
+    # The pin file travels with it: the gate reads its Pester version from there.
+    foreach ($file in 'Invoke-Tests.ps1', 'gate-modules.psd1') {
+        Copy-Item -Force (Join-Path (Split-Path -Parent $PSScriptRoot) 'tools' $file) `
+            (Join-Path $gateRoot 'tools' $file)
+    }
     foreach ($name in $fixtures.Keys) {
         Set-Content -Path (Join-Path $gateRoot 'tests' "$name.Tests.ps1") `
             -Value $fixtures[$name] -Encoding utf8
