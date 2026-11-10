@@ -111,17 +111,28 @@ if ($task.branch) {
     }
 }
 
-Set-TaskField $task 'finalStatus' $task.status
-Set-TaskField $task 'status' 'returned'
-Set-TaskField $task 'returnedAt' (Get-Date -Format o)
-# What the teardown stood on: the proof, or the fact that there was none.
-Set-TaskField $task 'landed' $verdict.Landed
-Set-TaskField $task 'landedReason' $verdict.Reason
-if (-not $verdict.Landed) { Set-TaskField $task 'discarded' $true }
-Write-TaskState $task
+# The record was read before the landed test, the fetch and the lease return,
+# and the watcher may have written to it since. So the closing fields go onto
+# the record as it is on disk now, and it is archived in the same breath, both
+# under the state lock: nothing can be written in between and lost.
+$task = Invoke-WithStateLock {
+    $current = Read-TaskState $Id
+    $closing = [ordered]@{
+        finalStatus  = $current.status
+        status       = 'returned'
+        returnedAt   = (Get-Date -Format o)
+        # What the teardown stood on: the proof, or the fact that there was none.
+        landed       = $verdict.Landed
+        landedReason = $verdict.Reason
+    }
+    if (-not $verdict.Landed) { $closing['discarded'] = $true }
+    $written = Update-TaskState $Id $closing
+    # Archive state; logs stay in logs\ for the record
+    Move-Item -Force (Get-TaskStatePath $Id) (Join-Path $paths.Archive "$Id.json")
+    $written
+}
 
-# Archive state and briefing; logs stay in logs\ for the record
-Move-Item -Force (Get-TaskStatePath $Id) (Join-Path $paths.Archive "$Id.json")
+# Archive the briefing
 $briefing = [string](Get-EventField $task 'briefing')
 if ($briefing -and (Test-Path -LiteralPath $briefing)) {
     Move-Item -Force $briefing (Join-Path $paths.Archive "$Id-briefing.md")

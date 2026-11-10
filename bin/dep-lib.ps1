@@ -266,34 +266,48 @@ function Read-TaskStateAny([string]$Id) {
 }
 
 function Write-TaskState($State, [string]$Path) {
-    # -Path is for a record that may be archived (see Write-TaskStateAny).
+    # Writes the WHOLE record. Right for a record this process just created or
+    # read a moment ago with nothing slow in between. A script that read the
+    # record and then went to the network, ran a gate or waited on anything
+    # must use Update-TaskState instead, or it undoes what others recorded
+    # meanwhile. -Path is for Update-TaskState, which may write an archived one.
     if (-not $Path) { $Path = Get-TaskStatePath $State.id }
     $tmp = "$Path.tmp"
     $State | ConvertTo-Json -Depth 8 | Set-Content -Path $tmp -Encoding utf8
     Move-Item -Force $tmp $Path
 }
 
-function Write-TaskStateAny($State) {
-    # Write a record back where it lives. Write-TaskState alone would bring a
-    # returned task back to life in the active directory.
-    $path = Get-TaskStateFile $State.id
-    if (-not $path) { throw "No task state (active or archived) for '$($State.id)'." }
-    Write-TaskState $State $path
-}
+function Update-TaskState {
+    <#
+    .SYNOPSIS
+    Set a few fields on a task's record as it is on disk right now, under the
+    state lock, and return the record as written ($null when there is none).
 
-function Update-TaskState([string]$Id, [System.Collections.IDictionary]$Fields) {
-    # Set a few fields on an ACTIVE task's record as it is on disk right now,
-    # under the state lock. For a writer that read the record a while ago (the
-    # watcher, across a network call): writing its own stale copy back would
-    # undo whatever another script recorded in the meantime. False when the
-    # task is no longer active.
+    For every writer that read the record a while ago - across a network call,
+    a gate run, a push: writing its own stale copy back would undo whatever
+    another script (the watcher, usually) recorded in the meantime. Only the
+    named fields are touched.
+
+    The record must be active unless -IncludeArchived is given, in which case a
+    returned task's record is updated where it lies in the archive.
+    #>
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$Id,
+        [Parameter(Mandatory, Position = 1)][System.Collections.IDictionary]$Fields,
+        [switch]$IncludeArchived
+    )
+    # Named outside the block: the analyzer does not see a parameter that is
+    # only used inside a script block as used.
+    $taskId = $Id
+    $updates = $Fields
+    $anywhere = [bool]$IncludeArchived
     Invoke-WithStateLock {
-        $path = Get-TaskStatePath $Id
-        if (-not (Test-Path -LiteralPath $path)) { return $false }
+        $path = if ($anywhere) { Get-TaskStateFile $taskId } else { Get-TaskStatePath $taskId }
+        if (-not $path -or -not (Test-Path -LiteralPath $path)) { return $null }
         $state = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-        foreach ($name in @($Fields.Keys)) { Set-TaskField $state $name $Fields[$name] }
-        Write-TaskState $state
-        $true
+        foreach ($name in @($updates.Keys)) { Set-TaskField $state $name $updates[$name] }
+        Write-TaskState $state $path
+        $state
     }
 }
 
@@ -323,17 +337,28 @@ function Test-TaskPrWatched($State) {
 
 function Get-PrWatchTasks {
     # Tasks whose pull request the watcher polls. None when PR watching is
-    # switched off (prPollMinutes 0).
+    # switched off (prPollMinutes 0). A PR that was closed without merging is
+    # still in here, so that a watcher which is running anyway notices when it
+    # is reopened - but see Test-TaskPrPending for what keeps a watcher running.
     if ([double](Get-DeputyConfig).prPollMinutes -le 0) { return @() }
     @(Get-AllTasks | Where-Object { Test-TaskPrWatched $_ })
+}
+
+function Test-TaskPrPending($State) {
+    # Is this task's pull request something to wait for? Watched, and not seen
+    # closed without merging: a closed PR may never change again, so it must
+    # not keep a watcher, the stop hooks or a one-shot session waiting. The
+    # watcher clears prClosedAt when it sees the PR open again.
+    (Test-TaskPrWatched $State) -and -not (Get-EventField $State 'prClosedAt')
 }
 
 function Get-WatchLoad {
     # Everything a watcher has work for: members that are running, and pull
     # requests that are open. A watcher is needed while Total is above zero.
+    # A pull request that was closed without merging is not counted.
     $active = @(Get-ActiveTasks)
     $activeIds = @($active | ForEach-Object { $_.id })
-    $pulls = @(Get-PrWatchTasks | Where-Object { $activeIds -notcontains $_.id })
+    $pulls = @(Get-PrWatchTasks | Where-Object { (Test-TaskPrPending $_) -and $activeIds -notcontains $_.id })
     $parts = @()
     if ($active.Count -gt 0) { $parts += "$($active.Count) posse task(s) are active" }
     if ($pulls.Count -gt 0) { $parts += "$($pulls.Count) published pull request(s) are waiting to be merged" }
@@ -574,6 +599,9 @@ function Format-Wake {
     }
     if ($Wake.event -eq 'merged') {
         '  The work has landed. Tear the task down with: {0}' -f (Get-ReturnCommand $Wake.taskId)
+    }
+    if ($Wake.event -eq 'closed') {
+        "  The work has NOT landed. Tell the Sheriff, and do not return the worktree without the Sheriff's word."
     }
 }
 

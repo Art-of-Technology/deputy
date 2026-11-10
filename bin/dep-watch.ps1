@@ -3,7 +3,7 @@
 .SYNOPSIS
 Watch running posse tasks and the pull requests of published ones, and surface
 actionable wake events: completed, failed, interrupted, blocked,
-needs-decision, died, stalled, merged, degraded.
+needs-decision, died, stalled, merged, degraded, closed.
 
 A task is completed (or failed, interrupted, blocked, needs-decision) only when
 its final result event has arrived AND the member process has exited. A result
@@ -33,6 +33,11 @@ switches it off), over REST (`gh api`), so no read:org token scope is needed.
   head. A PR counts as green from the moment it is published - the gate passed
   on that commit - so the first failing check is news, and so is the first
   one after every new head.
+- `closed`, once: the PR was closed without merging. prClosedAt is recorded,
+  and from then on the PR no longer counts as something to wait for: it does
+  not keep this watcher, the stop hooks or a one-shot session waiting. It is
+  still read whenever a watcher is running for another reason, and when that
+  shows it open again prClosedAt is cleared and it counts as before.
 A PR that cannot be read (no network, gh not signed in, a 404) produces
 nothing at all: a failed lookup is never a merge, and never a wake.
 
@@ -314,7 +319,9 @@ function Get-PrObservation($Task) {
     | merged                                        | merged   | mergedAt, mergeSha       |
     | open, a check failing at a head not yet told  | degraded | prDegradedHead           |
     | open and nothing failing, or already told     | none     | prCheckedAt              |
-    | closed without merging                        | none     | prCheckedAt              |
+    | closed without merging, not yet told          | closed   | prClosedAt               |
+    | closed without merging, already told          | none     | prCheckedAt              |
+    | open again after it was seen closed           | none     | prClosedAt cleared       |
     #>
     $fields = [ordered]@{ prCheckedAt = (Get-Date -Format o) }
     $observation = [pscustomobject]@{ Fields = $fields; Event = ''; Summary = '' }
@@ -331,7 +338,19 @@ function Get-PrObservation($Task) {
             $(if ($pr.MergeSha) { " as $(Format-Sha $pr.MergeSha)" }) + '.'
         return $observation
     }
-    if ($pr.State -ne 'open' -or -not $pr.HeadSha) { return $observation }
+    $knownClosed = [bool](Get-EventField $Task 'prClosedAt')
+    if ($pr.State -ne 'open') {
+        # Closed without merging. Said once; the record is what remembers.
+        if (-not $knownClosed) {
+            $fields['prClosedAt'] = (Get-Date -Format o)
+            $observation.Event = 'closed'
+            $observation.Summary = "Pull request #$($ref.Number) was closed without merging."
+        }
+        return $observation
+    }
+    # Open. If it had been seen closed, it was reopened: wait for it again.
+    if ($knownClosed) { $fields['prClosedAt'] = $null }
+    if (-not $pr.HeadSha) { return $observation }
     if ($pr.HeadSha -eq [string](Get-EventField $Task 'prDegradedHead')) { return $observation }
 
     $checks = Get-PrChecks $ref $pr.HeadSha
@@ -359,20 +378,25 @@ function Invoke-PrScan {
         $observation = Get-PrObservation $task
 
         # The read took a moment, and other scripts write this record too
-        # (dep-pr.ps1 merge, dep-publish.ps1, dep-return.ps1). Look again before
-        # saying anything: a task that was returned, or whose merge is already
-        # recorded, needs no wake.
-        $current = try { Read-TaskState $task.id } catch { $null }
-        if (-not $current) { continue }
-        if ($observation.Event -eq 'merged' -and (Get-EventField $current 'mergedAt')) { continue }
+        # (dep-pr.ps1 merge, dep-publish.ps1, dep-return.ps1). So the second
+        # look, the wake and the write happen together under the state lock:
+        # a task that was returned, or whose merge or closing is already
+        # recorded, needs no wake, and nobody can record either in between.
+        $queued = Invoke-WithStateLock {
+            $current = try { Read-TaskState $task.id } catch { $null }
+            if (-not $current) { return }
+            if ($observation.Event -eq 'merged' -and (Get-EventField $current 'mergedAt')) { return }
+            if ($observation.Event -eq 'closed' -and (Get-EventField $current 'prClosedAt')) { return }
 
-        # Queue first, record second, as above: a watcher killed in between
-        # repeats the wake rather than losing it. Only the fields this poll
-        # owns are written, onto the record as it is on disk now.
-        if ($observation.Event) {
-            $events += Add-WakeEvent (New-Wake $current $observation.Event (Limit-Text $observation.Summary 500))
+            # Queue first, record second, as above: a watcher killed in between
+            # repeats the wake rather than losing it. Only the fields this poll
+            # owns are written, onto the record as it is on disk now.
+            if ($observation.Event) {
+                Add-WakeEvent (New-Wake $current $observation.Event (Limit-Text $observation.Summary 500))
+            }
+            $null = Update-TaskState $task.id $observation.Fields
         }
-        $null = Update-TaskState $task.id $observation.Fields
+        if ($queued) { $events += $queued }
     }
     $events
 }

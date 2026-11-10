@@ -72,10 +72,22 @@ if ($anchorWarning) {
     Set-TaskField $task 'anchorWarning' $anchorWarning
 }
 
+function Save-Verdict {
+    # Record the gate's verdict. Only the gate's own fields, under the state
+    # lock, onto the record as it is on disk now: a gate runs for minutes, and
+    # the watcher may have written to the record meanwhile (a task that already
+    # has a pull request is polled while it is re-validated).
+    $fields = [ordered]@{}
+    foreach ($name in 'validation', 'validationNote', 'validationError', 'anchorWarning', 'validatedHead', 'validationEvidence') {
+        if ($task.PSObject.Properties[$name]) { $fields[$name] = $task.$name }
+    }
+    if (-not (Update-TaskState $Id $fields)) { throw "Task $Id has no active record left to write the verdict to." }
+}
+
 function Deny-Validation([string]$Reason) {
     Set-TaskField $task 'validation' 'failed'
     Set-TaskField $task 'validationError' $Reason
-    Write-TaskState $task
+    Save-Verdict
     Write-Output "VALIDATION FAILED: $Reason"
     exit 1
 }
@@ -87,7 +99,7 @@ function Deny-Verification([string]$Reason) {
     Set-TaskField $task 'validationNote' $Reason
     # The commit this (non-)verdict is about; dep-publish.ps1 holds it to that.
     Set-TaskField $task 'validatedHead' ((git -C $wt rev-parse HEAD 2>$null | Out-String).Trim())
-    Write-TaskState $task
+    Save-Verdict
     Write-Output "VALIDATION UNVERIFIED: $Reason"
     Write-Output 'The gate ran nothing, so nothing about this branch is verified. This is NOT a pass.'
     Write-Output "Fix: pin this repo's gate commands in config\projects.json, then re-run dep-validate.ps1 $Id."
@@ -214,7 +226,7 @@ if ($allPassed) {
     # The commit the verdict is about: the evidence commit, on top of the commit
     # the gate ran against. dep-publish.ps1 refuses a branch that has moved on.
     Set-TaskField $task 'validatedHead' ((git -C $wt rev-parse HEAD | Out-String).Trim())
-    Write-TaskState $task
+    Save-Verdict
     Write-Output "VALIDATION PASSED: evidence committed at .deputy/evidence/$Id.md"
     exit 0
 }

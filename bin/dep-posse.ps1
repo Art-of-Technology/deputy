@@ -91,7 +91,9 @@ function Show-Status {
             Gate   = if ($_.PSObject.Properties['validation'] -and $_.validation) { $_.validation } else { '-' }
             # The session's running total, as of the last result the watcher read.
             Cost   = ($cost = Format-Cost (Get-EventField $_ 'totalCostUsd')) ? $cost : '-'
-            Pr     = if ($_.prUrl -and (Get-EventField $_ 'mergedAt')) { "$($_.prUrl) (merged)" } else { $_.prUrl }
+            Pr     = if ($_.prUrl -and (Get-EventField $_ 'mergedAt')) { "$($_.prUrl) (merged)" }
+                     elseif ($_.prUrl -and (Get-EventField $_ 'prClosedAt')) { "$($_.prUrl) (closed)" }
+                     else { $_.prUrl }
             Task   = Limit-Text $_.task 60
         }
     } | Format-Table -AutoSize

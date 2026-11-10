@@ -22,7 +22,7 @@ posse member ......   ship: implement + test + commit    scout: investigate
 dep-watch.ps1 ..... polls stream-json logs + process liveness, and the pull
    |                request of every published task; wakes the Deputy only
    |                on: completed / failed / interrupted / blocked /
-   |                needs-decision / died / stalled / merged / degraded.
+   |                needs-decision / died / stalled / merged / degraded / closed.
    |                Started by the session's Stop hook, and every wake is
    |                queued until acknowledged (dep-wake.ps1), so a restart
    |                or an API error loses nothing
@@ -112,7 +112,7 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | `dep-doctor.ps1` | Toolchain check: PowerShell 7+, `git` / `gh` / `claude` / `treehouse` on PATH, `gh auth status`, treehouse at least 3.0.1 with `get --lease`, and the Deputy clone on its default branch and not behind `origin`. One line per problem, each naming its fix; prints nothing when healthy. Exit 0 healthy, 1 on any problem. Report only - it never installs, updates or pulls |
 | `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>] [-Effort low\|medium\|high\|xhigh\|max] [-MaxBudgetUsd <n>]` | Lease a worktree, launch a headless posse member, register task state. The session gets an id Deputy chose (`--session-id`, kept as `sessionId` in task state) and the task id as its name, so it can be resumed. `-Effort` and `-MaxBudgetUsd` become `--effort` and `--max-budget-usd`; both default to the config and are left off when that is `null`. Refuses to lease when treehouse fails the doctor's version check |
 | `dep-send.ps1 <taskId> -Message <text>` | Send a follow-up to a member whose process has exited: starts `claude -p --resume <sessionId>` in the task's worktree with the message on stdin and the same flags as the first run, appends to the same log, sets the task back to `running` and records the follow-up in task state. Refuses while the member is alive, when the watcher has not reported the run's outcome yet, and when the worktree is gone (see "Resumable members") |
-| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n] [-PrPollSeconds n]` | Scan tasks for wake events, and poll the pull request of every published, unmerged task for `merged` and `degraded` (see "Guarded merge, guarded teardown, and PR watching"); `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as completed (or failed, interrupted, blocked, needs-decision) only when its final `result` event has arrived AND the member process has exited - a `result` seen while the process is alive is interim (the member may be waiting on background helpers) and wakes nobody. What the final result means is in "Resumable members". A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90). Every wake is appended to the durable queue with a sequence number before its task record is updated. One watcher at a time: it holds `state\watcher.lock` and touches `state\watcher.beat` on every poll, and a second one says so and exits 0 (see "Wakes that survive") |
+| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n] [-PrPollSeconds n]` | Scan tasks for wake events, and poll the pull request of every published, unmerged task for `merged`, `degraded` and `closed` (see "Guarded merge, guarded teardown, and PR watching"); `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as completed (or failed, interrupted, blocked, needs-decision) only when its final `result` event has arrived AND the member process has exited - a `result` seen while the process is alive is interim (the member may be waiting on background helpers) and wakes nobody. What the final result means is in "Resumable members". A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90). Every wake is appended to the durable queue with a sequence number before its task record is updated. One watcher at a time: it holds `state\watcher.lock` and touches `state\watcher.beat` on every poll, and a second one says so and exits 0 (see "Wakes that survive") |
 | `dep-wake.ps1 drain` | Print every unacknowledged wake, oldest first, with what its task looks like now. The last line is the exact `ack -Through <seq>` command for what was printed. Changes nothing |
 | `dep-wake.ps1 ack -Through <seq>` | Remove the wakes at or below `<seq>` from the queue, atomically and under the state lock. Refuses a sequence that was never handed out |
 | `dep-session-start.ps1 [-Hook]` | Session-start report: doctor lines, `dep-posse.ps1 status`, watcher health, the drained queue. Always exits 0. Run by the `SessionStart` hook |
@@ -246,16 +246,19 @@ Otherwise it prints `REFUSED`, with the reason, changes nothing and exits 1. `-D
 
 The remote branch is treated separately, because deleting it can destroy work the local proof just relied on: it is never deleted while the task's pull request is open - not with `-Discard` either - or while the PR cannot be read, and it is kept when it is the only place the commits exist (pushed, but not merged anywhere). It is deleted once the PR is merged or the commits are on another remote branch.
 
-**PR watching.** Once a task has a pull request, the watcher reads it every `prPollMinutes` (default 5) until it is merged or the task is returned, and raises two wakes through the same durable queue as all the others:
+**PR watching.** Once a task has a pull request, the watcher reads it every `prPollMinutes` (default 5) until it is merged or the task is returned, and raises three wakes through the same durable queue as all the others:
 
 | Wake | When | What the Deputy does |
 | --- | --- | --- |
 | `merged` | once, when the PR is seen merged. `mergedAt` and `mergeSha` are recorded. A merge `dep-pr.ps1 merge` made itself is already recorded and raises none | runs `dep-return.ps1` |
 | `degraded` | once per head commit, when a check is failing at the PR's head. A PR counts as green from the moment it is published, since the gate passed on that commit, so the first red check is news | tells you |
+| `closed` | once, when the PR is seen closed without merging. `prClosedAt` is recorded | tells you, and does not return the worktree without your word: the work has not landed |
 
-A lookup that fails - no network, gh not signed in, a 404, a 500 - raises nothing and records nothing but the time of the attempt: an unreadable PR is never read as merged. The poll writes only its own fields onto the task record as it is on disk, so it cannot undo what another command recorded while the read was in flight.
+A PR that was closed without merging stops counting as something to wait for: it may never change again, so it does not keep the watcher, the `Stop` hooks or a one-shot session waiting. It is still read whenever a watcher is running for another reason (and by `dep-publish.ps1`); when that shows it open again, `prClosedAt` is cleared and it counts as before.
 
-An open pull request counts as work for the watcher: the `Stop` hooks keep one running for it exactly as they do for a running member, and `dep-watch.ps1 -Wait` goes home only when no task is active and no published PR is waiting. In print mode (`claude -p`) that holds a one-shot Deputy until the PR is merged; set `"prPollMinutes": 0` to switch PR watching off for such runs.
+A lookup that fails - no network, gh not signed in, a 404, a 500 - raises nothing and records nothing but the time of the attempt: an unreadable PR is never read as merged. The poll writes only its own fields onto the task record as it is on disk, under the state lock, so it cannot undo what another command recorded while the read was in flight. The same holds the other way round: `dep-pr.ps1 merge`, `dep-publish.ps1`, `dep-validate.ps1` and `dep-return.ps1` all read the record, then spend seconds or minutes on the network or the gate, so they too write only the fields they own (`Update-TaskState` in `dep-lib.ps1`) and never their stale copy of the whole record.
+
+An open pull request counts as work for the watcher: the `Stop` hooks keep one running for it exactly as they do for a running member, and `dep-watch.ps1 -Wait` goes home only when no task is active and no published PR is waiting. In print mode (`claude -p`) that holds a one-shot Deputy until the PR is merged or closed; set `"prPollMinutes": 0` to switch PR watching off for such runs.
 
 ## What Deputy will kill
 
@@ -355,7 +358,7 @@ Two traps worth knowing:
 | `autoWatch` | `true` | Whether the `Stop` / `StopFailure` hook runs the watcher and rewakes the session (see "Wakes that survive") |
 | `effort` | `null` | Default `--effort` for posse members: `low`, `medium`, `high`, `xhigh` or `max` (`null` = leave the flag off). `dep-spawn.ps1 -Effort` overrides it |
 | `maxBudgetUsd` | `null` | Default `--max-budget-usd` for one run of a posse member (`null` = no cap). `dep-spawn.ps1 -MaxBudgetUsd` overrides it |
-| `prPollMinutes` | `5` | Minutes between the watcher's reads of one published task's pull request (`0` = no PR watching, no `merged` or `degraded` wakes) |
+| `prPollMinutes` | `5` | Minutes between the watcher's reads of one published task's pull request (`0` = no PR watching, no `merged`, `degraded` or `closed` wakes) |
 
 ## Layout
 

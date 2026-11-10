@@ -27,7 +27,10 @@ merge   merge it - but only after proving it is fit to merge. It refuses, and
         The merge names the head commit it expects, so GitHub refuses it if the
         head moves in between (the REST form of `--match-head-commit <sha>`).
         Afterwards the PR is read again, and `mergedAt` and `mergeSha` are
-        recorded in task state only when that read shows it merged.
+        recorded in task state only when that read shows it merged. Only those
+        two fields are written, under the state lock, onto the record as it is
+        on disk then: the reads and the merge take seconds, and the watcher
+        may have recorded something in the meantime.
         Exit 0 merged (or already merged), 1 refused or not proven.
 
 .EXAMPLE
@@ -85,6 +88,14 @@ function Get-ExpectedHead {
         if ($local) { return [pscustomobject]@{ Sha = $local; Source = "the HEAD of the task worktree (no head was recorded at publish)" } }
     }
     [pscustomobject]@{ Sha = ''; Source = '' }
+}
+
+function Save-Merge($PullRequest) {
+    # Record a proven merge. Never the whole record this script read at the
+    # start: that copy is seconds old by now. A returned task's record is
+    # updated where it lies in the archive.
+    $written = Update-TaskState $Id ([ordered]@{ mergedAt = $PullRequest.MergedAt; mergeSha = $PullRequest.MergeSha }) -IncludeArchived
+    if (-not $written) { throw "The merge of #$($PullRequest.Number) is proven, but task $Id has no record left to write it to." }
 }
 
 function Format-Check($Check) {
@@ -158,9 +169,7 @@ switch ($Action) {
 
         if ($pr.Merged) {
             # Nothing to merge, and the read is the proof.
-            Set-TaskField $task 'mergedAt' $pr.MergedAt
-            Set-TaskField $task 'mergeSha' $pr.MergeSha
-            Write-TaskStateAny $task
+            Save-Merge $pr
             Write-Output "#$($pr.Number) is already merged as $($pr.MergeSha). Recorded; nothing to do."
             exit 0
         }
@@ -227,9 +236,7 @@ switch ($Action) {
             $after = Get-PullRequest $ref
         }
         if ($after.Ok -and $after.Merged) {
-            Set-TaskField $task 'mergedAt' $after.MergedAt
-            Set-TaskField $task 'mergeSha' $after.MergeSha
-            Write-TaskStateAny $task
+            Save-Merge $after
             Write-Output "merged #$($pr.Number) ($Method) as $($after.MergeSha)"
             Write-Output "  head: $($pr.HeadSha)"
             Write-Output "Tear the task down with: $(Get-ReturnCommand $Id)"

@@ -10,6 +10,11 @@ A merge or a red check arrived and nothing happened until the Sheriff asked.
 The watcher now polls each published, unmerged task's PR and raises `merged`
 once, and `degraded` once per head commit - through the same durable queue as
 every other wake - and a lookup that fails raises nothing at all.
+
+A pull request closed without merging raises `closed` once and then stops
+counting as something to wait for. It used to be polled for ever, which held
+the watcher, the stop hooks and a one-shot Deputy indefinitely, and the Deputy
+was never told.
 #>
 
 BeforeAll {
@@ -201,12 +206,112 @@ Describe 'dep-watch.ps1 and a pull request whose checks fail' {
     }
 }
 
+Describe 'dep-watch.ps1 and a pull request closed without merging' {
+    BeforeAll {
+        function Invoke-StopGuard($Scenario) {
+            Invoke-DeputyHook -InstallRoot $Scenario.Install -Script 'dep-hook-guard.ps1' -Arguments @('-GraceSeconds', '0')
+        }
+
+        # Failing checks too: a closed PR is `closed`, never `degraded`.
+        $script:closed = New-PrWatchScenario -PullRequest (New-PullRequestJson -State closed -HeadSha $script:head) -Runs $script:red
+        $script:guardBefore = Invoke-StopGuard $script:closed
+        $script:closedRun = Invoke-Watch $script:closed
+        $script:closedWakes = Get-WakeQueue $script:closed
+    }
+
+    It 'counts as work for the watcher until it is seen closed' {
+        $script:guardBefore.ExitCode | Should -Be 2
+        $script:guardBefore.ErrorOutput | Should -Match '1 published pull request\(s\) are waiting to be merged'
+    }
+
+    It 'raises a closed wake through the queue, and says the work has not landed' {
+        $script:closedRun.ExitCode | Should -Be 0
+        $script:closedRun.Output | Should -Match "\[wake\] $($script:closed.Id): closed \(ship\) seq=1"
+        $script:closedRun.Output | Should -Match "The work has NOT landed\. Tell the Sheriff, and do not return the worktree without the Sheriff's word\."
+        $script:closedWakes.Count | Should -Be 1
+        $script:closedWakes[0].event | Should -Be 'closed'
+        $script:closedWakes[0].summary | Should -Be 'Pull request #7 was closed without merging.'
+        $script:closedWakes[0].prUrl | Should -Be $script:prUrl
+    }
+
+    It 'records prClosedAt, and does not read the closing as a merge' {
+        $state = Get-State $script:closed
+        $state.prClosedAt | Should -Not -BeNullOrEmpty
+        $state.PSObject.Properties['mergedAt'] | Should -BeNullOrEmpty
+        $state.PSObject.Properties['prDegradedHead'] | Should -BeNullOrEmpty
+        $state.status | Should -Be 'completed'
+    }
+
+    It 'lets the stop through once the pull request is closed' {
+        $run = Invoke-StopGuard $script:closed
+        $run.ExitCode | Should -Be 0
+        $run.Output.Trim() | Should -BeNullOrEmpty
+        $run.ErrorOutput.Trim() | Should -BeNullOrEmpty
+    }
+
+    It 'no longer keeps a waiting watcher or the session-start report waiting for it' {
+        $run = Invoke-Watch $script:closed @('-Wait')
+        $run.ExitCode | Should -Be 0
+        $run.Output | Should -Match 'no active posse tasks and no published pull request waiting to be merged'
+        $start = Invoke-DeputyScript -InstallRoot $script:closed.Install -Script 'dep-session-start.ps1'
+        $start.Output | Should -Match 'Watcher: not running \(no active tasks\)\.'
+    }
+
+    It 'raises the wake exactly once across several polls' {
+        foreach ($poll in 1..3) {
+            Set-PollDue $script:closed
+            $run = Invoke-Watch $script:closed
+            $run.Output | Should -Match 'no new events'
+            $run.Output | Should -Not -Match '\[wake\]'
+        }
+        (Get-WakeQueue $script:closed).Count | Should -Be 1
+        # It is still being read, which is how a reopening is noticed.
+        @(Get-GhCalls -Path $script:closed.Shim).Count | Should -BeGreaterThan 3
+    }
+
+    It 'watches a reopened pull request again' {
+        Set-PullRequest $script:closed (New-PullRequestJson -HeadSha $script:head) $script:green
+        Set-PollDue $script:closed
+        (Invoke-Watch $script:closed).Output | Should -Match 'no new events'
+        (Get-State $script:closed).prClosedAt | Should -BeNullOrEmpty
+        # It counts as work for the watcher again.
+        $guard = Invoke-StopGuard $script:closed
+        $guard.ExitCode | Should -Be 2
+        $guard.ErrorOutput | Should -Match '1 published pull request\(s\) are waiting to be merged'
+    }
+
+    It 'still raises degraded and merged for the reopened pull request, and closed again if it is closed again' {
+        Set-PullRequest $script:closed (New-PullRequestJson -HeadSha $script:head) $script:red
+        Set-PollDue $script:closed
+        (Invoke-Watch $script:closed).Output | Should -Match ': degraded \(ship\) seq=2'
+
+        Set-PullRequest $script:closed (New-PullRequestJson -State closed -HeadSha $script:head)
+        Set-PollDue $script:closed
+        (Invoke-Watch $script:closed).Output | Should -Match ': closed \(ship\) seq=3'
+
+        Set-PullRequest $script:closed (New-PullRequestJson -Merged -HeadSha $script:head)
+        Set-PollDue $script:closed
+        (Invoke-Watch $script:closed).Output | Should -Match ': merged \(ship\) seq=4'
+        (Get-WakeQueue $script:closed).Count | Should -Be 4
+    }
+
+    It 'does not hold a watcher that was waiting on it: -Wait wakes with closed and exits' {
+        $s = New-PrWatchScenario
+        $watcher = Start-TestWatcher -InstallRoot $s.Install -Arguments @('-IntervalSeconds', '1', '-PrPollSeconds', '1')
+        $script:watchers.Add($watcher.Process)
+        Set-PullRequest $s (New-PullRequestJson -State closed -HeadSha $script:head)
+        Wait-TestProcessExit -Process $watcher.Process -TimeoutSeconds 60 | Should -BeTrue
+        Get-Content $watcher.OutFile -Raw | Should -Match ': closed \(ship\)'
+        # And the next one has nothing to wait for.
+        (Invoke-Watch $s @('-Wait')).Output | Should -Match 'no active posse tasks and no published pull request'
+    }
+}
+
 Describe 'dep-watch.ps1 and a pull request with nothing to report' {
     It 'raises nothing for <Name>' -ForEach @(
         @{ Name = 'an open pull request whose checks are green'; Pr = @{}; Runs = @(@{ name = 'test'; conclusion = 'success' }) }
         @{ Name = 'an open pull request whose checks are still running'; Pr = @{}; Runs = @(@{ name = 'test'; status = 'in_progress' }) }
         @{ Name = 'an open pull request with no checks at all'; Pr = @{}; Runs = @() }
-        @{ Name = 'a pull request that was closed without merging'; Pr = @{ State = 'closed' }; Runs = @(@{ name = 'test'; conclusion = 'failure' }) }
     ) {
         $s = New-PrWatchScenario -PullRequest (New-PullRequestJson @Pr -HeadSha $script:head) -Runs $Runs
         $run = Invoke-Watch $s

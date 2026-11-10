@@ -377,6 +377,30 @@ Describe 'dep-pr.ps1 merge' {
         (Get-RecordedState $s).mergeSha | Should -Be ('d' * 40)
     }
 
+    It 'keeps what another process wrote to the record while the merge was in flight' {
+        # The regression: merge wrote back the whole record it had read at the
+        # start, so anything the watcher recorded during the reads and the
+        # merge call was silently undone. Here the "watcher" writes while
+        # GitHub answers the merge call - after the read, before the write.
+        $s = New-PrScenario
+        Add-MergeRoute $s
+        $s.Routes["PUT $script:api/pulls/7/merge"].patchFile = @{
+            path   = $s.StatePath
+            fields = @{ prDegradedHead = ('e' * 40); prCheckedAt = '2026-03-04T05:06:07Z'; status = 'running' }
+        }
+        Set-GhRoutes -Path $s.Shim -Routes $s.Routes
+        (Invoke-Pr $s 'merge').ExitCode | Should -Be 0
+        $state = Get-RecordedState $s
+        $state.mergeSha | Should -Be ('c' * 40)
+        $state.mergedAt | Should -Not -BeNullOrEmpty
+        $state.prDegradedHead | Should -Be ('e' * 40)
+        $state.prCheckedAt | Should -Not -BeNullOrEmpty
+        $state.status | Should -Be 'running'
+        # And nothing else of the record was dropped on the way.
+        $state.prHead | Should -Be $script:head
+        $state.branch | Should -Be 'deputy/task'
+    }
+
     It 'writes the record of a returned task back to the archive' {
         $s = New-PrScenario -Archived
         Add-MergeRoute $s
@@ -506,6 +530,31 @@ Describe 'dep-publish.ps1 and the pull request' {
             $run.ExitCode | Should -Be 0
             $run.Output | Should -Match 'nothing to push: PR #7 is already at'
         }
+    }
+
+    It 'keeps what another process wrote to the record while the publish was in flight' {
+        # Same hazard as the merge: the record is read, then comes a push and a
+        # GitHub call. The "watcher" writes while GitHub answers the PATCH.
+        $s = New-PublishScenario
+        (Invoke-Step $s 'dep-publish.ps1').ExitCode | Should -Be 0
+        $published = Get-Head $s
+        Add-FollowUpWork $s
+        (Invoke-Step $s 'dep-validate.ps1').ExitCode | Should -Be 0
+        Set-GhRoutes -Path $s.Shim -Routes @{
+            "GET $script:api/pulls/7"   = @{
+                body      = (New-PullRequestJson -HeadSha $published)
+                patchFile = @{
+                    path   = (Join-Path $s.Install 'state' "$($s.Id).json")
+                    fields = @{ prDegradedHead = ('e' * 40) }
+                }
+            }
+            "PATCH $script:api/pulls/7" = @{ body = (New-PullRequestJson -HeadSha $published) }
+        }
+        (Invoke-Step $s 'dep-publish.ps1').ExitCode | Should -Be 0
+        $state = Get-TestTaskState -InstallRoot $s.Install -Id $s.Id
+        $state.prHead | Should -Be (Get-Head $s)
+        $state.prDegradedHead | Should -Be ('e' * 40)
+        $state.validation | Should -Be 'passed'
     }
 
     It 'refuses a branch that moved after the gate judged it' {

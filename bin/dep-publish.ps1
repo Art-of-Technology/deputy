@@ -39,6 +39,13 @@ param(
 Initialize-Deputy
 $task = Read-TaskState $Id
 
+function Save-Publish([System.Collections.IDictionary]$Fields) {
+    # Record what this publish established. Only these fields, under the state
+    # lock, onto the record as it is on disk now: the push and the GitHub calls
+    # take seconds, and the watcher may have written to the record meanwhile.
+    if (-not (Update-TaskState $Id $Fields)) { throw "Task $Id has no active record left to write to." }
+}
+
 if ($task.kind -ne 'ship') { throw "dep-publish only applies to ship tasks; $Id is '$($task.kind)'." }
 if (-not (Test-Path $task.worktree)) { throw "Worktree gone: $($task.worktree)." }
 if (Get-EventField $task 'mergedAt') {
@@ -121,9 +128,7 @@ if ($task.prUrl) {
         throw "Pull request #$($ref.Number) is $($pr.State), not open. Nothing was pushed."
     }
     if ($pr.HeadSha -eq $head) {
-        Set-TaskField $task 'prNumber' $ref.Number
-        Set-TaskField $task 'prHead' $head
-        Write-TaskState $task
+        Save-Publish ([ordered]@{ prNumber = $ref.Number; prHead = $head; prClosedAt = $null })
         Write-Output "nothing to push: PR #$($ref.Number) is already at $head"
         Write-Output "  pr:     $($task.prUrl)"
         exit 0
@@ -134,12 +139,15 @@ if ($task.prUrl) {
         throw "git push failed for branch '$($task.branch)'. Nothing was recorded; PR #$($ref.Number) is still at $(Format-Sha $pr.HeadSha)."
     }
 
-    Set-TaskField $task 'prNumber' $ref.Number
-    Set-TaskField $task 'prHead' $head
-    # A fresh head: give its checks one poll interval before the watcher reads them.
-    Set-TaskField $task 'prCheckedAt' (Get-Date -Format o)
-    Set-TaskField $task 'publishedUnverified' ([bool]$unverified)
-    Write-TaskState $task
+    Save-Publish ([ordered]@{
+            prNumber            = $ref.Number
+            prHead              = $head
+            # A fresh head: give its checks one poll interval before the watcher reads them.
+            prCheckedAt         = (Get-Date -Format o)
+            # It was just read open, whatever an earlier poll saw.
+            prClosedAt          = $null
+            publishedUnverified = [bool]$unverified
+        })
 
     # The body carries the summary and the gate verdict, and both are about
     # the head that was just replaced.
@@ -174,21 +182,23 @@ try {
 }
 finally { Pop-Location }
 
+$published = [ordered]@{}
 if ($prOut -match 'https://github\.com/[^\s]+/pull/\d+') {
+    $published['prUrl'] = $Matches[0]
     Set-TaskField $task 'prUrl' $Matches[0]
     $ref = Get-TaskPrRef $task
-    if ($ref) { Set-TaskField $task 'prNumber' $ref.Number }
+    if ($ref) { $published['prNumber'] = $ref.Number }
     # The commit the PR was opened at. dep-pr.ps1 merge refuses a PR whose head
     # is anything else, until a later publish moves this on.
-    Set-TaskField $task 'prHead' $head
+    $published['prHead'] = $head
     # The watcher polls the PR from here on; its first look is one interval away.
-    Set-TaskField $task 'prCheckedAt' (Get-Date -Format o)
+    $published['prCheckedAt'] = (Get-Date -Format o)
 }
 else {
     Write-Output "WARNING: gh pr create succeeded but printed no pull request URL, so no PR is recorded for ${Id}: $(Limit-Text $prOut 200)"
 }
-if ($unverified) { Set-TaskField $task 'publishedUnverified' $true }
-Write-TaskState $task
+if ($unverified) { $published['publishedUnverified'] = $true }
+if ($published.Count -gt 0) { Save-Publish $published }
 
 Write-Output "published $Id"
 Write-Output "  branch: $($task.branch) -> $defaultBranch"

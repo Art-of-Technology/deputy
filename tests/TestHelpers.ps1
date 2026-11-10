@@ -391,7 +391,10 @@ function New-GhShim {
     - body:   the JSON body, or text: a raw body (a diff);
     - fail:   answer with no HTTP response at all (no network, not signed in);
     - then:   routes to put in place once this one was hit - how a merge call
-              turns the pull request into a merged one.
+              turns the pull request into a merged one;
+    - patchFile: @{ path; fields } - set these fields in that JSON file while
+              the request is being answered. That is another process writing
+              to a task record in the middle of the caller's work.
     A request with no route gets a 404. Like the real gh with --include, it
     prints the status line and headers before the body, for errors too, and
     exits 1 with `gh: <message> (HTTP <status>)` on stderr for a status of 400
@@ -464,6 +467,13 @@ elseif ($null -ne $route.body) { [Console]::Out.WriteLine(($route.body | Convert
 if ($route.then) {
     foreach ($key in @($route.then.Keys)) { $routes[$key] = $route.then[$key] }
     ($routes | ConvertTo-Json -Depth 30) | Set-Content -Path $routesFile -Encoding utf8
+}
+if ($route.patchFile) {
+    $document = Get-Content $route.patchFile.path -Raw | ConvertFrom-Json
+    foreach ($key in @($route.patchFile.fields.Keys)) {
+        $document | Add-Member -NotePropertyName $key -NotePropertyValue $route.patchFile.fields[$key] -Force
+    }
+    ($document | ConvertTo-Json -Depth 20) | Set-Content -Path $route.patchFile.path -Encoding utf8
 }
 if ($status -ge 400) {
     $message = if ($route.body -and $route.body.message) { $route.body.message } else { $reason }
