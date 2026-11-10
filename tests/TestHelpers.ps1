@@ -224,7 +224,9 @@ function New-MemberShims {
     directory and the DEPUTY_POSSE_TASK marker. The treehouse shim passes the
     doctor's checks, leases the worktree named in lease.json, lists no
     processes, accepts every `return` without touching the worktree, and logs
-    every invocation to treehouse-calls.log.
+    every invocation to treehouse-calls.log. With a file named
+    return-detaches in its directory, a `return` detaches the worktree's HEAD
+    first, as treehouse does when it resets a slot it takes back.
 
     When the leased path is a git worktree, the lease does what treehouse
     does to it: it cuts the slot from the base (--base, else the lease's own
@@ -259,8 +261,11 @@ function New-MemberShims {
         'if "%1"=="--version" (echo v3.1.8& exit /b 0)'
         'if "%1"=="get" if "%2"=="--help" goto help'
         'if "%1"=="get" goto lease'
-        'if "%1"=="return" exit /b 0'
+        'if "%1"=="return" goto return'
         'exit /b 1'
+        ':return'
+        'if exist "%~dp0return-detaches" git -C "%~2" switch -q --detach >nul 2>&1'
+        'exit /b 0'
         ':help'
         'echo       --base string     Branch to cut this worktree from'
         'echo   -b, --branch string   Create and check out a new Git branch at the acquired commit'

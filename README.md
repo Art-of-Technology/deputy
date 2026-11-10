@@ -110,17 +110,17 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | Command | What it does |
 | --- | --- |
 | `dep-doctor.ps1` | Toolchain check: PowerShell 7+, `git` / `gh` / `claude` / `treehouse` on PATH, `gh auth status`, treehouse at least 3.0.1 whose `get --help` lists `--lease`, `--branch` and `--base`, and the Deputy clone on its default branch and not behind `origin`. One line per problem, each naming its fix; prints nothing when healthy. Exit 0 healthy, 1 on any problem. Report only - it never installs, updates or pulls |
-| `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-BaseBranch <branch>] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>] [-Effort low\|medium\|high\|xhigh\|max] [-MaxBudgetUsd <n>]` | Lease a worktree, launch a headless posse member, register task state (see "The spawn contract"). A ship task's branch is `<branchPrefix><taskId>`, created by the lease (`treehouse get -b`); `-BaseBranch` cuts the worktree from that branch (`--base`) and is kept as `baseBranch`. The lease must be a worktree of its own, or nothing is launched and the lease is given back. The session gets an id Deputy chose (`--session-id`, kept as `sessionId` in task state) and the task id as its name, so it can be resumed. `-Effort` and `-MaxBudgetUsd` become `--effort` and `--max-budget-usd`; both default to the config and are left off when that is `null`. Refuses to lease when treehouse fails the doctor's check, and refuses a base branch or branch prefix git cannot use before leasing anything |
+| `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-BaseBranch <branch>] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>] [-Effort low\|medium\|high\|xhigh\|max] [-MaxBudgetUsd <n>]` | Lease a worktree, launch a headless posse member, register task state (see "The spawn contract"). A ship task's branch is `<branchPrefix><taskId>`, created by the lease (`treehouse get -b`); `-BaseBranch` cuts the worktree from that branch (`--base`) and is kept as `baseBranch`. The lease must be a worktree of its own, or nothing is launched and the lease is given back. The session gets an id Deputy chose (`--session-id`, kept as `sessionId` in task state) and the task id as its name, so it can be resumed. `-Model` and `-Effort` become `--model` and `--effort`; without them they come from the repo's project entry, else the per-kind default in the config, else they are left off (see "Choosing the model"), and the spawn prints the model it chose. `-MaxBudgetUsd` becomes `--max-budget-usd`, defaults to the config, and is left off when that is `null`. Refuses to lease when treehouse fails the doctor's check, and refuses a base branch or branch prefix git cannot use before leasing anything |
 | `dep-send.ps1 <taskId> -Message <text>` | Send a follow-up to a member whose process has exited: starts `claude -p --resume <sessionId>` in the task's worktree with the message on stdin and the same flags as the first run, appends to the same log, sets the task back to `running` and records the follow-up in task state. Refuses while the member is alive, when the watcher has not reported the run's outcome yet, and when the worktree is gone (see "Resumable members") |
 | `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n] [-PrPollSeconds n]` | Scan tasks for wake events, and poll the pull request of every published, unmerged task for `merged`, `degraded` and `closed` (see "Guarded merge, guarded teardown, and PR watching"); `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as completed (or failed, interrupted, blocked, needs-decision) only when its final `result` event has arrived AND the member process has exited - a `result` seen while the process is alive is interim (the member may be waiting on background helpers) and wakes nobody. What the final result means is in "Resumable members". A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90). Every wake is appended to the durable queue with a sequence number before its task record is updated. One watcher at a time: it holds `state\watcher.lock` and touches `state\watcher.beat` on every poll, and a second one says so and exits 0 (see "Wakes that survive") |
 | `dep-wake.ps1 drain` | Print every unacknowledged wake, oldest first, with what its task looks like now. The last line is the exact `ack -Through <seq>` command for what was printed. Changes nothing |
 | `dep-wake.ps1 ack -Through <seq>` | Remove the wakes at or below `<seq>` from the queue, atomically and under the state lock. Refuses a sequence that was never handed out |
 | `dep-session-start.ps1 [-Hook]` | Session-start report: doctor lines, `dep-posse.ps1 status`, watcher health, the drained queue. Always exits 0. Run by the `SessionStart` hook |
 | `dep-hook-guard.ps1`, `dep-hook-stop.ps1` | The `Stop` / `StopFailure` hooks. Not for running by hand (see "Wakes that survive") |
-| `dep-posse.ps1 status [-Watch]` | Posse table: status, liveness, age, gate, cost, PR; `-Watch` auto-refreshes with recent wakes |
+| `dep-posse.ps1 status [-Watch]` | Posse table: status, liveness, age, gate, cost, model (with the model the member reports, when that differs), PR; `-Watch` auto-refreshes with recent wakes |
 | `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw] [-Follow]` | Human-readable log tail (or raw stream-json), follow-ups shown as `[send]` lines; `-Follow` live-tails |
-| `dep-posse.ps1 result <taskId>` | Final report text, the status the member reported, follow-ups sent, cost, scout report path, PR URL |
-| `dep-posse.ps1 kill <taskId>` | Stop a runaway member's process tree (lease kept for inspection). Kills only processes proven to be the task's - see "What Deputy will kill" |
+| `dep-posse.ps1 result <taskId>` | Final report text, the status the member reported, follow-ups sent, cost with turns and active time over all runs, model and where it came from, scout report path, PR URL |
+| `dep-posse.ps1 kill <taskId>` | Stop a runaway member's process tree (lease kept for inspection), counting the usage of the run it stops. Kills only processes proven to be the task's - see "What Deputy will kill" |
 | `dep-validate.ps1 <taskId>` | Run the no-mistakes gate in the task's worktree, anchored on the task's base branch (the default branch when it has none); commits evidence on pass. Exit 0 passed, 1 failed, 2 unverified (no commands to run) |
 | `dep-publish.ps1 <taskId> [-AllowUnverified]` | Push the branch and open the PR against the task's base branch (which must be on `origin`; the default branch when it has none), recording its number and head commit (`prNumber`, `prHead`); refuses a failed or unverified gate, and a branch that moved after the gate judged it. On a task that already has a PR it pushes the branch's new validated commits to that PR, rewrites the PR description and moves `prHead` on. `-AllowUnverified` is the Sheriff's opt-in for repos with no gate, and labels the PR as never validated |
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <taskId> [-Method squash\|merge\|rebase] [-AllowNoChecks]` | PR operations over GitHub's REST API (`gh api`), so no `read:org` token scope is needed. `checks` exits 0 when nothing is failing or pending, 1 on a failing check, 8 when one is only pending. `merge` (squash by default) refuses a PR that is not fit to merge, listing every failing condition, and records the merge only when it is proven; branch cleanup happens in dep-return |
@@ -182,7 +182,7 @@ Several small weaknesses used to sit at the moment of dispatch, and each one sur
 
 A base branch resolves the way treehouse cuts from it: `origin/<base>` when it exists, else the local branch. It never falls back to the default branch: a base that can no longer be resolved is an `ANCHOR WARNING`, and the landed check refuses rather than measure the work against a branch it was not cut from. Without `-BaseBranch` the lease is cut from treehouse's default; if treehouse reports a different base than the repository's default branch (a pool configured with `base_branch` in `treehouse.toml`), that branch becomes the task's `baseBranch` the same way, and the spawn output says so.
 
-**An isolated lease, or none.** After leasing, `git -C <lease> rev-parse --show-toplevel` must resolve to the lease path itself and not to the repository's own checkout, and a ship task's worktree must be on its new branch. Otherwise no member is launched, the lease is given back with `treehouse return --if-lease-id` - guarded by its id and never forced, so treehouse leaves alone anything it does not manage or that has changes in it - and the new branch is deleted. The same happens when anything else fails between the lease and the launch.
+**An isolated lease, or none.** After leasing, `git -C <lease> rev-parse --show-toplevel` must resolve to the lease path itself and not to the repository's own checkout, and a ship task's worktree must be on its new branch. Otherwise no member is launched, the lease is given back with `treehouse return --if-lease-id` - guarded by its id and never forced, so treehouse leaves alone anything it does not manage or that has changes in it - and the new branch is deleted. The same happens when anything else fails between the lease and the launch. The deletion is checked, not assumed: when the branch is still there afterwards (the lease could not be returned, or the slot still has the branch checked out), the error ends with a line naming the branch, what git said, and the `git -C <repo> branch -D <branch>` that removes it once nothing has it checked out.
 
 **Not the Deputy.** `AGENTS.md` opens with a role exception, and every briefing carries the same sentence: *A posse member launched by Deputy into a worktree of this repository follows its briefing and is not the Deputy.* A member working on Deputy loads this repository's `AGENTS.md` as project instructions whatever the hooks do (they already do nothing for a member, see `Test-DeputyHome`), so the instructions themselves have to say it.
 
@@ -212,7 +212,7 @@ Hooks are not isolated: user-level and plugin hooks still run in members, so kee
 
 A member used to be one shot: it could not ask a question, be corrected, or be continued after an outage. The only answer to any of those was a respawn, which starts from nothing and pays a second time for a context that can cost several dollars to build. Three things change that.
 
-**A session Deputy can name.** `dep-spawn.ps1` generates a UUID per task, starts the member with `--session-id <uuid> -n <taskId>` and keeps the id as `sessionId` in task state. `dep-send.ps1 <taskId> -Message <text>` then starts `claude -p --resume <sessionId>` in the same worktree, with the message on stdin and the same flags as the first run - permissions, isolation, model, effort, budget and report schema belong to the process, not to the stored session, so a resumed run is given them again. The member carries on with everything it knew. It can be sent to any task whose process has exited and whose worktree is still leased, whatever its status; `dep-return.ps1` ends that.
+**A session Deputy can name.** `dep-spawn.ps1` generates a UUID per task, starts the member with `--session-id <uuid> -n <taskId>` and keeps the id as `sessionId` in task state. `dep-send.ps1 <taskId> -Message <text>` then starts `claude -p --resume <sessionId>` in the same worktree, with the message on stdin and the same flags as the first run - permissions, isolation, model, effort, budget and report schema belong to the process, not to the stored session, so a resumed run is given them again. The model and effort are the ones recorded at spawn, never resolved again from the config, so a follow-up cannot move a task to another model halfway (see "Choosing the model"). The member carries on with everything it knew. It can be sent to any task whose process has exited and whose worktree is still leased, whatever its status; `dep-return.ps1` ends that.
 
 **A structured final report.** Every member runs with `--json-schema`, so its last message is an object, not prose to be guessed at:
 
@@ -242,7 +242,14 @@ The watcher reads `structured_output` from the final `result` event and keeps it
 
 **A follow-up reopens the gate.** The member is about to change the branch, so `dep-send.ps1` clears `validation` and its notes; `dep-validate.ps1` has to judge the branch again. That works after publishing too: `dep-publish.ps1` on a task that already has a PR pushes the new validated commits to that same PR (a plain push, never a force), rewrites the PR description with the new summary and verdict, and moves the recorded `prHead` to the new commit. It refuses when the PR is no longer open or cannot be read, and does nothing when the PR is already at the branch's head.
 
-**Cost.** The watcher keeps `total_cost_usd`, `num_turns` and `duration_ms` from each final result as `totalCostUsd`, `numTurns` and `durationMs`, and `dep-posse.ps1 status` shows the cost per task. `--max-budget-usd` caps one run: a member that reaches it ends as `failed` with `Reached maximum budget`, and a resumed run gets the cap afresh.
+**Cost.** When a run ends, the watcher adds its usage to the task as `totalCostUsd`, `numTurns` and `durationMs`; `dep-posse.ps1 status` shows the cost per task, and `dep-posse.ps1 result` the whole line, for example `Cost: $18.11, 212 turn(s), 41m 07s active over 2 run(s)`.
+
+- One run can end several segments with a `result` event each. Claude Code measures `num_turns` and `duration_ms` per input message - the briefing, a follow-up, and every background helper that reports back starts a new one - so each result covers only its own segment. The watcher adds up every result of the run, not only the last. (It used to keep only the last one, which is how a member that worked for some forty minutes was shown as 5 turns and 26 seconds.)
+- `total_cost_usd` is a running total for the whole session, earlier runs included, so the latest (highest) figure replaces the stored one and never lowers it.
+- `durationMs` is active time: the time the member spent on its segments. Time spent idle between them, waiting for a background helper, is not in it, so it can be well below the task's age.
+- A run that dies, or is stopped with `dep-posse.ps1 kill`, counts too: whatever results it wrote before it ended are added when it ends.
+
+`--max-budget-usd` caps one run: a member that reaches it ends as `failed` with `Reached maximum budget`, and a resumed run gets the cap afresh.
 
 **What was verified on a real Claude Code** (2.1.322, Windows 11), by hand, in a throwaway git repository with a linked worktree under the temp directory and no remote:
 
@@ -255,7 +262,9 @@ The watcher reads `structured_output` from the final `result` event and keeps it
 | Resuming a session whose first run ended on an API error, with "Continue where you left off." | works: the session resumes under the same id. The first run had been cut off before any model output, so there was nothing to continue from but the prompt |
 | The shape of a transient API failure (a local endpoint answering 529 to every request) | ten retries over about three minutes, then exit 1 and a `result` with `subtype: success`, `is_error: true`, `api_error_status: 529` and the text `API Error: 529 Overloaded...` |
 | The shape of an exhausted budget | exit 1 and a `result` with `subtype: error_max_budget_usd`, `is_error: true`, `result: null` and `errors: ["Reached maximum budget ($...)"]` |
-| What `total_cost_usd` counts after a resume | the whole session: a resumed run reported the running total, not its own cost. `num_turns` and `duration_ms` were per run. So Deputy keeps the latest cost and adds up the other two |
+| What `total_cost_usd` counts after a resume | the whole session: a resumed run reported the running total, not its own cost. So Deputy keeps the latest cost |
+| What `num_turns` and `duration_ms` count | read from the 2.1.322 source rather than observed: both are reset for every input message the session takes in (the turn counter and the start time are set at the top of the loop over input messages, and `duration_ms` is the time since then). A run with background helpers takes in one message per helper that reports back, and ends each with a `result`. So Deputy adds up every result of every run |
+| What the `init` event reports as `model` for an alias | the full model id: `--model haiku` reported `claude-haiku-5-5`, and so did the result's `modelUsage`. So an alias shows up as a `MODEL MISMATCH`; the tracked config uses full ids |
 | What `--max-budget-usd` counts after a resume | the run: a resume with a cap below what the session had already cost still ran to the end |
 | `--resume` with a session id that does not exist | exit 1, `No conversation found with session ID` on stderr, and an `error_during_execution` result: the task ends as `failed` |
 | The real scripts end to end against the real CLI (a throwaway Deputy home; `treehouse` replaced by a shim that leased a linked worktree of the throwaway repo): `dep-spawn.ps1`, a `needs-decision` wake carrying the member's question, `dep-send.ps1` with the decision, a `completed` wake | works: both runs carried the session id from task state, the resumed run appended to the same log after the `[send]` marker, committed the file it had created in the first run, and quoted a codeword from the briefing |
@@ -358,6 +367,8 @@ The projects config overrides detection per repo - pin exact commands, or opt a 
 
 `match` is a repo folder name, or a full path if it contains a slash (compared as a path, whatever its separators). An empty `validate` list means auto-detect. `delivery` must be `no-mistakes` or `direct-pr`; anything else is refused rather than guessed at. An entry may name only the keys it changes: the rest come from the `default` block. The local file's entries are matched first, and its `default` keys win over the tracked ones.
 
+An entry (or the `default` block) may also name a `model` and an `effort` for the members working in that repo, over the per-kind default (see "Choosing the model"): `{ "match": "myapp", "model": "claude-sonnet-5-5", "effort": "high" }`. `null`, or no key, leaves the choice to the per-kind default.
+
 The security property of no-mistakes: the agent that wrote the code never holds the pen on validation or publishing. Members need no `gh` or push access at all, and a branch cannot rubber-stamp its own gate.
 
 **Whose text the PR title is.** `dep-publish.ps1` derives the title from the branch's one member commit subject when there is exactly one of them (Deputy's own evidence commit never counts), and from the Sheriff's briefing otherwise. That is a trust boundary worth naming rather than leaving implicit: on a single-commit branch, the title of a pull request on your organisation's repository is text a headless posse member wrote, where it used to be the Sheriff's own words. What that text can do is deliberately bounded to being a headline:
@@ -399,32 +410,54 @@ Two traps worth knowing:
 - The target repo's own `.claude/settings.json` allowlist does **not** apply (observed above): leased worktrees are directories nobody trusted interactively. Grants must come from the spawner (`-AllowedTools`) or your user-level settings. Not checked: a worktree of a repository whose main checkout you have trusted.
 - `bypassPermissions` means members run shell commands unattended in their worktree. Point Deputy only at repos you trust, on a machine you trust.
 
+## Choosing the model
+
+Every member runs on a model somebody chose. It used to be otherwise: the config's `model` defaulted to `null`, so every member ran on whatever the account default was at the moment it was spawned, and one person switching models in their own interactive session silently changed what the whole posse ran on.
+
+`dep-spawn.ps1` now resolves the model and the effort once per task, in `Resolve-MemberSettings` (`bin\dep-lib.ps1`), first match wins:
+
+1. `-Model` / `-Effort` on the spawn;
+2. the repo's project profile: `model` / `effort` of its matched entry, else of the projects `default` block (local over tracked, as for every project key);
+3. the per-kind default: `models.<kind>` / `effort.<kind>` in the Deputy config (`config\deputy.local.json` over `config\deputy.json`);
+4. nothing: the flag is left off, and the member runs on the account default.
+
+The tracked `config\deputy.json` pins both kinds, so step 4 is only reached when someone unpins them. Ship work runs on Opus (`claude-opus-5-5`), the Sheriff's decision. Scouts are pinned to the same model so they do not follow the account default either; that one is a default the Deputy's maintainers chose, and yours to change in your local file.
+
+- **Recorded.** The resolved `model` and `effort` go into task state with where they came from (`modelSource`, `effortSource`, for example `config\deputy.json models.ship` or `-Model`), and the spawn prints them (`model:    claude-opus-5-5 (config\deputy.json models.ship)`), so the Deputy can say which model it chose.
+- **Kept for the whole task.** `dep-send.ps1` starts a resumed run with the recorded model and effort, never re-resolved ones: changing the config, or the account default, does not move a running task to another model.
+- **Checked.** Deputy keeps no list of model ids - they change with every release - so any non-empty name is accepted (one starting with `-` is refused, as a command line would read it as an option). What catches a typo is the member itself: the model its `init` event reports is kept as `reportedModel`. When it is not the model the task was started with, `dep-posse.ps1 status` shows `<model> (reports <other>)`, `dep-posse.ps1 result` says `MISMATCH`, and the member's wakes carry a `MODEL MISMATCH` line. An alias such as `opus` is reported as the full model id it stands for, so it shows up here too. A bracketed variant suffix (`[1m]`) and letter case are not counted as a difference.
+- **Effort** is validated as before: `low`, `medium`, `high`, `xhigh` or `max`, refused otherwise with the file and key named.
+
+Choosing a model at intake is the Deputy's call within the rule in `AGENTS.md` ("Choosing a model"): the configured defaults, stepping down a tier only for mechanical work, and never below the Sheriff's choice for ship work without the Sheriff's word.
+
 ## Configuration
 
 Configuration comes in two layers. The tracked files, `config\deputy.json` and `config\projects.json`, are the defaults every clone shares; they change only through pull requests, like any other file. Your own settings go in `config\deputy.local.json` and `config\projects.local.json`, which are gitignored, so personal pins - a model, a budget, the gate of a repository only you work on - never make your clone drift from `main`. Neither local file exists until you create it, and nothing is moved into them for you.
 
-- **Deputy settings** are merged key by key: the built-in defaults, then `config\deputy.json`, then `config\deputy.local.json`. A key the local file does not name keeps its tracked value, and `null` in either file means the built-in default, so a local `null` undoes a tracked value.
+- **Deputy settings** are merged key by key: the built-in defaults, then `config\deputy.json`, then `config\deputy.local.json`. A key the local file does not name keeps its tracked value, and `null` in either file means the built-in default, so a local `null` undoes a tracked value. `models` and `effort` hold one value per kind of task and are merged one level deeper, kind by kind: a local `{ "models": { "scout": "..." } }` changes the scout model and keeps the tracked ship model.
 - **Project profiles** (see "Delivery modes"): the `default` blocks are merged key by key, local over tracked, and the local file's `projects` entries are matched before the tracked ones. The tracked `deputy` entry stays in `config\projects.json`: it is how Deputy gates its own pull requests, for everyone.
 
-A local file that is not valid JSON, or a project entry with an unknown `delivery` or a `validate` that is not a list, is an error that names the file, never a silent fall back to the defaults.
+A local file that is not valid JSON, a project entry with an unknown `delivery`, a `validate` that is not a list or an unknown `effort`, or a `models` / `effort` entry for a kind that does not exist, is an error that names the file, never a silent fall back to the defaults.
 
-For example, a `config\deputy.local.json` that names only the keys it changes:
+For example, a `config\deputy.local.json` that pins your own scout model and a budget, and names nothing else:
 
 ```json
-{ "model": "opus", "maxBudgetUsd": 10 }
+{ "models": { "scout": "claude-sonnet-5-5" }, "maxBudgetUsd": 10 }
 ```
+
+**The old flat keys.** Before per-kind defaults, `model` and `effort` were single values. They are still read for one release: a file's flat `"model": "x"` counts as `models.<kind>` for every kind the same file does not set per kind, and likewise for a flat `"effort": "high"`. `dep-spawn.ps1` prints a warning naming the file while one is in use. A flat key set to `null` carries no choice and is ignored. Move them to the per-kind shape.
 
 The keys:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `model` | `null` | Model for posse members (`null` = account default) |
+| `models` | `{ "ship": null, "scout": null }` built in; the tracked file pins both to `claude-opus-5-5` | Model per kind of task (`null` = account default). A project entry's `model` and `dep-spawn.ps1 -Model` override it (see "Choosing the model") |
 | `permissionMode` | `bypassPermissions` | Default permission mode for headless members (see Permissions above) |
 | `watchIntervalSeconds` | `15` | Watcher poll interval |
 | `stallMinutes` | `10` | Minutes without log activity before a stalled wake |
 | `branchPrefix` | `deputy/` | Prefix of a ship task's branch, which is `<branchPrefix><taskId>`. A prefix git cannot use in a branch name is refused at spawn |
 | `autoWatch` | `true` | Whether the `Stop` / `StopFailure` hook runs the watcher and rewakes the session (see "Wakes that survive") |
-| `effort` | `null` | Default `--effort` for posse members: `low`, `medium`, `high`, `xhigh` or `max` (`null` = leave the flag off). `dep-spawn.ps1 -Effort` overrides it |
+| `effort` | `{ "ship": null, "scout": null }` | `--effort` per kind of task: `low`, `medium`, `high`, `xhigh` or `max` (`null` = leave the flag off). A project entry's `effort` and `dep-spawn.ps1 -Effort` override it |
 | `maxBudgetUsd` | `null` | Default `--max-budget-usd` for one run of a posse member (`null` = no cap). `dep-spawn.ps1 -MaxBudgetUsd` overrides it |
 | `prPollMinutes` | `5` | Minutes between the watcher's reads of one published task's pull request (`0` = no PR watching, no `merged`, `degraded` or `closed` wakes) |
 | `memberIsolation` | `true` | Launch members with `--strict-mcp-config --disable-slash-commands`: no MCP servers, skills or slash commands from your setup (see "Member environment"). Recorded per task, so a resumed run matches its first run |

@@ -39,9 +39,10 @@ BeforeAll {
         A throwaway repository with a 'release' branch one commit ahead of
         main, a linked worktree of it standing in for the leased pool slot, a
         throwaway install, and the shims first on PATH. -LeasePath leases that
-        directory instead of the worktree.
+        directory instead of the worktree; -LeaseRepo leases the repository's
+        own checkout, -LeaseSubdir a directory inside the worktree.
         #>
-        param([string]$LeasePath, [string]$LeaseBase)
+        param([string]$LeasePath, [string]$LeaseBase, [switch]$LeaseRepo, [switch]$LeaseSubdir)
         $script:n++
         $dir = Join-Path $script:root "case$($script:n)"
         $repo = New-TestRepo -Path (Join-Path $dir 'repo')
@@ -53,7 +54,11 @@ BeforeAll {
         $slot = Join-Path $dir 'pool-slot'
         Invoke-Git @('-C', $repo, 'worktree', 'add', '-q', '--detach', $slot, 'main')
         $slot = (Resolve-Path $slot).Path
-        $lease = if ($LeasePath) { $LeasePath } else { $slot }
+        $lease = if ($LeasePath) { $LeasePath } elseif ($LeaseRepo) { $repo } else { $slot }
+        if ($LeaseSubdir) {
+            $lease = Join-Path $slot 'subdir'
+            New-Item -ItemType Directory -Force $lease | Out-Null
+        }
         $install = New-DeputyInstall -Path (Join-Path $dir 'deputy') -SourceRoot $script:sourceRoot
         $shims = New-MemberShims -Path (Join-Path $dir 'shims') -LeasePath $lease -LeaseBase $LeaseBase
         [pscustomobject]@{ Dir = $dir; Repo = $repo; Slot = $slot; Lease = $lease; Install = $install; Shims = $shims; Calls = 0 }
@@ -75,7 +80,11 @@ BeforeAll {
             $state = Get-TestTaskState -InstallRoot $Scenario.Install -Id $id
             Wait-TestProcessGone -ProcessId $state.pid | Should -BeTrue
         }
-        [pscustomobject]@{ Run = $run; Id = $id; Call = $call; State = $state }
+        # Flat: the output on one line, for a long refusal. PowerShell's error
+        # view wraps a thrown message at the console width, in lines that
+        # start with a '|' gutter, so a phrase can be split anywhere.
+        $flat = ($run.Output -replace '\r?\n\s*\|', ' ') -replace '\s+', ' '
+        [pscustomobject]@{ Run = $run; Id = $id; Call = $call; State = $state; Flat = $flat }
     }
 
     # The treehouse shim's lease and return invocations, one line each (wrap
@@ -437,6 +446,131 @@ Describe 'dep-spawn.ps1' {
             (Get-MemberShimCalls -Path $script:bad.Shims).Count | Should -Be 0
             @(Get-ChildItem (Join-Path $script:bad.Install 'state') -Filter 'posse-*.json' -ErrorAction SilentlyContinue) |
                 Should -HaveCount 0
+        }
+
+        It 'says nothing about a branch the lease never created' {
+            $script:badSpawn.Run.Output | Should -Not -Match 'task branch'
+        }
+    }
+
+    Context 'the branch of a lease it gives back' {
+        It 'deletes the branch, and says nothing about it, when the return frees it' {
+            # Refused: the lease is a directory inside the worktree. The return
+            # resets the slot, as treehouse does, so the branch can go.
+            $s = New-SpawnScenario -LeaseSubdir
+            Set-Content -Path (Join-Path $s.Shims 'return-detaches') -Value '' -Encoding ascii
+            $spawn = Invoke-Spawn $s @('-Task', 'Never starts')
+            $spawn.Run.ExitCode | Should -Not -Be 0
+            $spawn.Flat | Should -Match 'not to the lease itself'
+            $spawn.Flat | Should -Match 'The lease was returned'
+            @(Get-LeaseCalls $s)[0] | Should -Match ' -b deputy/posse-'
+            (git -C $s.Repo branch --list 'deputy/*' | Out-String).Trim() | Should -BeNullOrEmpty
+            $spawn.Flat | Should -Not -Match 'task branch'
+        }
+
+        It 'says when the branch is still there, names it, and gives the command that removes it' {
+            # Octopus's review of #38: the cleanup used to fail without a word.
+            # Here the lease is the repository's own checkout, which the lease
+            # put on the new branch: refused and given back, and git cannot
+            # delete a branch that is checked out.
+            $s = New-SpawnScenario -LeaseRepo
+            $spawn = Invoke-Spawn $s @('-Task', 'Never starts')
+            $spawn.Run.ExitCode | Should -Not -Be 0
+            $spawn.Flat | Should -Match 'own checkout'
+            $branch = (git -C $s.Repo branch --list 'deputy/*' --format '%(refname:short)' | Out-String).Trim()
+            $branch | Should -Match '^deputy/posse-\d{8}-\d{6}-[a-z]{3}$'
+            $spawn.Flat | Should -Match ([regex]::Escape("The task branch $branch was NOT deleted (git said: "))
+            $spawn.Flat | Should -Match ([regex]::Escape("git -C ""$($s.Repo)"" branch -D $branch"))
+        }
+    }
+
+    Context 'the model and effort it starts a member with' {
+        BeforeAll {
+            $script:pick = New-SpawnScenario
+            $script:pickConfig = Join-Path $script:pick.Install 'config'
+            $script:pickModels = '{ "models": { "ship": "config-ship-model", "scout": "config-scout-model" }, "effort": { "ship": "medium" } }'
+
+            function Invoke-PickSpawn([string[]]$Extra = @()) {
+                # Every spawn leases the same slot: take it off the last
+                # task's branch first.
+                Invoke-Git @('-C', $script:pick.Slot, 'switch', '-q', '--detach')
+                Invoke-Spawn $script:pick (@('-Task', 'Pick a model') + $Extra)
+            }
+
+            function Get-Flag($Spawn, [string]$Flag) {
+                $arguments = @($Spawn.Call.args)
+                $index = [array]::IndexOf($arguments, $Flag)
+                if ($index -lt 0) { return $null }
+                $arguments[$index + 1]
+            }
+        }
+
+        BeforeEach {
+            foreach ($name in 'deputy.json', 'deputy.local.json', 'projects.local.json') {
+                Remove-Item (Join-Path $script:pickConfig $name) -ErrorAction SilentlyContinue
+            }
+        }
+
+        It 'takes the per-kind default from the config, records where it came from, and says so' {
+            Set-Content -Path (Join-Path $script:pickConfig 'deputy.json') -Value $script:pickModels -Encoding utf8
+            $spawn = Invoke-PickSpawn
+            $spawn.Run.ExitCode | Should -Be 0 -Because $spawn.Run.Output
+            Get-Flag $spawn '--model' | Should -Be 'config-ship-model'
+            Get-Flag $spawn '--effort' | Should -Be 'medium'
+            $spawn.State.model | Should -Be 'config-ship-model'
+            $spawn.State.modelSource | Should -Be 'config\deputy.json models.ship'
+            $spawn.State.effort | Should -Be 'medium'
+            $spawn.State.effortSource | Should -Be 'config\deputy.json effort.ship'
+            $spawn.State.PSObject.Properties.Name | Should -Contain 'reportedModel'
+            $spawn.Run.Output | Should -Match ([regex]::Escape('model:    config-ship-model (config\deputy.json models.ship)'))
+            $spawn.Run.Output | Should -Match ([regex]::Escape('effort:   medium (config\deputy.json effort.ship)'))
+
+            $scout = Invoke-PickSpawn @('-Kind', 'scout')
+            Get-Flag $scout '--model' | Should -Be 'config-scout-model'
+            @($scout.Call.args) | Should -Not -Contain '--effort'
+        }
+
+        It 'lets the repo''s project entry win over the per-kind default, and -Model / -Effort over both' {
+            Set-Content -Path (Join-Path $script:pickConfig 'deputy.json') -Value $script:pickModels -Encoding utf8
+            Set-Content -Path (Join-Path $script:pickConfig 'projects.local.json') -Encoding utf8 `
+                -Value '{ "projects": [ { "match": "repo", "model": "project-model" } ] }'
+            $fromProject = Invoke-PickSpawn
+            Get-Flag $fromProject '--model' | Should -Be 'project-model'
+            $fromProject.State.modelSource | Should -Be "config\projects.local.json (match 'repo')"
+            # The entry names no effort: the per-kind default stays.
+            Get-Flag $fromProject '--effort' | Should -Be 'medium'
+
+            $fromFlags = Invoke-PickSpawn @('-Model', 'flag-model', '-Effort', 'max')
+            Get-Flag $fromFlags '--model' | Should -Be 'flag-model'
+            Get-Flag $fromFlags '--effort' | Should -Be 'max'
+            $fromFlags.State.modelSource | Should -Be '-Model'
+        }
+
+        It 'leaves --model off when nothing names a model, and says the member runs on the account default' {
+            $spawn = Invoke-PickSpawn
+            $spawn.Run.ExitCode | Should -Be 0 -Because $spawn.Run.Output
+            @($spawn.Call.args) | Should -Not -Contain '--model'
+            $spawn.State.model | Should -BeNullOrEmpty
+            $spawn.State.modelSource | Should -Be 'account default'
+            $spawn.Run.Output | Should -Match 'model:    account default \(no -Model, no project model and no models\.ship in the config\)'
+        }
+
+        It 'still reads the old flat model key, and warns about it' {
+            Set-Content -Path (Join-Path $script:pickConfig 'deputy.json') -Value $script:pickModels -Encoding utf8
+            Set-Content -Path (Join-Path $script:pickConfig 'deputy.local.json') -Value '{ "model": "legacy-model" }' -Encoding utf8
+            $spawn = Invoke-PickSpawn
+            $spawn.Run.ExitCode | Should -Be 0 -Because $spawn.Run.Output
+            Get-Flag $spawn '--model' | Should -Be 'legacy-model'
+            $spawn.State.modelSource | Should -Be 'config\deputy.local.json model (old flat key)'
+            $spawn.Run.Output | Should -Match ([regex]::Escape('WARNING: config\deputy.local.json "model" still uses the old flat'))
+        }
+
+        It 'refuses a model name a command line would read as an option, before leasing anything' {
+            $leases = @(Get-LeaseCalls $script:pick).Count
+            $spawn = Invoke-Spawn $script:pick @('-Task', 'Never starts', '-Model', '--dangerously-skip-permissions')
+            $spawn.Run.ExitCode | Should -Not -Be 0
+            $spawn.Flat | Should -Match 'not a model name'
+            @(Get-LeaseCalls $script:pick).Count | Should -Be $leases
         }
     }
 }

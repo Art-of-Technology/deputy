@@ -42,10 +42,16 @@ BeforeAll {
         param(
             [Parameter(Mandatory)][ValidateSet('init', 'assistant', 'user', 'result')][string]$Type,
             [string]$Text = '',
-            [switch]$IsError
+            [switch]$IsError,
+            # init: the model the member says it runs on.
+            [string]$Model
         )
         $streamEvent = switch ($Type) {
-            'init' { [ordered]@{ type = 'system'; subtype = 'init'; session_id = 'test' } }
+            'init' {
+                $init = [ordered]@{ type = 'system'; subtype = 'init'; session_id = 'test' }
+                if ($Model) { $init.model = $Model }
+                $init
+            }
             'assistant' {
                 [ordered]@{
                     type    = 'assistant'
@@ -614,17 +620,74 @@ Describe 'dep-watch.ps1 recording what a run cost' {
         $watched.State.PSObject.Properties['totalCostUsd'] | Should -BeNullOrEmpty
     }
 
-    It 'shows the cost in dep-posse.ps1 status and result' {
+    It 'adds up every result of a run, not only the last one' {
+        # A member that worked for 38 minutes, started background helpers,
+        # and ended a short last segment when the last helper reported back.
+        # Claude Code counts num_turns and duration_ms per input message, so
+        # the final result covers only that segment: the watcher used to show
+        # this run as 5 turns and 26s.
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            (New-StreamEvent assistant 'Starting helper agents in the background.'),
+            (New-ResultEvent @{ result = 'Waiting for the helpers.'; total_cost_usd = 12.5; num_turns = 40; duration_ms = 2280000 }),
+            (New-StreamEvent user 'helper agent finished'),
+            (New-StreamEvent assistant 'Writing the report.'),
+            (New-ResultEvent @{ result = 'Done.'; total_cost_usd = 18.11; num_turns = 5; duration_ms = 26000 })
+        )
+        $watched.Wake.event | Should -Be 'completed'
+        $watched.State.numTurns | Should -Be 45
+        $watched.State.durationMs | Should -Be 2306000
+        # The cost is a running total already: the latest, not a sum.
+        $watched.State.totalCostUsd | Should -Be 18.11
+    }
+
+    It 'counts what a run that died had done before it died' {
+        $watched = Invoke-FinishedWatch -Arguments @('-DeadSeconds', '0') -Lines @(
+            (New-StreamEvent init),
+            (New-ResultEvent @{ result = 'Waiting for the helpers.'; total_cost_usd = 1.25; num_turns = 4; duration_ms = 60000 }),
+            (New-StreamEvent assistant 'Carrying on.')
+        )
+        $watched.Wake.event | Should -Be 'died'
+        $watched.State.numTurns | Should -Be 4
+        $watched.State.durationMs | Should -Be 60000
+        $watched.State.totalCostUsd | Should -Be 1.25
+    }
+
+    It 'shows the cost in dep-posse.ps1 status, and the whole usage in dep-posse.ps1 result' {
         $scenario = New-WatchScenario -Exited -Lines @(
             (New-StreamEvent init),
-            (New-ResultEvent @{ result = 'Done.'; total_cost_usd = 3.456; num_turns = 7; duration_ms = 90000 })
+            (New-ResultEvent @{ result = 'Waiting.'; total_cost_usd = 1.5; num_turns = 4; duration_ms = 60000 }),
+            (New-StreamEvent user 'helper agent finished'),
+            (New-ResultEvent @{ result = 'Done.'; total_cost_usd = 3.456; num_turns = 3; duration_ms = 30000 })
         )
         $null = Invoke-Watch $scenario
         $status = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-posse.ps1' -Arguments @('status')
         $status.Output | Should -Match '\bCost\b'
         $status.Output | Should -Match '\$3\.46'
         $result = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-posse.ps1' -Arguments @('result', $scenario.Id)
-        $result.Output | Should -Match 'Cost: \$3\.46 over 7 turn\(s\), 90s of member time'
+        $result.Output | Should -Match 'Cost: \$3\.46, 7 turn\(s\), 1m 30s active over 1 run\(s\)'
+        # The log shows each result as what it is: one segment, and the
+        # session's running cost.
+        $logs = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-posse.ps1' -Arguments @('logs', $scenario.Id)
+        $logs.Output | Should -Match ([regex]::Escape('[result] success segment: turns=4 time=1m 00s session cost=$1.50'))
+        $logs.Output | Should -Match ([regex]::Escape('[result] success segment: turns=3 time=30s session cost=$3.46'))
+    }
+
+    It 'counts the usage of a running member that is killed' {
+        # No wake follows a kill, so the kill is where its run is counted.
+        $scenario = New-WatchScenario -Lines @(
+            (New-StreamEvent init -Model 'claude-opus-5-5'),
+            (New-ResultEvent @{ result = 'Waiting for the helpers.'; total_cost_usd = 2.5; num_turns = 9; duration_ms = 120000 }),
+            (New-StreamEvent user 'helper agent finished')
+        ) -Extra @{ numTurns = 1; durationMs = 1000; totalCostUsd = 0.5 }
+        $kill = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-posse.ps1' -Arguments @('kill', $scenario.Id)
+        $kill.ExitCode | Should -Be 0 -Because $kill.Output
+        $state = Get-TestTaskState -InstallRoot $scenario.Install -Id $scenario.Id
+        $state.status | Should -Be 'killed'
+        $state.numTurns | Should -Be 10
+        $state.durationMs | Should -Be 121000
+        $state.totalCostUsd | Should -Be 2.5
+        $state.reportedModel | Should -Be 'claude-opus-5-5'
     }
 
     It 'shows a dash for a task whose cost is not known' {
@@ -676,6 +739,33 @@ Describe 'dep-watch.ps1 with a resumed member' {
         $wake.followUps | Should -Be 1
     }
 
+    It 'adds every result of the resumed run to the totals, and none of the earlier run''s again' {
+        $scenario = New-WatchScenario -Exited -Lines @(
+            (New-StreamEvent init),
+            (New-ResultEvent @{ result = 'First run.'; total_cost_usd = 2.0; num_turns = 10; duration_ms = 5000 }),
+            '{"type":"deputy","subtype":"follow_up","number":1,"message":"Go on."}'
+        ) -Extra @{ status = 'running'; totalCostUsd = 2.0; numTurns = 10; durationMs = 5000; followUps = @(@{ number = 1 }) }
+        $offset = (Get-Item $scenario.Log).Length
+        $statePath = Join-Path $scenario.Install 'state' "$($scenario.Id).json"
+        $state = Get-Content $statePath -Raw | ConvertFrom-Json
+        $state | Add-Member -NotePropertyName logOffset -NotePropertyValue $offset -Force
+        ($state | ConvertTo-Json -Depth 6) | Set-Content -Path $statePath -Encoding utf8
+        Add-StreamEvent $scenario.Log @(
+            (New-StreamEvent init),
+            (New-ResultEvent @{ result = 'Waiting.'; total_cost_usd = 2.5; num_turns = 3; duration_ms = 1000 }),
+            (New-StreamEvent user 'helper agent finished'),
+            (New-ResultEvent @{ result = 'Second run done.'; total_cost_usd = 2.75; num_turns = 2; duration_ms = 500 })
+        )
+        $run = Invoke-Watch $scenario
+        $run.Output | Should -Match ': completed \(scout\)'
+        $watched = Get-TestTaskState -InstallRoot $scenario.Install -Id $scenario.Id
+        $watched.numTurns | Should -Be 15
+        $watched.durationMs | Should -Be 6500
+        $watched.totalCostUsd | Should -Be 2.75
+        $result = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-posse.ps1' -Arguments @('result', $scenario.Id)
+        $result.Output | Should -Match 'Cost: \$2\.75, 15 turn\(s\), 6s active over 2 run\(s\)'
+    }
+
     It 'reports a resumed run that wrote nothing as died, not as completed' {
         $scenario = New-WatchScenario -Exited -Lines @(
             (New-StreamEvent init),
@@ -687,5 +777,68 @@ Describe 'dep-watch.ps1 with a resumed member' {
         $run.Output | Should -Match ': died \(scout\)'
         $run.Output | Should -Match 'without a result'
         $run.Output | Should -Not -Match 'First run finished'
+    }
+}
+Describe 'dep-watch.ps1 and the model a member reports' {
+    It 'records the model of the init event while the member is still running' {
+        $scenario = New-WatchScenario -Extra @{ model = 'claude-opus-5-5' } -Lines @(
+            (New-StreamEvent init -Model 'claude-opus-5-5'),
+            (New-StreamEvent assistant 'Working.')
+        )
+        $run = Invoke-Watch $scenario
+        $run.Output | Should -Not -Match '\[wake\]'
+        (Get-TestTaskState -InstallRoot $scenario.Install -Id $scenario.Id).reportedModel | Should -Be 'claude-opus-5-5'
+        $status = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-posse.ps1' -Arguments @('status')
+        $status.Output | Should -Match '\bModel\b'
+        $status.Output | Should -Match 'claude-opus-5-5'
+        $status.Output | Should -Not -Match 'reports'
+    }
+
+    Context 'a member that runs on another model than it was started with' {
+        BeforeAll {
+            $script:mismatched = Invoke-FinishedWatch -Extra @{ model = 'claude-opus-5-5'; modelSource = 'config\deputy.json models.scout' } -Lines @(
+                (New-StreamEvent init -Model 'claude-fable-5-2'),
+                (New-StreamEvent result 'Done.')
+            )
+            $install = Split-Path -Parent (Split-Path -Parent $script:mismatched.State.stdoutLog)
+            $script:mismatchStatus = Invoke-DeputyScript -InstallRoot $install -Script 'dep-posse.ps1' -Arguments @('status')
+            $script:mismatchResult = Invoke-DeputyScript -InstallRoot $install -Script 'dep-posse.ps1' -Arguments @('result', $script:mismatched.State.id)
+        }
+
+        It 'says so in the completed wake' {
+            $script:mismatched.Wake.event | Should -Be 'completed'
+            $script:mismatched.Wake.modelMismatch | Should -Be 'requested claude-opus-5-5, but the member reports claude-fable-5-2'
+            $script:mismatched.Run.Output | Should -Match 'MODEL MISMATCH: requested claude-opus-5-5, but the member reports claude-fable-5-2'
+            $script:mismatched.State.reportedModel | Should -Be 'claude-fable-5-2'
+        }
+
+        It 'shows both models in dep-posse.ps1 status and result' {
+            $script:mismatchStatus.Output | Should -Match ([regex]::Escape('claude-opus-5-5 (reports claude-fable-5-2)'))
+            # A wide row still keeps every column when the output is
+            # redirected: Format-Table used to drop the last ones.
+            $script:mismatchStatus.Output | Should -Match '\bPr\s+Task\b'
+            $script:mismatchStatus.Output | Should -Match 'test task'
+            $script:mismatchResult.Output | Should -Match ([regex]::Escape('Model: claude-opus-5-5 (config\deputy.json models.scout). MISMATCH: requested claude-opus-5-5, but the member reports claude-fable-5-2'))
+        }
+    }
+
+    It 'sees no mismatch when the names differ only in case or a bracketed variant' {
+        $watched = Invoke-FinishedWatch -Extra @{ model = 'Claude-Opus-5-5[1m]' } -Lines @(
+            (New-StreamEvent init -Model 'claude-opus-5-5'),
+            (New-StreamEvent result 'Done.')
+        )
+        $watched.Wake.modelMismatch | Should -BeNullOrEmpty
+        $watched.Run.Output | Should -Not -Match 'MODEL MISMATCH'
+    }
+
+    It 'shows what a member started without a model reports, as the account default' {
+        $scenario = New-WatchScenario -Exited -Lines @(
+            (New-StreamEvent init -Model 'claude-fable-5-2'),
+            (New-StreamEvent result 'Done.')
+        )
+        $run = Invoke-Watch $scenario
+        $run.Output | Should -Not -Match 'MODEL MISMATCH'
+        $status = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-posse.ps1' -Arguments @('status')
+        $status.Output | Should -Match ([regex]::Escape('claude-fable-5-2 (account default)'))
     }
 }

@@ -81,6 +81,13 @@ function Initialize-Deputy {
 # The delivery modes a project can have (see README, "Delivery modes").
 $script:DeliveryModes = @('no-mistakes', 'direct-pr')
 
+# The kinds of task a member can be spawned for. The models and effort keys of
+# the Deputy config hold one value per kind.
+$script:MemberKinds = @('ship', 'scout')
+
+# The --effort levels claude accepts.
+$script:MemberEffortLevels = @('low', 'medium', 'high', 'xhigh', 'max')
+
 function Get-ConfigDisplayName([string]$Path) {
     # A config file the way its owner knows it: config\<name>.
     'config\' + (Split-Path -Leaf $Path)
@@ -108,6 +115,28 @@ function Read-ConfigFile([string]$Path) {
     $parsed
 }
 
+function Test-ModelName($Value) {
+    # Can this be passed as --model? Any non-empty string: model ids change with
+    # every release, so Deputy keeps no list of them, and a typo is caught by
+    # the model the member itself reports (reportedModel). Only a value a
+    # command line would read as an option is refused.
+    $Value -is [string] -and $Value.Trim() -and -not $Value.Trim().StartsWith('-')
+}
+
+function Assert-MemberSetting([string]$Setting, $Value, [string]$Where) {
+    # One model or effort value from a config file: null (not set), or a value
+    # claude can be started with. $Where names the file and key for the error.
+    if ($null -eq $Value) { return }
+    if ($Setting -eq 'model') {
+        if (-not (Test-ModelName $Value)) {
+            throw "$Where has model '$Value', which is not a model name. Write it as a string such as ""claude-opus-5-5"", or null for the account default."
+        }
+    }
+    elseif ($Value -isnot [string] -or $script:MemberEffortLevels -cnotcontains $Value) {
+        throw "$Where has effort '$Value', which is not one of: $($script:MemberEffortLevels -join ', ')."
+    }
+}
+
 function Get-DeputyConfig {
     <#
     .SYNOPSIS
@@ -115,9 +144,20 @@ function Get-DeputyConfig {
     (tracked), then config\deputy.local.json (private), key by key. A later
     layer's value replaces an earlier one, and null in either file means the
     built-in default - so a local null can undo a tracked value.
+
+    models and effort hold one value per kind of task ({ "ship": ...,
+    "scout": ... }) and are merged one level deeper, kind by kind, so a local
+    file can pin one kind and keep the tracked value of the other. sources
+    names the file each of those values came from ('models.ship' =
+    'config\deputy.json models.ship'), for dep-spawn.ps1 to say why a member
+    runs on the model it does.
+
+    The old flat keys - "model" as one string, "effort" as one string - are
+    still read, for one release: as the value of every kind the same file does
+    not set per kind. legacyKeys lists where they were found, so dep-spawn.ps1
+    can warn. A flat key set to null carries no choice and is ignored.
     #>
     $builtIn = [ordered]@{
-        model                = $null
         permissionMode       = 'bypassPermissions'
         watchIntervalSeconds = 15
         stallMinutes         = 10
@@ -126,9 +166,8 @@ function Get-DeputyConfig {
         # rewakes the session (dep-hook-stop.ps1). Off leaves the queue, the
         # session-start report and the stop guard in place.
         autoWatch            = $true
-        # Defaults for dep-spawn.ps1 -Effort and -MaxBudgetUsd. Null leaves the
-        # flag off the member's command line.
-        effort               = $null
+        # Default for dep-spawn.ps1 -MaxBudgetUsd. Null leaves the flag off the
+        # member's command line.
         maxBudgetUsd         = $null
         # How often the watcher reads each published, unmerged task's pull
         # request (see Get-PrWatchTasks). 0 switches PR watching off.
@@ -141,15 +180,87 @@ function Get-DeputyConfig {
     }
     $config = [ordered]@{}
     foreach ($name in $builtIn.Keys) { $config[$name] = $builtIn[$name] }
+
+    # The per-kind keys, and the setting each one holds. Built in, every kind
+    # is null: the flag is left off and the member runs on the account default.
+    $perKind = [ordered]@{ models = 'model'; effort = 'effort' }
+    $kindValues = @{}
+    $sources = [ordered]@{}
+    foreach ($key in $perKind.Keys) {
+        $kindValues[$key] = [ordered]@{}
+        foreach ($kind in $script:MemberKinds) { $kindValues[$key][$kind] = $null; $sources["$key.$kind"] = $null }
+    }
+    $legacy = @()
+
     $p = Get-DeputyPaths
     foreach ($file in $p.ConfigFile, $p.LocalConfigFile) {
         $layer = Read-ConfigFile $file
         if (-not $layer) { continue }
+        $name = Get-ConfigDisplayName $file
+        $flat = [ordered]@{}                    # per-kind key -> this file's old flat value
+        $named = @{ models = @(); effort = @() } # the kinds this file sets per kind
         foreach ($prop in $layer.PSObject.Properties) {
-            $config[$prop.Name] = if ($null -ne $prop.Value) { $prop.Value } else { $builtIn[$prop.Name] }
+            $key = $prop.Name
+            $value = $prop.Value
+            if ($key -eq 'model') {
+                if ($null -eq $value) { continue }
+                Assert-MemberSetting 'model' $value $name
+                $flat['models'] = $value
+                continue
+            }
+            if (-not $perKind.Contains($key)) {
+                $config[$key] = if ($null -ne $value) { $value } else { $builtIn[$key] }
+                continue
+            }
+            if ($null -eq $value) {
+                foreach ($kind in $script:MemberKinds) { $kindValues[$key][$kind] = $null; $sources["$key.$kind"] = $null }
+                continue
+            }
+            if ($key -eq 'effort' -and $value -is [string]) {
+                Assert-MemberSetting 'effort' $value $name
+                $flat['effort'] = $value
+                continue
+            }
+            if (-not (Test-JsonObject $value)) {
+                throw "$name has a $key value that is not one entry per kind. Write it as { ""ship"": ..., ""scout"": ... }."
+            }
+            foreach ($entry in $value.PSObject.Properties) {
+                if ($script:MemberKinds -notcontains $entry.Name) {
+                    throw "$name has $key.$($entry.Name), which is not a kind of task. The kinds are: $($script:MemberKinds -join ', ')."
+                }
+                $kind = $entry.Name.ToLowerInvariant()
+                Assert-MemberSetting $perKind[$key] $entry.Value "$name ($key.$kind)"
+                $kindValues[$key][$kind] = $entry.Value
+                $sources["$key.$kind"] = ($null -ne $entry.Value) ? "$name $key.$kind" : $null
+                $named[$key] += $kind
+            }
+        }
+        foreach ($key in $flat.Keys) {
+            $flatName = $perKind[$key]
+            $legacy += "$name ""$flatName"""
+            foreach ($kind in $script:MemberKinds) {
+                if ($named[$key] -contains $kind) { continue }
+                $kindValues[$key][$kind] = $flat[$key]
+                $sources["$key.$kind"] = "$name $flatName (old flat key)"
+            }
         }
     }
+    $config['models'] = [pscustomobject]$kindValues['models']
+    $config['effort'] = [pscustomobject]$kindValues['effort']
+    $config['sources'] = [pscustomobject]$sources
+    $config['legacyKeys'] = @($legacy)
     [pscustomobject]$config
+}
+
+function Get-LegacyConfigWarning($Config) {
+    # The one warning for the old flat model and effort keys, or $null when no
+    # config file uses them.
+    $found = @(Get-EventField $Config 'legacyKeys' | Where-Object { $_ })
+    if ($found.Count -eq 0) { return $null }
+    ('{0} still use{1} the old flat "model"/"effort" keys. They are read as the value for every kind for now, ' +
+        'and stop being read in a later release. Move them to one entry per kind: ' +
+        '"models": {{ "ship": "...", "scout": "..." }}, "effort": {{ "ship": ..., "scout": ... }}.') -f
+    ($found -join ', '), ($found.Count -eq 1 ? 's' : '')
 }
 
 function Assert-ProjectFields($Fields, [string]$Where) {
@@ -168,6 +279,7 @@ function Assert-ProjectFields($Fields, [string]$Where) {
             throw "$Where has a validate value that is not a list of commands. Write it as [""command"", ...]."
         }
     }
+    foreach ($setting in 'model', 'effort') { Assert-MemberSetting $setting (Get-EventField $Fields $setting) $Where }
 }
 
 function Test-ProjectMatch($Entry, [string]$RepoPath) {
@@ -182,18 +294,22 @@ function Test-ProjectMatch($Entry, [string]$RepoPath) {
 function Get-ProjectProfile([string]$RepoPath) {
     <#
     .SYNOPSIS
-    A repo's delivery profile: its delivery mode and its gate commands.
+    A repo's delivery profile: its delivery mode, its gate commands, and the
+    model and effort its members run with when the project names them.
 
     Read from config\projects.local.json (private) over config\projects.json
     (tracked). The default block is merged key by key: local over tracked over
-    the built-in default (no-mistakes, auto-detected gate). Project entries are
-    matched local first, then tracked, and the first match wins; it is laid
-    over the default key by key, so an entry may name only what it changes. An
-    empty validate list means auto-detect at validation time (see
-    Get-AutoValidateCommands).
+    the built-in default (no-mistakes, auto-detected gate, no model or effort
+    of its own). Project entries are matched local first, then tracked, and
+    the first match wins; it is laid over the default key by key, so an entry
+    may name only what it changes. An empty validate list means auto-detect at
+    validation time (see Get-AutoValidateCommands). A null model or effort is
+    not set, and leaves the choice to the per-kind default of the Deputy
+    config (see Resolve-MemberSettings).
 
     Source and ValidateSource say where the profile and its gate commands came
-    from, for the gate's evidence.
+    from, for the gate's evidence; ModelSource and EffortSource the same for
+    the model and effort.
     #>
     $p = Get-DeputyPaths
     $layers = @(
@@ -217,18 +333,19 @@ function Get-ProjectProfile([string]$RepoPath) {
     $result = [ordered]@{
         delivery = 'no-mistakes'; validate = @(); match = $null
         source = 'built-in default'; validateSource = 'built-in default'
+        model = $null; modelSource = $null; effort = $null; effortSource = $null
     }
     $apply = {
         param($Fields, [string]$From)
         $result.source = $From
-        foreach ($key in 'delivery', 'validate') {
+        foreach ($key in 'delivery', 'validate', 'model', 'effort') {
             # Read the property itself: through the pipeline an empty list
             # would come back as null, and "validate": [] (auto-detect) could
             # never override a pinned default.
             $prop = $Fields.PSObject.Properties[$key]
             if (-not $prop -or $null -eq $prop.Value) { continue }
             $result[$key] = $prop.Value
-            if ($key -eq 'validate') { $result.validateSource = $From }
+            if ($key -ne 'delivery') { $result["${key}Source"] = $From }
         }
     }
     # The default: tracked, then local on top.
@@ -250,7 +367,66 @@ function Get-ProjectProfile([string]$RepoPath) {
         match          = $result.match
         source         = $result.source
         validateSource = $result.validateSource
+        model          = $result.model
+        modelSource    = $result.modelSource
+        effort         = $result.effort
+        effortSource   = $result.effortSource
     }
+}
+
+function Resolve-MemberSettings {
+    <#
+    .SYNOPSIS
+    The model and effort a new member is started with, and where each came
+    from. One rule for both, first match wins:
+
+    1. the spawn's own -Model / -Effort;
+    2. the repo's project profile (its matched entry, else the projects
+       default; see Get-ProjectProfile);
+    3. the per-kind default in the Deputy config (models.<kind>,
+       effort.<kind>; see Get-DeputyConfig);
+    4. nothing: the flag is left off, and the member runs on the account
+       default.
+
+    Only a spawn resolves. A resumed run is started with what the task
+    recorded at spawn (Get-TaskMemberArguments), so a follow-up can never
+    change the model or effort mid-task, whatever the config says by then.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('ship', 'scout')][string]$Kind,
+        [string]$Model,
+        [string]$Effort,
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Project
+    )
+    $resolved = [ordered]@{}
+    foreach ($setting in 'model', 'effort') {
+        $explicit = ($setting -eq 'model') ? $Model : $Effort
+        $flag = ($setting -eq 'model') ? '-Model' : '-Effort'
+        $key = ($setting -eq 'model') ? 'models' : 'effort'
+        $candidates = @(
+            [pscustomobject]@{ Value = $explicit; Source = $flag }
+            [pscustomobject]@{ Value = Get-EventField $Project $setting; Source = Get-EventField $Project "${setting}Source" }
+            [pscustomobject]@{
+                Value  = Get-EventField (Get-EventField $Config $key) $Kind
+                Source = Get-EventField (Get-EventField $Config 'sources') "$key.$Kind"
+            }
+        )
+        $chosen = $candidates | Where-Object { $null -ne $_.Value -and "$($_.Value)".Trim() } | Select-Object -First 1
+        $value = $null
+        $source = 'account default'
+        if ($chosen) {
+            $value = "$($chosen.Value)".Trim()
+            # -Effort is matched without regard to case, like any PowerShell
+            # parameter set; claude is given the level as it spells it.
+            if ($setting -eq 'effort') { $value = $value.ToLowerInvariant() }
+            $source = $chosen.Source ? $chosen.Source : 'config'
+            Assert-MemberSetting $setting $value $source
+        }
+        $resolved[$setting] = $value
+        $resolved["${setting}Source"] = $source
+    }
+    [pscustomobject]$resolved
 }
 
 function Test-GitRef([string]$RepoPath, [string]$Ref) {
@@ -786,6 +962,10 @@ function Format-Wake {
     if ($Wake.prUrl) { '  pr: {0}' -f $Wake.prUrl }
     if ($Wake.prUrlRejected) { "  pr REJECTED (not this task's repo): {0}" -f $Wake.prUrlRejected }
     if ($Wake.summary) { '  {0}' -f $Wake.summary }
+    $mismatch = Get-EventField $Wake 'modelMismatch'
+    if ($mismatch) {
+        "  MODEL MISMATCH: {0}. Check the model name in -Model, the project entry or models in the config, and tell the Sheriff." -f $mismatch
+    }
     if ($Wake.question) { '  question: {0}' -f $Wake.question }
     if ($script:FollowUpWakes -contains $Wake.event) {
         # These are answered in the member's own session, not with a respawn.
@@ -1217,6 +1397,35 @@ function Undo-Lease {
     finally { Pop-Location }
 }
 
+function Remove-UnusedTaskBranch {
+    <#
+    .SYNOPSIS
+    Delete the branch a lease created for a member that was never launched,
+    and prove it is gone. Returns nothing when it is gone (or was never
+    created), else one line naming the branch, why it is still there and the
+    command that removes it.
+
+    The branch carries no work, but git branch -D can still fail - the branch
+    is checked out in the slot because the lease could not be returned, or the
+    return left the slot on it - and a branch nobody was told about is only
+    found by whoever trips over it later.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RepoPath,
+        [Parameter(Mandatory)][string]$Branch,
+        [switch]$LeaseReturned
+    )
+    $ref = "refs/heads/$Branch"
+    if (-not (Test-GitRef $RepoPath $ref)) { return }
+    if ($LeaseReturned) {
+        $said = (@(git -C $RepoPath branch -D $Branch 2>&1) | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) -join ' '
+        if (-not (Test-GitRef $RepoPath $ref)) { return }
+        $why = $said ? "git said: $(Limit-Text $said 200)" : 'git branch -D left it in place'
+    }
+    else { $why = 'the lease that has it checked out was not returned' }
+    "The task branch $Branch was NOT deleted ($why). Remove it once no worktree has it checked out: git -C ""$RepoPath"" branch -D $Branch"
+}
+
 function Get-DeputyCloneProblems([string]$Root) {
     # Is the Deputy clone on its default branch, and not behind origin? Report
     # only: this never fetches, pulls or switches. ls-remote reads the remote
@@ -1600,8 +1809,6 @@ function Stop-TaskProcesses($State) {
 # started exactly like the first one.
 # ---------------------------------------------------------------------------
 
-$script:MemberEffortLevels = @('low', 'medium', 'high', 'xhigh', 'max')
-
 # The statuses a member can end its structured final report with, and the wake
 # each one becomes. 'done' and 'failed' keep the wakes they always had.
 $script:MemberReportWakes = [ordered]@{
@@ -1821,6 +2028,9 @@ function Get-MemberArguments {
 
 function Get-TaskMemberArguments($State, [switch]$Resume) {
     # A task's member arguments, from what its record says it was spawned with.
+    # The model and effort in particular are read from the record and never
+    # resolved again (Resolve-MemberSettings runs at spawn only): a resumed run
+    # stays on the model its session started on, whatever the config says now.
     $read = { param($name) if ($State.PSObject.Properties[$name]) { $State.$name } else { $null } }
     $settings = @{
         SessionId      = [string](& $read 'sessionId')
@@ -2152,6 +2362,159 @@ function Get-MemberOutcome($ResultEvent) {
         }
     }
     [pscustomobject]@{ Wake = 'completed'; Text = $text; Report = $null }
+}
+
+function ConvertFrom-StreamLine([string]$Line) {
+    # One stream-json line as an object, or $null for anything unparseable
+    # (a line the member is still writing, stray non-JSON output).
+    try { $Line | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+}
+
+function Read-MemberRun([string]$LogPath, [long]$Offset = 0) {
+    <#
+    .SYNOPSIS
+    What the current run of a member has written to its stream-json log: its
+    last result, the usage of all its results, and the model it reports.
+    $null when the log cannot be read.
+
+    Result is the LAST {"type":"result",...} event (Event, its Text, and
+    Interim), or $null when the run has none yet. A result event is not proof
+    the member is done: a member that started background helpers emits one at
+    the end of each turn, then resumes when a helper reports back and emits
+    another. So the last result is the only candidate for the final one, and it
+    is Interim when assistant or user events follow it.
+
+    Every result counts towards the usage, not only the last one. Claude Code
+    measures num_turns and duration_ms per input message - the briefing, a
+    follow-up, each background helper that reports back - so one run can end
+    several segments with a result each, and the last one covers only its own
+    segment. Turns and DurationMs therefore add up all of the run's results.
+    total_cost_usd is a running total for the whole session, so CostUsd is the
+    highest one. Each is $null when no result carried it. Results counts them.
+
+    ReportedModel is the model of the run's last init event: the model the
+    member says it runs on, as opposed to the one it was asked for.
+
+    -Offset is where the current run starts in the log, in bytes. Everything
+    before it belongs to runs that were already handled.
+    #>
+    if (-not (Test-Path -LiteralPath $LogPath)) { return $null }
+    try {
+        # Share the file with the member, which is still appending to it.
+        $stream = [System.IO.FileStream]::new($LogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
+    }
+    catch { return $null }
+    $last = $null
+    $continued = $false
+    $results = 0
+    $usage = @{ num_turns = $null; duration_ms = $null; total_cost_usd = $null }
+    $model = $null
+    try {
+        if ($Offset -gt 0) {
+            # A log shorter than its recorded offset has no current run yet.
+            if ($Offset -gt $stream.Length) {
+                return [pscustomobject]@{ Result = $null; Results = 0; Turns = $null; DurationMs = $null; CostUsd = $null; ReportedModel = $null }
+            }
+            $null = $stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+        }
+        $reader = [System.IO.StreamReader]::new($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            # Cheap substring tests first: logs run to megabytes, and only the
+            # few candidate lines are worth parsing. Nested occurrences of
+            # these keys are escaped inside JSON strings, and the parsed
+            # top-level type is what decides.
+            if ($line.Contains('"type":"result"')) {
+                $parsed = ConvertFrom-StreamLine $line
+                if ((Get-EventField $parsed 'type') -ne 'result') { continue }
+                $last = $parsed
+                $continued = $false
+                $results++
+                foreach ($field in 'num_turns', 'duration_ms') {
+                    $value = ConvertTo-InvariantNumber (Get-EventField $parsed $field)
+                    if ($null -ne $value) { $usage[$field] = [double]($usage[$field] ?? 0) + $value }
+                }
+                $cost = ConvertTo-InvariantNumber (Get-EventField $parsed 'total_cost_usd')
+                if ($null -ne $cost) { $usage.total_cost_usd = [math]::Max($cost, [double]($usage.total_cost_usd ?? 0)) }
+            }
+            elseif ($line.Contains('"subtype":"init"')) {
+                $parsed = ConvertFrom-StreamLine $line
+                if ((Get-EventField $parsed 'type') -eq 'system' -and (Get-EventField $parsed 'subtype') -eq 'init') {
+                    $reported = [string](Get-EventField $parsed 'model')
+                    if ($reported.Trim()) { $model = $reported.Trim() }
+                }
+            }
+            elseif ($last -and -not $continued -and
+                ($line.Contains('"type":"assistant"') -or $line.Contains('"type":"user"'))) {
+                $parsed = ConvertFrom-StreamLine $line
+                if ((Get-EventField $parsed 'type') -in @('assistant', 'user')) { $continued = $true }
+            }
+        }
+    }
+    finally { $stream.Dispose() }
+    [pscustomobject]@{
+        Result        = if ($last) {
+            [pscustomobject]@{ Event = $last; Text = (Get-MemberOutcome $last).Text; Interim = $continued }
+        } else { $null }
+        Results       = $results
+        Turns         = ($null -ne $usage.num_turns) ? [long]$usage.num_turns : $null
+        DurationMs    = ($null -ne $usage.duration_ms) ? [long]$usage.duration_ms : $null
+        CostUsd       = $usage.total_cost_usd
+        ReportedModel = $model
+    }
+}
+
+function Add-RunUsage($State, $Run) {
+    <#
+    .SYNOPSIS
+    Add one finished run's usage (Read-MemberRun) to the task's totals.
+
+    Called exactly once per run: when the run's outcome is recorded and the
+    task leaves running/stalled (the watcher's completion and died wakes,
+    dep-posse.ps1 kill). The next run starts at a new logOffset, so no result
+    is ever counted twice. totalCostUsd is the session's running total, so it
+    replaces the stored figure and never lowers it; numTurns and durationMs
+    add up across runs.
+    #>
+    if (-not $Run) { return }
+    if ($null -ne $Run.CostUsd) {
+        $known = ConvertTo-InvariantNumber (Get-EventField $State 'totalCostUsd')
+        Set-TaskField $State 'totalCostUsd' ([math]::Max([double]$Run.CostUsd, [double]($known ?? 0)))
+    }
+    foreach ($pair in @(@('Turns', 'numTurns'), @('DurationMs', 'durationMs'))) {
+        $value = $Run.($pair[0])
+        if ($null -eq $value) { continue }
+        $known = ConvertTo-InvariantNumber (Get-EventField $State $pair[1])
+        Set-TaskField $State $pair[1] ([long]($value + ($known ?? 0)))
+    }
+}
+
+function Get-ModelKey([string]$Model) {
+    # A model name compared the way claude reads it: without regard to case,
+    # and without a bracketed variant suffix such as [1m].
+    ($Model.Trim() -replace '\s*\[[^\]]*\]$', '').ToLowerInvariant()
+}
+
+function Get-TaskModelMismatch($State) {
+    # Text saying the member runs on another model than the one it was started
+    # with, or $null when they agree or either one is not known.
+    $requested = [string](Get-EventField $State 'model')
+    $reported = [string](Get-EventField $State 'reportedModel')
+    if (-not $requested.Trim() -or -not $reported.Trim()) { return $null }
+    if ((Get-ModelKey $requested) -eq (Get-ModelKey $reported)) { return $null }
+    "requested $requested, but the member reports $reported"
+}
+
+function Format-TaskModel($State) {
+    # A task's model as dep-posse.ps1 status shows it.
+    $requested = [string](Get-EventField $State 'model')
+    $reported = [string](Get-EventField $State 'reportedModel')
+    if ($requested) {
+        if (Get-TaskModelMismatch $State) { return "$requested (reports $reported)" }
+        return $requested
+    }
+    if ($reported) { return "$reported (account default)" }
+    'account default'
 }
 
 function Get-TaskFollowUps($State) {

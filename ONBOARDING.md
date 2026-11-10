@@ -23,7 +23,21 @@ cd C:\apps\deputy
 
 The clone is the whole install - no build step. Your clone is also your instance: task state and logs live inside it, private to you.
 
-Your own settings are private too. Put them in `config\deputy.local.json` (model, budget, permission mode, ...) and `config\projects.local.json` (the gate commands or delivery mode of the repos you work on). Both are gitignored and win over the tracked `config\deputy.json` and `config\projects.json`, which you leave as they are on `main` - so `git pull` never conflicts with your pins. Create a local file only when you need it, with only the keys you want to change; the README's "Configuration" section has the details.
+Your own settings are private too. Put them in `config\deputy.local.json` (models, budget, permission mode, ...) and `config\projects.local.json` (the gate commands, delivery mode or model of the repos you work on). Both are gitignored and win over the tracked `config\deputy.json` and `config\projects.json`, which you leave as they are on `main` - so `git pull` never conflicts with your pins. Create a local file only when you need it, with only the keys you want to change; the README's "Configuration" section has the details.
+
+**Which model the posse runs on** is set in the config, never by whatever model your own Claude Code session happens to be on. The tracked `config\deputy.json` pins one model per kind of task (`models.ship`, `models.scout`), so every member runs on a model somebody chose. To run your members on another model, pin it in `config\deputy.local.json` - only the kind you name changes:
+
+```json
+{ "models": { "scout": "claude-sonnet-5-5" } }
+```
+
+or for one repo only, in `config\projects.local.json`:
+
+```json
+{ "projects": [ { "match": "myapp", "model": "claude-sonnet-5-5" } ] }
+```
+
+The Deputy names the model in every spawn it confirms, `dep-posse.ps1 status` shows it per task, and a member that reports running on a different model than the one it was given is flagged (`MODEL MISMATCH`) - usually a typo in the model name.
 
 Now check the toolchain. The doctor prints one line per problem, each with the exact command that fixes it, and nothing at all when everything is in order:
 
@@ -82,6 +96,8 @@ pwsh -NoProfile -File bin\dep-posse.ps1 logs <taskId> # readable live log
 - **`gh` errors about token scopes** - `gh pr view` needs `read:org`; re-auth with `gh auth login` or add the scope to your PAT.
 - **Spawn refuses with "Refusing to launch a member"** - the worktree treehouse leased was not a worktree of its own (or not on the task's new branch), so nothing was started in it and the lease was given back. The line after it says what was wrong; `treehouse status` (run inside the repo) shows the pool.
 - **Spawn refuses with "Refusing to lease a worktree"** - treehouse is older than 3.0.1, its version cannot be read, or its `get` lacks a flag Deputy needs. Run `pwsh -NoProfile -File bin\dep-doctor.ps1` and apply the fix it names (`treehouse update`, with no tasks leased, straight to the latest release - never to 3.0.0).
+- **Spawn warns about the old flat "model"/"effort" keys** - your `config\deputy.local.json` (or `config\deputy.json`, if you changed it) still has `"model": "..."` or `"effort": "..."` as a single value. It is still read, as the value for every kind, for one more release. Move it to `"models": { "ship": "...", "scout": "..." }` and `"effort": { "ship": ..., "scout": ... }`.
+- **A wake or the status says `MODEL MISMATCH`** - the member reports running on another model than it was started with. Check the model name in `-Model`, your project entry or `models` in the config; an alias (`opus`) is reported as the full model id, which shows up here too.
 - **Worktree stuck as leased** - `treehouse status` (run inside the repo) to inspect; `pwsh -NoProfile -File bin\dep-return.ps1 <taskId>` releases it safely: it refuses, and says why, if the task's work has not landed anywhere (add `-Discard` only when you mean to throw that work away).
 
 ## Updating
