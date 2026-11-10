@@ -36,10 +36,18 @@ dep-return.ps1 .... worktree back to the pool, task state archived
 
 ## Prerequisites
 
-- Windows with PowerShell 7+
+- Windows with PowerShell 7 or later
 - git, and [GitHub CLI](https://cli.github.com/) authenticated (`gh auth login`)
-- [treehouse](https://github.com/kunchenguid/treehouse) on PATH
+- [treehouse](https://github.com/kunchenguid/treehouse) **3.0.1 or later** on PATH, with `treehouse get --lease`
 - [Claude Code](https://claude.com/claude-code) on PATH
+
+Check all of it in one go - silent means healthy, otherwise one line per problem with the exact fix:
+
+```powershell
+pwsh -NoProfile -File bin\dep-doctor.ps1
+```
+
+**Updating treehouse.** Older treehouse releases can mislist the processes in a worktree on Windows, which is why there is a floor and why `dep-spawn.ps1` refuses to lease below it. Update with `treehouse update`, with no tasks leased, and make sure it lands on the latest release: an update must go straight there, never to 3.0.0, which is below the floor. Confirm with `treehouse --version` and re-run the doctor.
 
 ## Quickstart
 
@@ -82,19 +90,29 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 
 | Command | What it does |
 | --- | --- |
-| `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>]` | Lease a worktree, launch a headless posse member, register task state |
+| `dep-doctor.ps1` | Toolchain check: PowerShell 7+, `git` / `gh` / `claude` / `treehouse` on PATH, `gh auth status`, treehouse at least 3.0.1 with `get --lease`, and the Deputy clone on its default branch and not behind `origin`. One line per problem, each naming its fix; prints nothing when healthy. Exit 0 healthy, 1 on any problem. Report only - it never installs, updates or pulls |
+| `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>]` | Lease a worktree, launch a headless posse member, register task state. Refuses to lease when treehouse fails the doctor's version check |
 | `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n]` | Scan tasks for wake events; `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90) |
 | `dep-posse.ps1 status [-Watch]` | Posse table: status, liveness, age, PR; `-Watch` auto-refreshes with recent wakes |
 | `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw] [-Follow]` | Human-readable log tail (or raw stream-json); `-Follow` live-tails |
 | `dep-posse.ps1 result <taskId>` | Final report text, scout report path, PR URL |
-| `dep-posse.ps1 kill <taskId>` | Stop a runaway member's process tree (lease kept for inspection) |
+| `dep-posse.ps1 kill <taskId>` | Stop a runaway member's process tree (lease kept for inspection). Kills only processes proven to be the task's - see "What Deputy will kill" |
 | `dep-validate.ps1 <taskId>` | Run the no-mistakes gate in the task's worktree; commits evidence on pass. Exit 0 passed, 1 failed, 2 unverified (no commands to run) |
 | `dep-publish.ps1 <taskId> [-AllowUnverified]` | Push the branch and open the PR; refuses a failed or unverified gate. `-AllowUnverified` is the Sheriff's opt-in for repos with no gate, and labels the PR as never validated |
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <taskId> [-Method squash\|merge\|rebase]` | PR operations via gh (merge defaults to squash; branch cleanup happens in dep-return) |
-| `dep-return.ps1 <taskId>` | Kill stragglers, return the lease (guarded by `--if-lease-id`), delete the task branch, archive state |
+| `dep-return.ps1 <taskId>` | Kill stragglers (same proof as `kill`), return the lease (guarded by `--if-lease-id`), delete the task branch, archive state |
 | `dep-dashboard.ps1 [-Id <taskId>] [-Tail n]` | Live posse view in Windows Terminal: auto-refreshing status tab + a live-tail tab per active member. Re-running adds new members' tabs to the same window; `-Id` opens one task (active or archived) |
 
 Inside a Deputy session, the `/dashboard` skill (`.claude\skills\dashboard`) opens the same posse view on request.
+
+## What Deputy will kill
+
+`dep-posse.ps1 kill` and `dep-return.ps1` force-kill process trees, so a pid is treated as a claim to check, not an instruction. The candidates are the member pid recorded at spawn and whatever treehouse lists in the task's worktree; treehouse's listing says where to look, and is never by itself a licence to kill. A candidate is killed only when both of these hold:
+
+- **It can be read.** Its executable path or its command line is readable. A process Deputy cannot inspect is left alone.
+- **It can be placed.** Either it sits in the process tree under the recorded member pid - checked hop by hop against pid recycling, with the member pid itself required to carry the recorded start time - or its working directory, which Deputy reads from the process itself, is inside the task worktree.
+
+On top of that, pid 0 and pid 4 are never candidates, a worktree listing of more than 50 processes is discarded whole as a mislisting (with a warning), and the calling process and its ancestors are never killed. Anything that fails the proof is left running and named in a `left pid N running` warning, so it is visible rather than silently skipped.
 
 ## Delivery modes (no-mistakes gate)
 
@@ -186,7 +204,7 @@ Two traps worth knowing:
 ## Layout
 
 ```
-bin\        toolbelt (dep-spawn, dep-watch, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-dashboard, dep-lib)
+bin\        toolbelt (dep-doctor, dep-spawn, dep-watch, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-dashboard, dep-lib)
 config\     deputy.json, projects.json
 tools\      Deputy's own gate: Invoke-Lint.ps1, Invoke-Tests.ps1
 tests\      Pester suite for the toolbelt

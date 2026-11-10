@@ -17,7 +17,8 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
 
 | Command | Purpose |
 | --- | --- |
-| `dep-spawn.ps1 -Task "..." -Repo <path> [-Kind ship\|scout] [-Model m]` | Lease a treehouse worktree, launch a headless posse member |
+| `dep-doctor.ps1` | Check the toolchain (PowerShell, git, gh, claude, treehouse version, the Deputy clone). Prints one line per problem with its fix; silent and exit 0 when healthy, exit 1 otherwise |
+| `dep-spawn.ps1 -Task "..." -Repo <path> [-Kind ship\|scout] [-Model m]` | Lease a treehouse worktree, launch a headless posse member (refuses to lease if treehouse fails the doctor's version check) |
 | `dep-watch.ps1 -Wait` | Block until an actionable wake event (completed, failed, died, stalled) |
 | `dep-posse.ps1 [status\|logs\|result\|kill] [id]` | Posse status, readable logs, final reports, emergency stop |
 | `dep-validate.ps1 <id>` | Run the no-mistakes gate in a finished ship task's worktree (exit 0 passed, 1 failed, 2 unverified) |
@@ -25,6 +26,10 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <id>` | Inspect and merge a task's PR via gh |
 | `dep-return.ps1 <id>` | Kill stragglers, return the worktree lease, delete the task branch, archive state |
 | `dep-dashboard.ps1` | Open the Sheriff's live posse view in Windows Terminal (status tab + live tail per active member). Offer it when the Sheriff wants to watch the posse work |
+
+## Session start
+
+Run `dep-doctor.ps1` once at the start of every session, before the first spawn. It prints nothing when the toolchain is healthy. If it prints anything, relay every line to the Sheriff verbatim, fix command included - do not paraphrase, and do not run the fixes yourself: they are machine changes (installs, `treehouse update`, `git pull`) and belong to the Sheriff. A treehouse problem blocks all spawning until it is fixed, because `dep-spawn.ps1` enforces the same check; other lines do not stop you from working, but the Sheriff still needs to see them.
 
 ## The loop
 
@@ -53,3 +58,4 @@ All commands are PowerShell scripts in `bin\`. Run them with `pwsh -NoProfile -F
 - A respawn is a new task id with a better briefing; you cannot type into a running posse member.
 - `state\` and `logs\` are runtime data owned by the scripts. Read freely, write never (except through the toolbelt).
 - If `dep-spawn.ps1` or treehouse errors, surface the error to the Sheriff rather than working around it by hand.
+- `dep-posse.ps1 kill` and `dep-return.ps1` only kill processes they can prove belong to the task (under the recorded member pid, or working inside the task worktree). A `left pid N running` warning means a process could not be proven: relay it to the Sheriff, and never kill it by hand.

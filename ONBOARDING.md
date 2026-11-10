@@ -9,8 +9,10 @@ Everything runs natively on Windows. You need:
 1. **PowerShell 7+** - check with `pwsh --version`; install via `winget install Microsoft.PowerShell` if missing.
 2. **git** - `winget install Git.Git` if missing.
 3. **GitHub CLI, authenticated** - `winget install GitHub.cli`, then `gh auth login` (choose HTTPS; make sure the account has push access to the repos you'll work on).
-4. **treehouse** (worktree pool manager) - PowerShell installer from https://github.com/kunchenguid/treehouse. Verify with `treehouse --version`.
+4. **treehouse 3.0.1 or later** (worktree pool manager) - `irm https://kunchenguid.github.io/treehouse/install.ps1 | iex` (from https://github.com/kunchenguid/treehouse). Verify with `treehouse --version`.
 5. **Claude Code** - https://claude.com/claude-code. Verify with `claude --version`.
+
+Minimum versions: PowerShell 7 and treehouse 3.0.1. Older treehouse releases can mislist the processes in a worktree on Windows, so Deputy refuses to lease from them. If you already have treehouse, run `treehouse update` with no tasks leased and check it landed on the latest release - an update must go straight to the latest, never to 3.0.0, which is below the minimum.
 
 ## 2. Get Deputy
 
@@ -20,6 +22,14 @@ cd C:\apps\deputy
 ```
 
 The clone is the whole install - no build step. Your clone is also your instance: task state and logs live inside it, private to you.
+
+Now check the toolchain. The doctor prints one line per problem, each with the exact command that fixes it, and nothing at all when everything is in order:
+
+```powershell
+pwsh -NoProfile -File bin\dep-doctor.ps1
+```
+
+Your Deputy runs the same check at the start of every session and tells you about anything it finds.
 
 ## 3. Launch your Deputy
 
@@ -64,6 +74,7 @@ pwsh -NoProfile -File bin\dep-posse.ps1 logs <taskId> # readable live log
 
 - **Member stalls immediately** - almost always permissions: headless agents cannot answer prompts. Keep the default permission mode, or grant tools explicitly (README, Permissions section).
 - **`gh` errors about token scopes** - `gh pr view` needs `read:org`; re-auth with `gh auth login` or add the scope to your PAT.
+- **Spawn refuses with "Refusing to lease a worktree"** - treehouse is older than 3.0.1 or its version cannot be read. Run `pwsh -NoProfile -File bin\dep-doctor.ps1` and apply the fix it names (`treehouse update`, with no tasks leased, straight to the latest release - never to 3.0.0).
 - **Worktree stuck as leased** - `treehouse status` (run inside the repo) to inspect; `pwsh -NoProfile -File bin\dep-return.ps1 <taskId>` releases it safely.
 
 ## Updating
@@ -72,3 +83,5 @@ pwsh -NoProfile -File bin\dep-posse.ps1 logs <taskId> # readable live log
 cd C:\apps\deputy
 git pull
 ```
+
+Then re-run `pwsh -NoProfile -File bin\dep-doctor.ps1`. It also tells you when your clone has fallen behind `origin` (it only reports - it never pulls for you).
