@@ -6,5 +6,6 @@
   "branchPrefix": "deputy/",
   "autoWatch": true,
   "effort": null,
-  "maxBudgetUsd": null
+  "maxBudgetUsd": null,
+  "prPollMinutes": 5
 }

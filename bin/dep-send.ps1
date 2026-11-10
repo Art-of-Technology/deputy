@@ -19,7 +19,9 @@ watcher reports the resumed run's result as a new wake. Each follow-up is
 recorded in task state (followUps).
 
 A gate verdict from an earlier run is cleared: the member is about to change
-the branch, so dep-validate.ps1 has to judge it again.
+the branch, so dep-validate.ps1 has to judge it again. That holds after
+publishing too: when the task already has a PR, dep-validate.ps1 followed by
+dep-publish.ps1 pushes the member's new commits to that same PR.
 
 .EXAMPLE
 .\dep-send.ps1 posse-20260729-114756-thv -Message "Continue where you left off."
@@ -103,7 +105,7 @@ Set-TaskField $task 'stallNotified' $false
 
 # Whatever the gate said, it said about a branch the member is about to change.
 $hadVerdict = [bool](Get-EventField $task 'validation')
-foreach ($stale in 'validation', 'validationNote', 'validationError', 'validationEvidence') {
+foreach ($stale in 'validation', 'validationNote', 'validationError', 'validationEvidence', 'validatedHead') {
     if ($task.PSObject.Properties[$stale]) { Set-TaskField $task $stale $null }
 }
 Write-TaskState $task
