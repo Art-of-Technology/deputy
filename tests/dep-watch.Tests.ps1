@@ -10,6 +10,11 @@ emitted a `result` event mid-session, and the watcher woke the Deputy with
 `completed` while the member was still alive and still writing its report.
 A task is completed only when its final result has arrived AND the member
 process has exited.
+
+Further down: what the final result MEANS. A transient API failure is
+`interrupted`, a structured final report maps by its status (`blocked` and
+`needs-decision` are wakes of their own), and after dep-send.ps1 resumed a
+member only the current run's result counts.
 #>
 
 BeforeAll {
@@ -65,6 +70,24 @@ BeforeAll {
         $streamEvent | ConvertTo-Json -Compress -Depth 8
     }
 
+    function New-ResultEvent {
+        # A result event with exactly these fields on top of the basics, for
+        # the shapes New-StreamEvent does not cover: API errors, structured
+        # reports, usage.
+        param([hashtable]$Fields = @{})
+        $resultEvent = [ordered]@{ type = 'result'; subtype = 'success'; is_error = $false; result = '' }
+        foreach ($key in $Fields.Keys) { $resultEvent[$key] = $Fields[$key] }
+        $resultEvent | ConvertTo-Json -Compress -Depth 8
+    }
+
+    function New-ReportEvent {
+        # The result event of a member that ended with a structured report.
+        param([hashtable]$Report, [hashtable]$Fields = @{})
+        $all = @{ result = ($Report | ConvertTo-Json -Compress); structured_output = $Report }
+        foreach ($key in $Fields.Keys) { $all[$key] = $Fields[$key] }
+        New-ResultEvent $all
+    }
+
     function Add-StreamEvent([string]$LogPath, [string[]]$Lines) {
         Add-Content -Path $LogPath -Value $Lines -Encoding utf8
     }
@@ -79,7 +102,11 @@ BeforeAll {
             [string[]]$Lines = @(),
             [switch]$Exited,
             # Pretend the log has been silent this long (and fully seen).
-            [int]$IdleMinutes = 0
+            [int]$IdleMinutes = 0,
+            # Make the task's repo a git repo whose origin is this URL.
+            [string]$Origin,
+            # Extra or overriding fields of the task record.
+            [hashtable]$Extra = @{}
         )
         $script:n++
         $dir = Join-Path $script:root "case$($script:n)"
@@ -116,9 +143,30 @@ BeforeAll {
             prUrl          = $null
             result         = $null
         }
+        foreach ($key in $Extra.Keys) { $state[$key] = $Extra[$key] }
         ($state | ConvertTo-Json -Depth 6) | Set-Content -Path (Join-Path $stateDir "$id.json") -Encoding utf8
 
+        if ($Origin) {
+            Invoke-Git @('init', '-q', $dir)
+            Invoke-Git @('-C', $dir, 'remote', 'add', 'origin', $Origin)
+        }
+
         [pscustomobject]@{ Install = $install; Id = $id; Log = $log; Member = $member }
+    }
+
+    function Invoke-FinishedWatch {
+        # Scan a task whose member has exited with these log lines; return the
+        # run, the task record and the one wake it queued (or $null).
+        param([string[]]$Lines, [string]$Origin, [hashtable]$Extra = @{}, [string[]]$Arguments = @())
+        $scenario = New-WatchScenario -Exited -Lines $Lines -Origin $Origin -Extra $Extra
+        $run = Invoke-Watch $scenario $Arguments
+        $wakes = Get-WakeQueue $scenario
+        [pscustomobject]@{
+            Run   = $run
+            State = Get-TestTaskState -InstallRoot $scenario.Install -Id $scenario.Id
+            Wake  = if ($wakes.Count -gt 0) { $wakes[0] } else { $null }
+            Wakes = $wakes
+        }
     }
 
     function Invoke-Watch($Scenario, [string[]]$Arguments = @()) {
@@ -298,5 +346,346 @@ Describe 'dep-watch.ps1 with a member that never exits after its final result' {
         $wakes = Get-WakeQueue $script:hung
         @($wakes | ForEach-Object event) | Should -Be @('stalled', 'completed')
         $wakes[1].summary | Should -Be $script:finalText
+    }
+}
+
+Describe 'dep-watch.ps1 with a result that is a transient API failure' {
+    It 'wakes with interrupted, not failed, for api_error_status <Status>' -ForEach @(
+        @{ Status = 429 }, @{ Status = 500 }, @{ Status = 502 }, @{ Status = 503 }, @{ Status = 529 }
+    ) {
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            (New-ResultEvent @{ is_error = $true; api_error_status = $Status; result = "API Error: $Status upstream trouble" })
+        )
+        $watched.Run.Output | Should -Match ': interrupted \(scout\)'
+        $watched.Wake.event | Should -Be 'interrupted'
+        $watched.State.status | Should -Be 'interrupted'
+    }
+
+    It 'reads the real shape of an overloaded API: success subtype, is_error, status 529' {
+        # Captured from claude 2.1.322 against an endpoint answering 529.
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            ('{"type":"result","subtype":"success","is_error":true,"api_error_status":529,"num_turns":1,' +
+            '"total_cost_usd":0,"duration_ms":184897,"terminal_reason":"api_error","result":"API Error: 529 ' +
+            'Overloaded. This is a server-side issue, usually temporary - try again in a moment."}')
+        )
+        $watched.Wake.event | Should -Be 'interrupted'
+        $watched.Wake.summary | Should -Match 'API Error: 529 Overloaded'
+    }
+
+    It 'recognises <Name> from the text when there is no status field' -ForEach @(
+        @{ Name = 'an overloaded error'; Text = '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}' }
+        @{ Name = 'an API error 503'; Text = 'API Error: 503 Service Unavailable' }
+        @{ Name = 'an API error (429 ...)'; Text = 'API Error (429 {"type":"rate_limit_error"})' }
+    ) {
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            (New-StreamEvent result -IsError $Text)
+        )
+        $watched.Wake.event | Should -Be 'interrupted'
+    }
+
+    It 'says how to continue the member, and that no follow-up was sent yet' {
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            (New-ResultEvent @{ is_error = $true; api_error_status = 529; result = 'API Error: 529 Overloaded.' })
+        )
+        $watched.Wake.followUps | Should -Be 0
+        $watched.Run.Output | Should -Match 'follow-ups sent so far: 0\.'
+        $watched.Run.Output | Should -Match 'dep-send\.ps1" posse-20260101-120000-abc -Message'
+    }
+
+    It 'keeps <Name> as failed' -ForEach @(
+        @{ Name = 'a client error (400)'; Fields = @{ is_error = $true; api_error_status = 400; result = 'API Error: 400 invalid request' } }
+        @{ Name = 'an authentication error (401)'; Fields = @{ is_error = $true; api_error_status = 401; result = 'API Error: 401 unauthorized' } }
+        @{ Name = 'a 404 that mentions an overloaded queue'; Fields = @{ is_error = $true; api_error_status = 404; result = 'API Error: 404 model not found (the overloaded one was retired)' } }
+        @{ Name = 'an error whose text happens to hold the number 500'; Fields = @{ is_error = $true; result = 'The script processed 500 rows and then crashed.' } }
+    ) {
+        $watched = Invoke-FinishedWatch -Lines @((New-StreamEvent init), (New-ResultEvent $Fields))
+        $watched.Wake.event | Should -Be 'failed'
+        $watched.State.status | Should -Be 'failed'
+    }
+
+    It 'reports an error result that has no text by its errors: an exhausted budget is failed' {
+        # Captured from claude 2.1.322 with --max-budget-usd.
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            ('{"type":"result","subtype":"error_max_budget_usd","is_error":true,"api_error_status":null,' +
+            '"result":null,"errors":["Reached maximum budget ($0.0001)"],"num_turns":1,"total_cost_usd":0.0147}')
+        )
+        $watched.Wake.event | Should -Be 'failed'
+        $watched.Wake.summary | Should -Be 'Reached maximum budget ($0.0001)'
+        $watched.State.result | Should -Be 'Reached maximum budget ($0.0001)'
+    }
+
+    It 'names the subtype when an error result says nothing at all' {
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            (New-ResultEvent @{ subtype = 'error_max_turns'; is_error = $true; result = $null })
+        )
+        $watched.Wake.event | Should -Be 'failed'
+        $watched.Wake.summary | Should -Match 'error_max_turns'
+    }
+}
+
+Describe 'dep-watch.ps1 with a structured final report' {
+    It 'completes on status done, with the summary and tests as the result' {
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            (New-ReportEvent @{ status = 'done'; summary = 'Fixed the flaky test.'; tests = 'npm test: 42 passed' })
+        )
+        $watched.Run.Output | Should -Match ': completed \(scout\)'
+        $watched.Wake.event | Should -Be 'completed'
+        $watched.Wake.summary | Should -Be 'Fixed the flaky test. Tests: npm test: 42 passed'
+        $watched.Wake.question | Should -BeNullOrEmpty
+        $watched.State.status | Should -Be 'completed'
+        $watched.State.result | Should -Be "Fixed the flaky test.`n`nTests: npm test: 42 passed"
+        $watched.State.report.status | Should -Be 'done'
+        $watched.State.report.tests | Should -Be 'npm test: 42 passed'
+        # Not a wake that is answered with dep-send.ps1
+        $watched.Run.Output | Should -Not -Match 'follow-ups sent so far'
+    }
+
+    It 'wakes with <Status> and carries the question' -ForEach @(
+        @{ Status = 'blocked'; Question = 'The staging database is unreachable. Can you restart it?' }
+        @{ Status = 'needs-decision'; Question = 'Keep the v1 endpoint or remove it? I recommend keeping it.' }
+    ) {
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            (New-ReportEvent @{ status = $Status; summary = 'Stopped half way.'; question = $Question })
+        )
+        $watched.Run.Output | Should -Match ": $Status \(scout\)"
+        $watched.Run.Output | Should -Match ('question: ' + [regex]::Escape($Question))
+        $watched.Run.Output | Should -Match 'follow-ups sent so far: 0\. Answer in the same session with: .*dep-send\.ps1'
+        $watched.Wake.event | Should -Be $Status
+        $watched.Wake.question | Should -Be $Question
+        # The question has a line of its own, so the summary does not repeat it
+        $watched.Wake.summary | Should -Be 'Stopped half way.'
+        $watched.State.status | Should -Be $Status
+        $watched.State.report.question | Should -Be $Question
+        $watched.State.result | Should -Be "Stopped half way.`n`nQuestion: $Question"
+    }
+
+    It 'leaves a blocked task out of the tasks a watcher still watches' {
+        $scenario = New-WatchScenario -Exited -Lines @(
+            (New-StreamEvent init),
+            (New-ReportEvent @{ status = 'blocked'; summary = 'Stuck.'; question = 'Which way?' })
+        )
+        $null = Invoke-Watch $scenario
+        $again = Invoke-Watch $scenario
+        $again.Output | Should -Not -Match '\[wake\]'
+        (Get-WakeQueue $scenario).Count | Should -Be 1
+    }
+
+    It 'fails on status failed' {
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            (New-ReportEvent @{ status = 'failed'; summary = 'The migration cannot be written without the schema.' })
+        )
+        $watched.Wake.event | Should -Be 'failed'
+        $watched.State.status | Should -Be 'failed'
+        $watched.State.report.status | Should -Be 'failed'
+    }
+
+    It 'lets an error result win over a structured report' {
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            (New-ReportEvent @{ status = 'done'; summary = 'All good.' } @{ is_error = $true; api_error_status = 529 })
+        )
+        $watched.Wake.event | Should -Be 'interrupted'
+        $watched.State.report | Should -BeNullOrEmpty
+    }
+
+    It 'falls back to the text when <Name>' -ForEach @(
+        @{ Name = 'there is no structured output'; Fields = @{ result = 'Plain text report.' } }
+        @{ Name = 'the structured output is null'; Fields = @{ result = 'Plain text report.'; structured_output = $null } }
+        @{ Name = 'the status is not one of the four'; Fields = @{ result = 'Plain text report.'; structured_output = @{ status = 'finished'; summary = 'x' } } }
+        @{ Name = 'the structured output is not an object'; Fields = @{ result = 'Plain text report.'; structured_output = 'done' } }
+    ) {
+        $watched = Invoke-FinishedWatch -Lines @((New-StreamEvent init), (New-ResultEvent $Fields))
+        $watched.Wake.event | Should -Be 'completed'
+        $watched.Wake.summary | Should -Be 'Plain text report.'
+        $watched.State.result | Should -Be 'Plain text report.'
+        $watched.State.report | Should -BeNullOrEmpty
+    }
+
+    Context 'the pull request URL' {
+        It 'trusts the prUrl field when it points at the task''s own repo' {
+            $watched = Invoke-FinishedWatch -Origin 'https://github.com/acme/widgets.git' -Lines @(
+                (New-StreamEvent init),
+                (New-ReportEvent @{ status = 'done'; summary = 'Opened the PR.'; prUrl = 'https://github.com/acme/widgets/pull/7' })
+            )
+            $watched.State.prUrl | Should -Be 'https://github.com/acme/widgets/pull/7'
+            $watched.Wake.prUrl | Should -Be 'https://github.com/acme/widgets/pull/7'
+            $watched.Wake.prUrlRejected | Should -BeNullOrEmpty
+        }
+
+        It 'rejects a prUrl field that points at another repo' {
+            $watched = Invoke-FinishedWatch -Origin 'https://github.com/acme/widgets.git' -Lines @(
+                (New-StreamEvent init),
+                (New-ReportEvent @{ status = 'done'; summary = 'Opened the PR.'; prUrl = 'https://github.com/evil/widgets/pull/7' })
+            )
+            $watched.State.prUrl | Should -BeNullOrEmpty
+            $watched.State.prUrlRejected | Should -Be 'https://github.com/evil/widgets/pull/7'
+            $watched.Run.Output | Should -Match 'pr REJECTED'
+        }
+
+        It 'rejects a prUrl field that is not a pull request URL' {
+            $watched = Invoke-FinishedWatch -Origin 'https://github.com/acme/widgets.git' -Lines @(
+                (New-StreamEvent init),
+                (New-ReportEvent @{ status = 'done'; summary = 'Opened the PR.'; prUrl = 'see the branch on the server' })
+            )
+            $watched.State.prUrl | Should -BeNullOrEmpty
+            $watched.State.prUrlRejected | Should -Be 'see the branch on the server'
+        }
+
+        It 'does not go looking in the summary when the report has no prUrl field' {
+            # With a structured report the URL has a field of its own; a URL
+            # mentioned in prose is a reference, not the task's PR.
+            $watched = Invoke-FinishedWatch -Origin 'https://github.com/acme/widgets.git' -Lines @(
+                (New-StreamEvent init),
+                (New-ReportEvent @{ status = 'done'; summary = 'Same fix as https://github.com/acme/widgets/pull/3.' })
+            )
+            $watched.State.prUrl | Should -BeNullOrEmpty
+            $watched.State.prUrlRejected | Should -BeNullOrEmpty
+        }
+
+        It 'still finds the URL in a plain text result, and still checks the repo' {
+            $own = Invoke-FinishedWatch -Origin 'git@github.com:acme/widgets.git' -Lines @(
+                (New-StreamEvent init),
+                (New-StreamEvent result 'Done. PR: https://github.com/Acme/Widgets/pull/9')
+            )
+            $own.State.prUrl | Should -Be 'https://github.com/Acme/Widgets/pull/9'
+
+            $foreign = Invoke-FinishedWatch -Origin 'git@github.com:acme/widgets.git' -Lines @(
+                (New-StreamEvent init),
+                (New-StreamEvent result 'Done. PR: https://github.com/evil/widgets/pull/9')
+            )
+            $foreign.State.prUrl | Should -BeNullOrEmpty
+            $foreign.State.prUrlRejected | Should -Be 'https://github.com/evil/widgets/pull/9'
+        }
+    }
+}
+
+Describe 'dep-watch.ps1 recording what a run cost' {
+    It 'persists total_cost_usd, num_turns and duration_ms from the final result' {
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            (New-ResultEvent @{ result = 'Done.'; total_cost_usd = 1.2345; num_turns = 12; duration_ms = 61000 })
+        )
+        $watched.State.totalCostUsd | Should -Be 1.2345
+        $watched.State.numTurns | Should -Be 12
+        $watched.State.durationMs | Should -Be 61000
+    }
+
+    It 'records them for an interrupted run too' {
+        $watched = Invoke-FinishedWatch -Lines @(
+            (New-StreamEvent init),
+            (New-ResultEvent @{ is_error = $true; api_error_status = 529; result = 'API Error: 529'; total_cost_usd = 0.5; num_turns = 3; duration_ms = 1000 })
+        )
+        $watched.State.totalCostUsd | Should -Be 0.5
+        $watched.State.numTurns | Should -Be 3
+    }
+
+    It 'takes the session total for cost and adds up turns and duration after a follow-up' {
+        # A resumed run reports the cost of the whole session so far, but only
+        # its own turns and duration (observed on claude 2.1.322).
+        $watched = Invoke-FinishedWatch -Extra @{ totalCostUsd = 2.0; numTurns = 10; durationMs = 5000 } -Lines @(
+            (New-StreamEvent init),
+            (New-ResultEvent @{ result = 'Done.'; total_cost_usd = 2.75; num_turns = 4; duration_ms = 3000 })
+        )
+        $watched.State.totalCostUsd | Should -Be 2.75
+        $watched.State.numTurns | Should -Be 14
+        $watched.State.durationMs | Should -Be 8000
+    }
+
+    It 'never lowers the recorded cost' {
+        # A run cut off before its first request reports a cost of 0.
+        $watched = Invoke-FinishedWatch -Extra @{ totalCostUsd = 2.0 } -Lines @(
+            (New-StreamEvent init),
+            (New-ResultEvent @{ is_error = $true; api_error_status = 529; result = 'API Error: 529'; total_cost_usd = 0 })
+        )
+        $watched.State.totalCostUsd | Should -Be 2.0
+    }
+
+    It 'leaves the usage alone when the result carries none' {
+        $watched = Invoke-FinishedWatch -Lines @((New-StreamEvent init), (New-StreamEvent result 'Done.'))
+        $watched.State.PSObject.Properties['totalCostUsd'] | Should -BeNullOrEmpty
+    }
+
+    It 'shows the cost in dep-posse.ps1 status and result' {
+        $scenario = New-WatchScenario -Exited -Lines @(
+            (New-StreamEvent init),
+            (New-ResultEvent @{ result = 'Done.'; total_cost_usd = 3.456; num_turns = 7; duration_ms = 90000 })
+        )
+        $null = Invoke-Watch $scenario
+        $status = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-posse.ps1' -Arguments @('status')
+        $status.Output | Should -Match '\bCost\b'
+        $status.Output | Should -Match '\$3\.46'
+        $result = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-posse.ps1' -Arguments @('result', $scenario.Id)
+        $result.Output | Should -Match 'Cost: \$3\.46 over 7 turn\(s\), 90s of member time'
+    }
+
+    It 'shows a dash for a task whose cost is not known' {
+        $scenario = New-WatchScenario -Lines @((New-StreamEvent init))
+        $status = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-posse.ps1' -Arguments @('status')
+        $status.ExitCode | Should -Be 0
+        $status.Output | Should -Match '\bCost\b'
+        $status.Output | Should -Not -Match '\$'
+    }
+}
+
+Describe 'dep-watch.ps1 with a resumed member' {
+    BeforeAll {
+        # The log of a task dep-send.ps1 resumed: the first run and its result,
+        # the follow-up marker, and nothing from the resumed run yet.
+        $firstRun = @(
+            (New-StreamEvent init),
+            (New-ReportEvent @{ status = 'needs-decision'; summary = 'First run.'; question = 'Which way?' }),
+            '{"type":"deputy","subtype":"follow_up","number":1,"message":"Go left."}'
+        )
+        $script:resumed = New-WatchScenario -Exited -Lines $firstRun
+        $offset = (Get-Item $script:resumed.Log).Length
+        $statePath = Join-Path $script:resumed.Install 'state' "$($script:resumed.Id).json"
+        $state = Get-Content $statePath -Raw | ConvertFrom-Json
+        $state | Add-Member -NotePropertyName logOffset -NotePropertyValue $offset
+        $state | Add-Member -NotePropertyName followUps -NotePropertyValue @(@{ number = 1; message = 'Go left.' })
+        ($state | ConvertTo-Json -Depth 6) | Set-Content -Path $statePath -Encoding utf8
+
+        $script:silentRun = Invoke-Watch $script:resumed
+        $script:silentStatus = (Get-TestTaskState -InstallRoot $script:resumed.Install -Id $script:resumed.Id).status
+    }
+
+    It 'does not report the earlier run''s result as the resumed run''s' {
+        $script:silentRun.Output | Should -Not -Match '\[wake\]'
+        $script:silentStatus | Should -Be 'running'
+    }
+
+    It 'reports the resumed run''s own result, with the follow-up counted' {
+        Add-StreamEvent $script:resumed.Log @(
+            (New-StreamEvent init),
+            (New-ReportEvent @{ status = 'blocked'; summary = 'Second run.'; question = 'And now?' })
+        )
+        $run = Invoke-Watch $script:resumed
+        $run.Output | Should -Match ': blocked \(scout\)'
+        $run.Output | Should -Match 'follow-ups sent so far: 1\.'
+        $wake = (Get-WakeQueue $script:resumed)[0]
+        $wake.summary | Should -Be 'Second run.'
+        $wake.question | Should -Be 'And now?'
+        $wake.followUps | Should -Be 1
+    }
+
+    It 'reports a resumed run that wrote nothing as died, not as completed' {
+        $scenario = New-WatchScenario -Exited -Lines @(
+            (New-StreamEvent init),
+            (New-StreamEvent result 'First run finished.'),
+            '{"type":"deputy","subtype":"follow_up","number":1,"message":"Carry on."}'
+        ) -Extra @{ logOffset = 100000 }
+        # Its offset is past the end of the log: the resumed run has no output.
+        $run = Invoke-Watch $scenario @('-DeadSeconds', '0')
+        $run.Output | Should -Match ': died \(scout\)'
+        $run.Output | Should -Match 'without a result'
+        $run.Output | Should -Not -Match 'First run finished'
     }
 }

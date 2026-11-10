@@ -4,7 +4,7 @@ Talk to one deputy. Ship with a posse.
 
 Deputy turns a single Claude Code session into a supervisor for a posse of isolated, headless coding agents on **Windows**. You (the Sheriff) talk to one agent (the Deputy); it dispatches tasks to posse members that each run in their own [treehouse](https://github.com/kunchenguid/treehouse) git worktree, supervises them through a zero-token watcher, and brings you back finished pull requests or investigation reports.
 
-Deputy is a native PowerShell reimagining of [firstmate](https://github.com/kunchenguid/firstmate). Where firstmate supervises interactive agents through tmux panes, Deputy runs posse members headless (`claude -p --output-format stream-json`) and supervises them through structured event logs - no terminal multiplexer required.
+Deputy is a native PowerShell reimagining of [firstmate](https://github.com/kunchenguid/firstmate). Where firstmate supervises interactive agents through tmux panes, Deputy runs posse members headless (`claude -p --output-format stream-json`) and supervises them through structured event logs - no terminal multiplexer required. A member is not one shot: its session can be resumed with a follow-up message, so a question, a correction or an API outage costs one line instead of a restart.
 
 ## How it works
 
@@ -20,10 +20,14 @@ posse member ......   ship: implement + test + commit    scout: investigate
    |
    v
 dep-watch.ps1 ..... polls stream-json logs + process liveness; wakes the
-   |                Deputy only on: completed / failed / died / stalled.
+   |                Deputy only on: completed / failed / interrupted /
+   |                blocked / needs-decision / died / stalled.
    |                Started by the session's Stop hook, and every wake is
    |                queued until acknowledged (dep-wake.ps1), so a restart
    |                or an API error loses nothing
+   |
+   |  dep-send.ps1 (interrupted, blocked, needs-decision: resume the member's
+   |                session with a follow-up; it carries on where it was)
    v
 delivery .......... direct-pr:   member already pushed and opened the PR
                     no-mistakes: dep-validate.ps1 gates the branch, then
@@ -75,6 +79,9 @@ pwsh -NoProfile -File bin\dep-watch.ps1 -Wait
 pwsh -NoProfile -File bin\dep-wake.ps1 drain
 pwsh -NoProfile -File bin\dep-wake.ps1 ack -Through <seq>
 
+# answer a member that asked, or continue one that was cut off (its process must have exited)
+pwsh -NoProfile -File bin\dep-send.ps1 <taskId> -Message "Continue where you left off."
+
 # inspect
 pwsh -NoProfile -File bin\dep-posse.ps1 status
 pwsh -NoProfile -File bin\dep-posse.ps1 logs <taskId>
@@ -98,20 +105,21 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | Command | What it does |
 | --- | --- |
 | `dep-doctor.ps1` | Toolchain check: PowerShell 7+, `git` / `gh` / `claude` / `treehouse` on PATH, `gh auth status`, treehouse at least 3.0.1 with `get --lease`, and the Deputy clone on its default branch and not behind `origin`. One line per problem, each naming its fix; prints nothing when healthy. Exit 0 healthy, 1 on any problem. Report only - it never installs, updates or pulls |
-| `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>]` | Lease a worktree, launch a headless posse member, register task state. Refuses to lease when treehouse fails the doctor's version check |
-| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n]` | Scan tasks for wake events; `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as completed (or failed) only when its final `result` event has arrived AND the member process has exited - a `result` seen while the process is alive is interim (the member may be waiting on background helpers) and wakes nobody. A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90). Every wake is appended to the durable queue with a sequence number before its task record is updated. One watcher at a time: it holds `state\watcher.lock` and touches `state\watcher.beat` on every poll, and a second one says so and exits 0 (see "Wakes that survive") |
+| `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>] [-Effort low\|medium\|high\|xhigh\|max] [-MaxBudgetUsd <n>]` | Lease a worktree, launch a headless posse member, register task state. The session gets an id Deputy chose (`--session-id`, kept as `sessionId` in task state) and the task id as its name, so it can be resumed. `-Effort` and `-MaxBudgetUsd` become `--effort` and `--max-budget-usd`; both default to the config and are left off when that is `null`. Refuses to lease when treehouse fails the doctor's version check |
+| `dep-send.ps1 <taskId> -Message <text>` | Send a follow-up to a member whose process has exited: starts `claude -p --resume <sessionId>` in the task's worktree with the message on stdin and the same flags as the first run, appends to the same log, sets the task back to `running` and records the follow-up in task state. Refuses while the member is alive, when the watcher has not reported the run's outcome yet, and when the worktree is gone (see "Resumable members") |
+| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n]` | Scan tasks for wake events; `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as completed (or failed, interrupted, blocked, needs-decision) only when its final `result` event has arrived AND the member process has exited - a `result` seen while the process is alive is interim (the member may be waiting on background helpers) and wakes nobody. What the final result means is in "Resumable members". A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90). Every wake is appended to the durable queue with a sequence number before its task record is updated. One watcher at a time: it holds `state\watcher.lock` and touches `state\watcher.beat` on every poll, and a second one says so and exits 0 (see "Wakes that survive") |
 | `dep-wake.ps1 drain` | Print every unacknowledged wake, oldest first, with what its task looks like now. The last line is the exact `ack -Through <seq>` command for what was printed. Changes nothing |
 | `dep-wake.ps1 ack -Through <seq>` | Remove the wakes at or below `<seq>` from the queue, atomically and under the state lock. Refuses a sequence that was never handed out |
 | `dep-session-start.ps1 [-Hook]` | Session-start report: doctor lines, `dep-posse.ps1 status`, watcher health, the drained queue. Always exits 0. Run by the `SessionStart` hook |
 | `dep-hook-guard.ps1`, `dep-hook-stop.ps1` | The `Stop` / `StopFailure` hooks. Not for running by hand (see "Wakes that survive") |
-| `dep-posse.ps1 status [-Watch]` | Posse table: status, liveness, age, PR; `-Watch` auto-refreshes with recent wakes |
-| `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw] [-Follow]` | Human-readable log tail (or raw stream-json); `-Follow` live-tails |
-| `dep-posse.ps1 result <taskId>` | Final report text, scout report path, PR URL |
+| `dep-posse.ps1 status [-Watch]` | Posse table: status, liveness, age, gate, cost, PR; `-Watch` auto-refreshes with recent wakes |
+| `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw] [-Follow]` | Human-readable log tail (or raw stream-json), follow-ups shown as `[send]` lines; `-Follow` live-tails |
+| `dep-posse.ps1 result <taskId>` | Final report text, the status the member reported, follow-ups sent, cost, scout report path, PR URL |
 | `dep-posse.ps1 kill <taskId>` | Stop a runaway member's process tree (lease kept for inspection). Kills only processes proven to be the task's - see "What Deputy will kill" |
 | `dep-validate.ps1 <taskId>` | Run the no-mistakes gate in the task's worktree; commits evidence on pass. Exit 0 passed, 1 failed, 2 unverified (no commands to run) |
 | `dep-publish.ps1 <taskId> [-AllowUnverified]` | Push the branch and open the PR; refuses a failed or unverified gate. `-AllowUnverified` is the Sheriff's opt-in for repos with no gate, and labels the PR as never validated |
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <taskId> [-Method squash\|merge\|rebase]` | PR operations via gh (merge defaults to squash; branch cleanup happens in dep-return) |
-| `dep-return.ps1 <taskId>` | Kill stragglers (same proof as `kill`), return the lease (guarded by `--if-lease-id`), delete the task branch, archive state |
+| `dep-return.ps1 <taskId>` | Kill stragglers (same proof as `kill`), return the lease (guarded by `--if-lease-id`), delete the task branch, archive state. After this the task can no longer be resumed |
 | `dep-dashboard.ps1 [-Id <taskId>] [-Tail n]` | Live posse view in Windows Terminal: auto-refreshing status tab + a live-tail tab per active member. Re-running adds new members' tabs to the same window; `-Id` opens one task (active or archived) |
 
 Inside a Deputy session, the `/dashboard` skill (`.claude\skills\dashboard`) opens the same posse view on request.
@@ -151,6 +159,59 @@ The two `Stop` hooks cooperate: the guard gives the watcher that the other hook 
 | The guard's block, its give-up warning (`systemMessage`) and the `StopFailure` repeat, with the real scripts under a live session | - | not checked live; covered by the Pester suite against the scripts as processes |
 
 In print mode (`claude -p`) Claude Code waits for an `asyncRewake` hook instead of going idle, so a one-shot Deputy is simply held until the wake arrives.
+
+## Resumable members
+
+A member used to be one shot: it could not ask a question, be corrected, or be continued after an outage. The only answer to any of those was a respawn, which starts from nothing and pays a second time for a context that can cost several dollars to build. Three things change that.
+
+**A session Deputy can name.** `dep-spawn.ps1` generates a UUID per task, starts the member with `--session-id <uuid> -n <taskId>` and keeps the id as `sessionId` in task state. `dep-send.ps1 <taskId> -Message <text>` then starts `claude -p --resume <sessionId>` in the same worktree, with the message on stdin and the same flags as the first run - permissions, model, effort, budget and report schema belong to the process, not to the stored session, so a resumed run is given them again. The member carries on with everything it knew. It can be sent to any task whose process has exited and whose worktree is still leased, whatever its status; `dep-return.ps1` ends that.
+
+**A structured final report.** Every member runs with `--json-schema`, so its last message is an object, not prose to be guessed at:
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `done`, `blocked`, `needs-decision` or `failed` (required) |
+| `summary` | What it did and found, or what stopped it (required) |
+| `tests` | The commands it ran and their results |
+| `question` | What it needs answered, when `blocked` or `needs-decision` |
+| `prUrl` | The pull request it opened (`direct-pr` delivery only) |
+
+The watcher reads `structured_output` from the final `result` event and keeps it as `report` in task state; `result` holds the same report as readable text, which is also what `dep-publish.ps1` puts in the PR body. A result without a report that follows the schema is handled as text, as before. A PR URL is still only trusted when it points at the task's own repo, whether it came from the `prUrl` field or from the text; anything else is kept as `prUrlRejected` and shown as rejected.
+
+**Wakes that say what to do next.** The final result decides the wake, and the task's status takes the same name:
+
+| Final result | Wake | Answer |
+| --- | --- | --- |
+| report `done`, or plain text | `completed` | validate and publish, or read the report |
+| report `blocked` | `blocked` | answer the member's question with `dep-send.ps1` |
+| report `needs-decision` | `needs-decision` | get the Sheriff's decision, pass it on with `dep-send.ps1` |
+| report `failed`, or an error result | `failed` | diagnose; correct it with `dep-send.ps1`, respawn, or escalate |
+| error result from a transient server failure: `api_error_status` 429, 500, 502, 503 or 529, or a text naming one of those API errors or `overloaded` | `interrupted` | `dep-send.ps1 <taskId> -Message "Continue where you left off."` once, then escalate |
+
+`interrupted`, `blocked` and `needs-decision` wakes print the member's question, how many follow-ups the task has already been sent, and the `dep-send.ps1` command. They go through the same durable queue as every other wake.
+
+**One log, several runs.** A resumed run appends to the task's log. `dep-send.ps1` first writes a marker line (`{"type":"deputy","subtype":"follow_up",...}`, shown as `[send]` by `dep-posse.ps1 logs`) and records the byte offset after it as `logOffset`; the watcher reads results only from there on, so an earlier run's result is never mistaken for the resumed run's. A resumed run that writes nothing ends as `died`, not as a second `completed`. Each follow-up is kept in task state (`followUps`: number, time, the status it answered, pid, message) and its text in `state\<taskId>-followup-<n>.md`.
+
+**A follow-up reopens the gate.** The member is about to change the branch, so `dep-send.ps1` clears `validation` and its notes; `dep-validate.ps1` has to judge the branch again. `dep-publish.ps1` opens a PR once and does not push to it again, so follow-ups belong before publishing.
+
+**Cost.** The watcher keeps `total_cost_usd`, `num_turns` and `duration_ms` from each final result as `totalCostUsd`, `numTurns` and `durationMs`, and `dep-posse.ps1 status` shows the cost per task. `--max-budget-usd` caps one run: a member that reaches it ends as `failed` with `Reached maximum budget`, and a resumed run gets the cap afresh.
+
+**What was verified on a real Claude Code** (2.1.322, Windows 11), by hand, in a throwaway git repository with a linked worktree under the temp directory and no remote:
+
+| Behaviour | Result |
+| --- | --- |
+| `claude -p --session-id <uuid> -n <name>` uses the given id | works: the `init` and `result` events carry it |
+| `--json-schema` in print mode | works: the `result` event has `structured_output` as an object, and `result` holds the same JSON as text |
+| `claude -p --resume <uuid>` on a print-mode session that had finished and exited | works: same session id, the member recalled a codeword it had only been told in the first run, and it edited the file it had created |
+| A second and a third resume of the same session | works |
+| Resuming a session whose first run ended on an API error, with "Continue where you left off." | works: the session resumes under the same id. The first run had been cut off before any model output, so there was nothing to continue from but the prompt |
+| The shape of a transient API failure (a local endpoint answering 529 to every request) | ten retries over about three minutes, then exit 1 and a `result` with `subtype: success`, `is_error: true`, `api_error_status: 529` and the text `API Error: 529 Overloaded...` |
+| The shape of an exhausted budget | exit 1 and a `result` with `subtype: error_max_budget_usd`, `is_error: true`, `result: null` and `errors: ["Reached maximum budget ($...)"]` |
+| What `total_cost_usd` counts after a resume | the whole session: a resumed run reported the running total, not its own cost. `num_turns` and `duration_ms` were per run. So Deputy keeps the latest cost and adds up the other two |
+| What `--max-budget-usd` counts after a resume | the run: a resume with a cap below what the session had already cost still ran to the end |
+| `--resume` with a session id that does not exist | exit 1, `No conversation found with session ID` on stderr, and an `error_during_execution` result: the task ends as `failed` |
+| The real scripts end to end against the real CLI (a throwaway Deputy home; `treehouse` replaced by a shim that leased a linked worktree of the throwaway repo): `dep-spawn.ps1`, a `needs-decision` wake carrying the member's question, `dep-send.ps1` with the decision, a `completed` wake | works: both runs carried the session id from task state, the resumed run appended to the same log after the `[send]` marker, committed the file it had created in the first run, and quoted a codeword from the briefing |
+| The same against a real treehouse lease | not checked: the hand runs deliberately left the real worktree pool alone |
 
 ## What Deputy will kill
 
@@ -248,19 +309,21 @@ Two traps worth knowing:
 | `stallMinutes` | `10` | Minutes without log activity before a stalled wake |
 | `branchPrefix` | `deputy/` | Branch name prefix for ship tasks |
 | `autoWatch` | `true` | Whether the `Stop` / `StopFailure` hook runs the watcher and rewakes the session (see "Wakes that survive") |
+| `effort` | `null` | Default `--effort` for posse members: `low`, `medium`, `high`, `xhigh` or `max` (`null` = leave the flag off). `dep-spawn.ps1 -Effort` overrides it |
+| `maxBudgetUsd` | `null` | Default `--max-budget-usd` for one run of a posse member (`null` = no cap). `dep-spawn.ps1 -MaxBudgetUsd` overrides it |
 
 ## Layout
 
 ```
-bin\        toolbelt (dep-doctor, dep-spawn, dep-watch, dep-wake, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-dashboard, dep-lib)
+bin\        toolbelt (dep-doctor, dep-spawn, dep-send, dep-watch, dep-wake, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-dashboard, dep-lib)
             and the session hooks (dep-session-start, dep-hook-guard, dep-hook-stop)
 .claude\    settings.json (the session hooks), skills\
 config\     deputy.json, projects.json
 tools\      Deputy's own gate: Invoke-Lint.ps1, Invoke-Tests.ps1, plus the module pins (gate-modules.psd1) and Install-GateModules.ps1
 tests\      Pester suite for the toolbelt
 .github\    workflows\ci.yml runs the gate on pull requests and pushes to main
-state\      one json per task, wake-queue.jsonl + wake-queue.seq, watcher.lock + watcher.beat,
-            hook counters, scout reports, validation records, archive\                         (runtime)
+state\      one json per task, briefings and follow-up messages, wake-queue.jsonl + wake-queue.seq,
+            watcher.lock + watcher.beat, hook counters, scout reports, validation records, archive\ (runtime)
 logs\       <taskId>.jsonl stream logs + stderr                                                (runtime)
 AGENTS.md   the Deputy's operating contract (harness-neutral)
 CLAUDE.md   loads AGENTS.md into Claude Code sessions
@@ -283,7 +346,7 @@ Both run on exact module versions pinned in `tools\gate-modules.psd1`, and refus
 pwsh -NoProfile -File tools\Install-GateModules.ps1
 ```
 
-The tests build throwaway git repos and throwaway Deputy installs under `$env:TEMP` - no network, and they never touch the real `state\` or `logs\`. They need only `git` and `pwsh`: no treehouse, no claude, and no signed-in `gh`.
+The tests build throwaway git repos and throwaway Deputy installs under `$env:TEMP` - no network, and they never touch the real `state\` or `logs\`. They need only `git` and `pwsh`: no treehouse, no claude, and no signed-in `gh`. Where a test has to see what a member process was given (`dep-spawn.ps1`, `dep-send.ps1`), fake `claude` and `treehouse` shims go first on `PATH`.
 
 ### CI
 

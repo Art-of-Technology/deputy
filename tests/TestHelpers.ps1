@@ -191,6 +191,87 @@ function New-StreamResultLine {
     } | ConvertTo-Json -Compress
 }
 
+function New-MemberShims {
+    <#
+    .SYNOPSIS
+    Fake claude and treehouse executables for end-to-end runs of dep-spawn.ps1
+    and dep-send.ps1. Put the returned directory first on PATH.
+
+    The claude shim prints an init event and a result event - the content of
+    claude-result.json in its own directory when that file exists, a plain
+    success otherwise - and then records the invocation as one JSON line in
+    claude-calls.jsonl: its arguments, what it read on stdin, its working
+    directory and the DEPUTY_POSSE_TASK marker. The treehouse shim passes the
+    doctor's checks, leases the worktree named in lease.json, lists no
+    processes, and logs every invocation to treehouse-calls.log.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [string]$LeasePath)
+    New-Item -ItemType Directory -Force $Path | Out-Null
+    $Path = (Resolve-Path $Path).Path
+    Set-Content -Path (Join-Path $Path 'claude.cmd') -Encoding ascii -Value @(
+        '@echo off'
+        'pwsh -NoProfile -File "%~dp0fake-claude.ps1" %*'
+    )
+    Set-Content -Path (Join-Path $Path 'fake-claude.ps1') -Encoding utf8 -Value @(
+        '$call = [ordered]@{'
+        '    args   = @($args | ForEach-Object { "$_" })'
+        '    stdin  = [Console]::In.ReadToEnd()'
+        '    cwd    = (Get-Location).Path'
+        '    marker = $env:DEPUTY_POSSE_TASK'
+        '}'
+        '[Console]::Out.WriteLine(''{"type":"system","subtype":"init","session_id":"fake"}'')'
+        '$result = Join-Path $PSScriptRoot ''claude-result.json'''
+        'if (Test-Path $result) { [Console]::Out.WriteLine((Get-Content $result -Raw).Trim()) }'
+        'else { [Console]::Out.WriteLine(''{"type":"result","subtype":"success","is_error":false,"result":"Fake member finished."}'') }'
+        '$line = $call | ConvertTo-Json -Compress -Depth 4'
+        'Add-Content -Path (Join-Path $PSScriptRoot ''claude-calls.jsonl'') -Value $line -Encoding utf8'
+    )
+    Set-Content -Path (Join-Path $Path 'treehouse.cmd') -Encoding ascii -Value @(
+        '@echo off'
+        'echo %*>>"%~dp0treehouse-calls.log"'
+        'if "%1"=="--version" (echo v3.1.8& exit /b 0)'
+        'if "%1"=="get" if "%2"=="--help" (echo       --lease   lease the worktree& exit /b 0)'
+        'if "%1"=="get" (type "%~dp0lease.json" & exit /b 0)'
+        'exit /b 1'
+    )
+    if ($LeasePath) {
+        ([ordered]@{ path = $LeasePath; lease_id = 'lease-test' } | ConvertTo-Json -Compress) |
+            Set-Content -Path (Join-Path $Path 'lease.json') -Encoding ascii
+    }
+    $Path
+}
+
+function Get-MemberShimCalls {
+    # Every recorded invocation of the claude shim, oldest first.
+    param([Parameter(Mandatory)][string]$Path)
+    $log = Join-Path $Path 'claude-calls.jsonl'
+    if (-not (Test-Path $log)) { return , @() }
+    , @(Get-Content $log | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+}
+
+function Wait-MemberShimCall {
+    # Wait until the claude shim has recorded $Count invocations (recording is
+    # its last act, after it wrote its output). True when it has.
+    param([Parameter(Mandatory)][string]$Path, [int]$Count = 1, [int]$TimeoutSeconds = 60)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if ((Get-MemberShimCalls -Path $Path).Count -ge $Count) { return $true }
+        Start-Sleep -Milliseconds 200
+    }
+    $false
+}
+
+function Wait-TestProcessGone {
+    # True when no process with this id is left within the timeout.
+    param([Parameter(Mandatory)][int]$ProcessId, [int]$TimeoutSeconds = 30)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return $true }
+        Start-Sleep -Milliseconds 100
+    }
+    $false
+}
+
 function New-TestRunningTask {
     <#
     .SYNOPSIS
