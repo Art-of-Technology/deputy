@@ -20,7 +20,10 @@ posse member ......   ship: implement + test + commit    scout: investigate
    |
    v
 dep-watch.ps1 ..... polls stream-json logs + process liveness; wakes the
-   |                Deputy only on: completed / failed / died / stalled
+   |                Deputy only on: completed / failed / died / stalled.
+   |                Started by the session's Stop hook, and every wake is
+   |                queued until acknowledged (dep-wake.ps1), so a restart
+   |                or an API error loses nothing
    v
 delivery .......... direct-pr:   member already pushed and opened the PR
                     no-mistakes: dep-validate.ps1 gates the branch, then
@@ -68,6 +71,10 @@ pwsh -NoProfile -File bin\dep-spawn.ps1 -Task "Why is startup slow?" -Repo C:\sr
 # supervise (blocks until something needs you)
 pwsh -NoProfile -File bin\dep-watch.ps1 -Wait
 
+# read the wakes nobody has acknowledged yet, then acknowledge the handled ones
+pwsh -NoProfile -File bin\dep-wake.ps1 drain
+pwsh -NoProfile -File bin\dep-wake.ps1 ack -Through <seq>
+
 # inspect
 pwsh -NoProfile -File bin\dep-posse.ps1 status
 pwsh -NoProfile -File bin\dep-posse.ps1 logs <taskId>
@@ -92,7 +99,11 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | --- | --- |
 | `dep-doctor.ps1` | Toolchain check: PowerShell 7+, `git` / `gh` / `claude` / `treehouse` on PATH, `gh auth status`, treehouse at least 3.0.1 with `get --lease`, and the Deputy clone on its default branch and not behind `origin`. One line per problem, each naming its fix; prints nothing when healthy. Exit 0 healthy, 1 on any problem. Report only - it never installs, updates or pulls |
 | `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>]` | Lease a worktree, launch a headless posse member, register task state. Refuses to lease when treehouse fails the doctor's version check |
-| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n]` | Scan tasks for wake events; `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as completed (or failed) only when its final `result` event has arrived AND the member process has exited - a `result` seen while the process is alive is interim (the member may be waiting on background helpers) and wakes nobody. A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90) |
+| `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n]` | Scan tasks for wake events; `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as completed (or failed) only when its final `result` event has arrived AND the member process has exited - a `result` seen while the process is alive is interim (the member may be waiting on background helpers) and wakes nobody. A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90). Every wake is appended to the durable queue with a sequence number before its task record is updated. One watcher at a time: it holds `state\watcher.lock` and touches `state\watcher.beat` on every poll, and a second one says so and exits 0 (see "Wakes that survive") |
+| `dep-wake.ps1 drain` | Print every unacknowledged wake, oldest first, with what its task looks like now. The last line is the exact `ack -Through <seq>` command for what was printed. Changes nothing |
+| `dep-wake.ps1 ack -Through <seq>` | Remove the wakes at or below `<seq>` from the queue, atomically and under the state lock. Refuses a sequence that was never handed out |
+| `dep-session-start.ps1 [-Hook]` | Session-start report: doctor lines, `dep-posse.ps1 status`, watcher health, the drained queue. Always exits 0. Run by the `SessionStart` hook |
+| `dep-hook-guard.ps1`, `dep-hook-stop.ps1` | The `Stop` / `StopFailure` hooks. Not for running by hand (see "Wakes that survive") |
 | `dep-posse.ps1 status [-Watch]` | Posse table: status, liveness, age, PR; `-Watch` auto-refreshes with recent wakes |
 | `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw] [-Follow]` | Human-readable log tail (or raw stream-json); `-Follow` live-tails |
 | `dep-posse.ps1 result <taskId>` | Final report text, scout report path, PR URL |
@@ -104,6 +115,42 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | `dep-dashboard.ps1 [-Id <taskId>] [-Tail n]` | Live posse view in Windows Terminal: auto-refreshing status tab + a live-tail tab per active member. Re-running adds new members' tabs to the same window; `-Id` opens one task (active or archived) |
 
 Inside a Deputy session, the `/dashboard` skill (`.claude\skills\dashboard`) opens the same posse view on request.
+
+## Wakes that survive
+
+A supervisor is only as good as its wake-up. Deputy used to depend on the model remembering to start the watcher after every wake: if it forgot, if the session was restarted, or if a turn ended on an API error, members finished and nobody was told. Three pieces replace "check back and hope":
+
+**A durable queue.** Every wake gets a sequence number that only ever grows (`state\wake-queue.seq`) and is appended to `state\wake-queue.jsonl` before the task's record is updated - so a watcher killed at the worst moment leaves the wake behind, at the price of possibly reporting it twice, never of losing it. A wake stays queued until it is acknowledged. `dep-wake.ps1 drain` prints what is pending and ends with the exact `ack -Through <seq>` command; the ack removes those rows and nothing newer. The loop is: drain, handle, run the printed ack.
+
+**One watcher, with a heartbeat.** A scanning watcher holds `state\watcher.lock` (its pid and process start time, so a recycled pid is never mistaken for it) and touches `state\watcher.beat` on every poll. A second watcher says a live one already holds the lock and exits 0. The lock of a watcher that is gone is reclaimed; one that is alive but stopped polling is replaced. `Test-WatcherHealthy` in `dep-lib.ps1` is the one definition of healthy: process alive and heartbeat fresh.
+
+**Session hooks**, in the tracked `.claude\settings.json`:
+
+| Hook | Script | What it does |
+| --- | --- | --- |
+| `SessionStart` | `dep-session-start.ps1 -Hook` | Puts the doctor's lines, the posse, the watcher's health and the drained wake queue into the session's context - on startup, resume, `/clear` and compaction |
+| `Stop` (synchronous) | `dep-hook-guard.ps1` | If a task is running or stalled and no healthy watcher reports to this session, blocks the stop with a one-line instruction to start the watcher. At most three blocks in a row (`state\hook-guard.blocks`), then it lets the stop through with a warning to you, and stays that way until a watcher is healthy again |
+| `Stop` and `StopFailure` (`asyncRewake`) | `dep-hook-stop.ps1` | If tasks are active and nothing healthy is watching for this session, runs the watcher in the hook's own foreground; when a wake arrives it exits 2 with the drained queue on stderr, which Claude Code hands to the idle session as a new turn. Also hands over any queued wake the session was never told about. After a `StopFailure` an already-delivered wake is repeated after a cooldown, at most five times, so an API outage cannot become a storm |
+
+The two `Stop` hooks cooperate: the guard gives the watcher that the other hook is starting a few seconds to report healthy, so normally it blocks nothing and only speaks when the automatic start did not work. Set `"autoWatch": false` in `config\deputy.json` to switch the rewake hook off; the queue, the session-start report and the guard keep working, and the guard then asks the Deputy to start the watcher itself.
+
+**The hooks do nothing in a posse worktree.** The same settings file is loaded by posse members working on Deputy itself, and a member that blocked its own stop or ran a watcher would be a second Deputy. Each hook exits at once, silently and without writing anything, when any of these holds: the session was spawned as a posse member (`dep-spawn.ps1` sets `DEPUTY_POSSE_TASK` in its environment), there is no `state\` beside `bin\`, or `.git` is a file (a linked worktree) rather than a directory (a clone).
+
+**One Deputy session per directory.** A hook-started watcher wakes the session that started it. A watcher left by a session that has ended is replaced by the next session's first stop; two live sessions in one Deputy home would keep taking it from each other.
+
+**What was verified on a real Claude Code** (2.1.322, Windows 11, hooks run in exec form through `pwsh`, no Git Bash involved):
+
+| Behaviour | How it was checked | Result |
+| --- | --- | --- |
+| `SessionStart` stdout reaches the model | print mode and the interactive TUI | works |
+| A synchronous `Stop` hook exiting 2 blocks the stop, stderr reaches the model | print mode | works |
+| An `asyncRewake` `Stop` hook exiting 2 wakes an **idle** session | streaming-input session, and the interactive TUI driven through a pseudo console | works |
+| The same on `StopFailure` (turn ended on an API error) | streaming-input session with an unusable model | works: the hook fires and its exit 2 starts a new turn |
+| The real scripts end to end: stop, hook-started watcher, task finishes, idle session woken with the drain, model runs the printed ack | interactive TUI in a throwaway Deputy home | works |
+| Background hook processes end with the session | interactive TUI | they did; the watcher additionally stops when its hook is gone |
+| The guard's block, its give-up warning (`systemMessage`) and the `StopFailure` repeat, with the real scripts under a live session | - | not checked live; covered by the Pester suite against the scripts as processes |
+
+In print mode (`claude -p`) Claude Code waits for an `asyncRewake` hook instead of going idle, so a one-shot Deputy is simply held until the wake arrives.
 
 ## What Deputy will kill
 
@@ -200,16 +247,20 @@ Two traps worth knowing:
 | `watchIntervalSeconds` | `15` | Watcher poll interval |
 | `stallMinutes` | `10` | Minutes without log activity before a stalled wake |
 | `branchPrefix` | `deputy/` | Branch name prefix for ship tasks |
+| `autoWatch` | `true` | Whether the `Stop` / `StopFailure` hook runs the watcher and rewakes the session (see "Wakes that survive") |
 
 ## Layout
 
 ```
-bin\        toolbelt (dep-doctor, dep-spawn, dep-watch, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-dashboard, dep-lib)
+bin\        toolbelt (dep-doctor, dep-spawn, dep-watch, dep-wake, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-dashboard, dep-lib)
+            and the session hooks (dep-session-start, dep-hook-guard, dep-hook-stop)
+.claude\    settings.json (the session hooks), skills\
 config\     deputy.json, projects.json
 tools\      Deputy's own gate: Invoke-Lint.ps1, Invoke-Tests.ps1, plus the module pins (gate-modules.psd1) and Install-GateModules.ps1
 tests\      Pester suite for the toolbelt
 .github\    workflows\ci.yml runs the gate on pull requests and pushes to main
-state\      one json per task, wake-queue.jsonl, scout reports, validation records, archive\   (runtime)
+state\      one json per task, wake-queue.jsonl + wake-queue.seq, watcher.lock + watcher.beat,
+            hook counters, scout reports, validation records, archive\                         (runtime)
 logs\       <taskId>.jsonl stream logs + stderr                                                (runtime)
 AGENTS.md   the Deputy's operating contract (harness-neutral)
 CLAUDE.md   loads AGENTS.md into Claude Code sessions

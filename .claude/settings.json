@@ -1,0 +1,48 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": ["-NoProfile", "-File", "${CLAUDE_PROJECT_DIR}/bin/dep-session-start.ps1", "-Hook"],
+            "timeout": 180
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": ["-NoProfile", "-File", "${CLAUDE_PROJECT_DIR}/bin/dep-hook-guard.ps1"],
+            "timeout": 60
+          },
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": ["-NoProfile", "-File", "${CLAUDE_PROJECT_DIR}/bin/dep-hook-stop.ps1"],
+            "asyncRewake": true,
+            "timeout": 28800
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh",
+            "args": ["-NoProfile", "-File", "${CLAUDE_PROJECT_DIR}/bin/dep-hook-stop.ps1"],
+            "asyncRewake": true,
+            "timeout": 28800
+          }
+        ]
+      }
+    ]
+  }
+}

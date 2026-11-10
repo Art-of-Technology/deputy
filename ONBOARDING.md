@@ -29,7 +29,7 @@ Now check the toolchain. The doctor prints one line per problem, each with the e
 pwsh -NoProfile -File bin\dep-doctor.ps1
 ```
 
-Your Deputy runs the same check at the start of every session and tells you about anything it finds.
+Your Deputy gets the same check at the start of every session - a session hook runs it, together with a report of the posse and of anything that finished while no session was open - and tells you about anything it finds.
 
 ## 3. Launch your Deputy
 

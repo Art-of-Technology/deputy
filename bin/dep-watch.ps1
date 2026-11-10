@@ -12,7 +12,23 @@ Default: one scan, print any events, exit.
 -Wait: block (polling) until at least one actionable event occurs, print it,
 exit 0. Exits 0 immediately if no tasks are active; exits 2 on timeout.
 Designed to run as a background process so the Deputy is woken only when a
-decision is needed.
+decision is needed. Exits 1 only when the watcher lock is held by a process
+that should be replaced and cannot be.
+
+Every wake is appended to the durable queue (state\wake-queue.jsonl) with a
+sequence number before anything else happens, so printing it here is no longer
+the only way it is seen: dep-wake.ps1 drain shows every wake that has not been
+acknowledged, whoever was or was not listening when it fired.
+
+Only one watcher scans at a time. It holds state\watcher.lock (pid plus process
+start time) and touches state\watcher.beat on every poll. If a live watcher
+already holds the lock, this one says so and exits 0 without scanning. The lock
+of a watcher that is gone is reclaimed; a watcher that is alive but no longer
+polling is replaced.
+
+-Session and -OwnerPid are for dep-hook-stop.ps1, which runs the watcher on
+behalf of one Claude session: the session id is recorded in the lock, and the
+watcher exits when the hook process that owns it is gone.
 #>
 [CmdletBinding()]
 [Diagnostics.CodeAnalysis.SuppressMessage('PSReviewUnusedParameter', 'DeadSeconds',
@@ -22,7 +38,9 @@ param(
     [int]$IntervalSeconds = 0,   # 0 = use config
     [int]$StallMinutes = 0,      # 0 = use config
     [int]$DeadSeconds = 90,      # log-silence grace before a dead process counts as died
-    [int]$TimeoutMinutes = 0     # with -Wait: 0 = wait forever
+    [int]$TimeoutMinutes = 0,    # with -Wait: 0 = wait forever
+    [string]$Session = '',       # the Claude session a stop hook runs this watcher for
+    [int]$OwnerPid = 0           # with -Wait: exit when this process is gone
 )
 
 . "$PSScriptRoot\dep-lib.ps1"
@@ -104,6 +122,7 @@ function Test-PrUrlBelongsToRepo([string]$RepoPath, [string]$Owner, [string]$Rep
 
 function New-Wake($Task, [string]$EventName, [string]$Summary) {
     [pscustomobject]@{
+        seq           = 0   # set by Add-WakeEvent
         at            = (Get-Date -Format o)
         taskId        = $Task.id
         event         = $EventName
@@ -117,8 +136,8 @@ function New-Wake($Task, [string]$EventName, [string]$Summary) {
 
 function Invoke-Scan {
     $events = @()
-    $active = @(Get-AllTasks | Where-Object { $_.status -in @('running', 'stalled') })
-    foreach ($task in $active) {
+    foreach ($task in (Get-ActiveTasks)) {
+        $wake = $null
         $size = if (Test-Path $task.stdoutLog) { (Get-Item $task.stdoutLog).Length } else { 0 }
         $alive = Test-TaskProcessAlive $task
 
@@ -150,7 +169,7 @@ function Invoke-Scan {
                     Set-TaskField $task 'prUrlRejected' $Matches[0]
                 }
             }
-            $events += New-Wake $task $task.status (Limit-Text $text 500)
+            $wake = New-Wake $task $task.status (Limit-Text $text 500)
         }
         elseif (-not $alive -and ((Get-Date) - [datetime]$task.lastActivityAt).TotalSeconds -ge $DeadSeconds) {
             # No process (by pid or worktree occupancy) AND the log has been
@@ -170,7 +189,7 @@ function Invoke-Scan {
                 "process exited without a final result; its only result was an interim result: " +
                 (Limit-Text $session.Text 200) + " | stderr: "
             } else { "process exited without a result. stderr: " }
-            $events += New-Wake $task 'died' ($summary + (Limit-Text $errTail 300))
+            $wake = New-Wake $task 'died' ($summary + (Limit-Text $errTail 300))
         }
         elseif ($task.status -eq 'running' -and -not $task.stallNotified) {
             $idleMinutes = ((Get-Date) - [datetime]$task.lastActivityAt).TotalMinutes
@@ -185,41 +204,73 @@ function Invoke-Scan {
                         "process exits (it may be waiting on background helpers, or hung): " +
                         (Limit-Text $session.Text 200)
                 }
-                $events += New-Wake $task 'stalled' $summary
+                $wake = New-Wake $task 'stalled' $summary
             }
         }
 
+        # Queue first, task record second. Once the record says 'completed'
+        # the task is never scanned again, so a watcher killed between the two
+        # writes must leave the wake behind, not the record: the worst case is
+        # then the same wake twice, never a task that finished and told nobody.
+        if ($wake) { $events += Add-WakeEvent $wake }
         Write-TaskState $task
     }
     , $events
 }
 
+$drainHint = 'Drain and acknowledge: ' + (Get-WakeCommand 'drain')
+
+# One watcher at a time, one-shot scans included: two scanners would each see
+# the same finished task and queue its wake twice.
+$claim = Enter-WatcherLock -Session $Session
+if (-not $claim.Acquired) {
+    $holder = $claim.Holder
+    if ($claim.Note) {
+        # Not the clean case: the holder should have been replaced and could
+        # not be, so nothing is scanning. Say so and fail.
+        Write-Output "watch: $($claim.Note). Nothing is scanning the posse. This needs the Sheriff: check what pid $($holder.ProcessId) is."
+        exit 1
+    }
+    $reportsTo = $holder.Session ?
+        "It was started by the stop hook of session $($holder.Session) and wakes that session when a wake fires." :
+        'It reports to whoever started it.'
+    Write-Output ("watch: a live watcher (pid {0}) already holds the watcher lock, so this one is not starting. {1} Every wake also lands in the queue." -f
+        $holder.ProcessId, $reportsTo)
+    Write-Output $drainHint
+    exit 0
+}
+if ($claim.Note) { Write-Output "watch: $($claim.Note)." }
+
 $deadline = if ($Wait -and $TimeoutMinutes -gt 0) { (Get-Date).AddMinutes($TimeoutMinutes) } else { $null }
 
-while ($true) {
-    $events = Invoke-Scan
-    foreach ($e in $events) {
-        Add-WakeEvent $e
-        Write-Output ("[wake] {0}: {1} ({2})" -f $e.taskId, $e.event, $e.kind)
-        if ($e.prUrl) { Write-Output ("  pr: {0}" -f $e.prUrl) }
-        if ($e.prUrlRejected) { Write-Output ("  pr REJECTED (not this task's repo): {0}" -f $e.prUrlRejected) }
-        if ($e.summary) { Write-Output ("  {0}" -f $e.summary) }
+try {
+    while ($true) {
+        Set-WatcherBeat
+        $events = Invoke-Scan
+        foreach ($e in $events) { Format-Wake $e | Write-Output }
+        if ($events.Count -gt 0) {
+            Write-Output $drainHint
+            if ($Wait) { exit 0 } else { break }
+        }
+        if (-not $Wait) {
+            Write-Output "watch: no new events."
+            break
+        }
+        if ((Get-ActiveTasks).Count -eq 0) {
+            Write-Output "watch: no active posse tasks."
+            exit 0
+        }
+        if ($deadline -and (Get-Date) -gt $deadline) {
+            Write-Output "watch: timed out after $TimeoutMinutes minutes with tasks still active."
+            exit 2
+        }
+        if ($OwnerPid -gt 0 -and -not (Get-Process -Id $OwnerPid -ErrorAction SilentlyContinue)) {
+            # The stop hook that ran this watcher is gone, so nothing would
+            # hear its wake. Stand down and let the next session start its own.
+            Write-Output "watch: owner process $OwnerPid is gone; stopping."
+            exit 0
+        }
+        Start-Sleep -Seconds $IntervalSeconds
     }
-    if ($events.Count -gt 0) {
-        if ($Wait) { exit 0 } else { break }
-    }
-    if (-not $Wait) {
-        Write-Output "watch: no new events."
-        break
-    }
-    $stillActive = @(Get-AllTasks | Where-Object { $_.status -in @('running', 'stalled') })
-    if ($stillActive.Count -eq 0) {
-        Write-Output "watch: no active posse tasks."
-        exit 0
-    }
-    if ($deadline -and (Get-Date) -gt $deadline) {
-        Write-Output "watch: timed out after $TimeoutMinutes minutes with tasks still active."
-        exit 2
-    }
-    Start-Sleep -Seconds $IntervalSeconds
 }
+finally { Exit-WatcherLock }
