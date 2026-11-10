@@ -200,6 +200,8 @@ switch ($Action) {
             Write-Output ''
             Write-Output "Anchor: $($task.anchorWarning)"
         }
+        $baseBranch = Get-EventField $task 'baseBranch'
+        if ($baseBranch) { Write-Output "Base branch: $baseBranch" }
         if ($task.prUrl) { Write-Output "PR: $($task.prUrl)" }
         $prHead = Get-EventField $task 'prHead'
         if ($prHead) { Write-Output "  published head: $prHead" }

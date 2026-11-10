@@ -138,7 +138,9 @@ function New-TestTaskState {
         [Parameter(Mandatory)][string]$Worktree,
         [Parameter(Mandatory)][string]$Branch,
         [string]$Id = 'posse-20260101-120000-abc',
-        [string]$Task = 'test task'
+        [string]$Task = 'test task',
+        # The branch the task was cut from, when it is not the default branch.
+        [string]$BaseBranch
     )
     $stateDir = Join-Path $InstallRoot 'state'
     New-Item -ItemType Directory -Force $stateDir | Out-Null
@@ -149,6 +151,7 @@ function New-TestTaskState {
         repo       = $Repo
         worktree   = $Worktree
         branch     = $Branch
+        baseBranch = $BaseBranch ? $BaseBranch : $null
         delivery   = 'no-mistakes'
         validation = $null
         status     = 'completed'
@@ -162,6 +165,23 @@ function New-TestTaskState {
 function Get-TestTaskState {
     param([Parameter(Mandatory)][string]$InstallRoot, [Parameter(Mandatory)][string]$Id)
     Get-Content (Join-Path $InstallRoot 'state' "$Id.json") -Raw | ConvertFrom-Json
+}
+
+function Invoke-DeputyLib {
+    <#
+    .SYNOPSIS
+    Evaluate one dep-lib.ps1 expression in a separate process, from a
+    throwaway install, and return its result parsed from JSON. Throws, with
+    what the process said, when the expression fails.
+
+    In-process tests dot-source the source tree's dep-lib.ps1, which reads the
+    real install's config; this reads the throwaway install's own.
+    #>
+    param([Parameter(Mandatory)][string]$InstallRoot, [Parameter(Mandatory)][string]$Command)
+    $lib = Join-Path $InstallRoot 'bin' 'dep-lib.ps1'
+    $out = & pwsh -NoProfile -Command ". '$lib'; ($Command) | ConvertTo-Json -Depth 8 -Compress" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw ("'$Command' failed: " + (($out | ForEach-Object { "$_" }) -join ' ')) }
+    ($out -join "`n") | ConvertFrom-Json
 }
 
 function Invoke-DeputyScript {
@@ -205,8 +225,14 @@ function New-MemberShims {
     doctor's checks, leases the worktree named in lease.json, lists no
     processes, accepts every `return` without touching the worktree, and logs
     every invocation to treehouse-calls.log.
+
+    When the leased path is a git worktree, the lease does what treehouse
+    does to it: it cuts the slot from the base (--base, else the lease's own
+    base_branch, else where it is), on the new branch -b names, and fails
+    when that branch already exists. -LeaseBase is the base_branch the lease
+    reports when no --base is given, like a pool configured with base_branch.
     #>
-    param([Parameter(Mandatory)][string]$Path, [string]$LeasePath)
+    param([Parameter(Mandatory)][string]$Path, [string]$LeasePath, [string]$LeaseBase)
     New-Item -ItemType Directory -Force $Path | Out-Null
     $Path = (Resolve-Path $Path).Path
     Set-Content -Path (Join-Path $Path 'claude.cmd') -Encoding ascii -Value @(
@@ -231,14 +257,47 @@ function New-MemberShims {
         '@echo off'
         'echo %*>>"%~dp0treehouse-calls.log"'
         'if "%1"=="--version" (echo v3.1.8& exit /b 0)'
-        'if "%1"=="get" if "%2"=="--help" (echo       --lease   lease the worktree& exit /b 0)'
-        'if "%1"=="get" (type "%~dp0lease.json" & exit /b 0)'
+        'if "%1"=="get" if "%2"=="--help" goto help'
+        'if "%1"=="get" goto lease'
         'if "%1"=="return" exit /b 0'
         'exit /b 1'
+        ':help'
+        'echo       --base string     Branch to cut this worktree from'
+        'echo   -b, --branch string   Create and check out a new Git branch at the acquired commit'
+        'echo       --lease           Durably lease a worktree without opening a subshell'
+        'exit /b 0'
+        ':lease'
+        'pwsh -NoProfile -File "%~dp0fake-treehouse-get.ps1" %*'
+        'exit /b %ERRORLEVEL%'
     )
+    Set-Content -Path (Join-Path $Path 'fake-treehouse-get.ps1') -Encoding utf8 -Value @'
+$arguments = @($args | ForEach-Object { "$_" })
+function Get-Flag([string[]]$Names) {
+    for ($i = 0; $i -lt $arguments.Count - 1; $i++) { if ($Names -contains $arguments[$i]) { return $arguments[$i + 1] } }
+    $null
+}
+$leaseFile = Join-Path $PSScriptRoot 'lease.json'
+if (-not (Test-Path $leaseFile)) { [Console]::Error.WriteLine('fake treehouse: no lease.json'); exit 1 }
+$lease = Get-Content $leaseFile -Raw | ConvertFrom-Json
+$branch = Get-Flag @('-b', '--branch')
+$base = Get-Flag @('--base')
+if (-not $base -and $lease.PSObject.Properties['base_branch']) { $base = $lease.base_branch }
+& git -C $lease.path rev-parse --git-dir *> $null
+if ($LASTEXITCODE -eq 0) {
+    $start = if ($base) { $base } else { 'HEAD' }
+    if ($branch) { & git -C $lease.path switch -q -c $branch $start *> $null }
+    elseif ($base) { & git -C $lease.path switch -q --detach $start *> $null }
+    if ($LASTEXITCODE -ne 0) { [Console]::Error.WriteLine("branch ""$branch"" could not be cut from $start"); exit 1 }
+}
+$out = [ordered]@{ path = $lease.path; lease_id = $lease.lease_id }
+if ($base) { $out.base_branch = $base }
+[Console]::Out.WriteLine(($out | ConvertTo-Json -Compress))
+exit 0
+'@
     if ($LeasePath) {
-        ([ordered]@{ path = $LeasePath; lease_id = 'lease-test' } | ConvertTo-Json -Compress) |
-            Set-Content -Path (Join-Path $Path 'lease.json') -Encoding ascii
+        $lease = [ordered]@{ path = $LeasePath; lease_id = 'lease-test' }
+        if ($LeaseBase) { $lease.base_branch = $LeaseBase }
+        ($lease | ConvertTo-Json -Compress) | Set-Content -Path (Join-Path $Path 'lease.json') -Encoding ascii
     }
     $Path
 }

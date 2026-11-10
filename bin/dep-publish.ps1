@@ -14,9 +14,11 @@ about the branch is proven, so publishing is refused too. -AllowUnverified
 overrides that, and is only for the Sheriff's explicit approval: the PR body
 then says in plain text that the branch was never validated.
 
-The first publish records the PR's number and the commit it was opened at
-(`prNumber`, `prHead`) in task state. That head is what dep-pr.ps1 merge later
-insists the PR is still at.
+The first publish opens the PR against the branch the task was cut from: its
+base branch when it was spawned with one (baseBranch in task state, which has
+to be on origin), else the default branch. It records the PR's number and the
+commit it was opened at (`prNumber`, `prHead`) in task state. That head is what
+dep-pr.ps1 merge later insists the PR is still at.
 
 Publishing again is how a follow-up reaches a PR that is already open: after
 dep-send.ps1 the member changed the branch and the gate verdict was cleared, so
@@ -58,7 +60,7 @@ $unverified = ($validation -eq 'unverified')
 if ($unverified -and -not $AllowUnverified) {
     throw ("Refusing to publish: the gate for task $Id ran nothing (validation 'unverified'" +
         $(if ($validationNote) { " - $validationNote" }) + "). Nothing about this branch is verified. " +
-        "Pin gate commands for this repo in config\projects.json and re-run dep-validate.ps1 $Id, or - " +
+        "Pin gate commands for this repo in config\projects.local.json and re-run dep-validate.ps1 $Id, or - " +
         'with the Sheriff explicitly approving an unverified merge - re-run with -AllowUnverified.')
 }
 if (-not $unverified -and $validation -ne 'passed') {
@@ -163,9 +165,20 @@ if ($task.prUrl) {
     exit 0
 }
 
-$anchor = Resolve-DefaultRef $wt
-$defaultBranch = $anchor.Branch
-if (-not $defaultBranch) {
+# The PR targets what the branch was cut from: the task's base branch when it
+# has one, else the default branch. A base branch has to be on origin for a
+# pull request to target it, which is checked before anything is pushed.
+$baseBranch = [string](Get-EventField $task 'baseBranch')
+$anchor = Resolve-BaseRef $wt $baseBranch
+$prBase = $anchor.Branch
+if ($baseBranch) {
+    if ($anchor.Ref -ne "refs/remotes/origin/$baseBranch") {
+        throw ("Refusing to publish: the task's base branch '$baseBranch' is not on origin (there is no origin/$baseBranch here), " +
+            "so no pull request can target it. Push '$baseBranch' to origin (or fetch it, if it is there already), then re-run " +
+            "dep-publish.ps1 $Id. Nothing was pushed.")
+    }
+}
+elseif (-not $prBase) {
     throw "Cannot resolve the default branch of $wt to open a PR against. Is 'origin' configured?"
 }
 
@@ -177,7 +190,7 @@ $body = Get-PrBody
 
 Push-Location $wt
 try {
-    $prOut = gh pr create --base $defaultBranch --head $task.branch --title $title --body $body 2>&1 | Out-String
+    $prOut = gh pr create --base $prBase --head $task.branch --title $title --body $body 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "gh pr create failed: $(Limit-Text $prOut 300)" }
 }
 finally { Pop-Location }
@@ -201,6 +214,6 @@ if ($unverified) { $published['publishedUnverified'] = $true }
 if ($published.Count -gt 0) { Save-Publish $published }
 
 Write-Output "published $Id"
-Write-Output "  branch: $($task.branch) -> $defaultBranch"
+Write-Output "  branch: $($task.branch) -> $prBase"
 Write-Output "  pr:     $($task.prUrl)"
 Write-Output "  head:   $head"

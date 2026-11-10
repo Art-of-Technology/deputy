@@ -13,7 +13,12 @@ function Get-DeputyPaths {
         State      = Join-Path $root 'state'
         Archive    = Join-Path $root 'state' 'archive'
         Logs       = Join-Path $root 'logs'
-        ConfigFile = Join-Path $root 'config' 'deputy.json'
+        # Tracked defaults, and the private overrides each user keeps for
+        # themselves (gitignored). See Get-DeputyConfig and Get-ProjectProfile.
+        ConfigFile        = Join-Path $root 'config' 'deputy.json'
+        LocalConfigFile   = Join-Path $root 'config' 'deputy.local.json'
+        ProjectsFile      = Join-Path $root 'config' 'projects.json'
+        LocalProjectsFile = Join-Path $root 'config' 'projects.local.json'
         WakeQueue  = Join-Path $root 'state' 'wake-queue.jsonl'
         # Runtime files beside the queue. None of them may end in .json: every
         # state\*.json is read as a task (Get-AllTasks).
@@ -64,8 +69,54 @@ function Initialize-Deputy {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Configuration. Each file comes in two layers: the tracked defaults
+# (config\deputy.json, config\projects.json), which every clone shares and which
+# change only through pull requests, and a user's private overrides
+# (config\deputy.local.json, config\projects.local.json), which are gitignored.
+# Personal pins - a model, a budget, the gate of a repo only you work on - go in
+# the local files, so a clone never drifts from main.
+# ---------------------------------------------------------------------------
+
+# The delivery modes a project can have (see README, "Delivery modes").
+$script:DeliveryModes = @('no-mistakes', 'direct-pr')
+
+function Get-ConfigDisplayName([string]$Path) {
+    # A config file the way its owner knows it: config\<name>.
+    'config\' + (Split-Path -Leaf $Path)
+}
+
+function Test-JsonObject($Value) {
+    # Is this a JSON object as ConvertFrom-Json returns one? Not `-is [pscustomobject]`:
+    # that accelerator is [psobject], which every value ConvertFrom-Json wraps passes,
+    # strings and numbers included.
+    $Value -is [System.Management.Automation.PSCustomObject]
+}
+
+function Read-ConfigFile([string]$Path) {
+    # A config file's JSON object, or $null when the file is not there or holds
+    # nothing. A file that is there but is not a JSON object is an error that
+    # names it: falling back to the defaults would quietly ignore a pin its
+    # owner believes is in force.
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $text = Get-Content -LiteralPath $Path -Raw
+    if (-not "$text".Trim()) { return $null }
+    $name = Get-ConfigDisplayName $Path
+    $parsed = try { $text | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "$name is not valid JSON: $($_.Exception.Message)" }
+    if (-not (Test-JsonObject $parsed)) { throw "$name must hold a JSON object." }
+    $parsed
+}
+
 function Get-DeputyConfig {
-    $defaults = [ordered]@{
+    <#
+    .SYNOPSIS
+    The Deputy configuration: the built-in defaults, then config\deputy.json
+    (tracked), then config\deputy.local.json (private), key by key. A later
+    layer's value replaces an earlier one, and null in either file means the
+    built-in default - so a local null can undo a tracked value.
+    #>
+    $builtIn = [ordered]@{
         model                = $null
         permissionMode       = 'bypassPermissions'
         watchIntervalSeconds = 15
@@ -82,34 +133,124 @@ function Get-DeputyConfig {
         # How often the watcher reads each published, unmerged task's pull
         # request (see Get-PrWatchTasks). 0 switches PR watching off.
         prPollMinutes        = 5
+        # Launch members without the operator's personal MCP servers, skills
+        # and slash commands (--strict-mcp-config --disable-slash-commands, see
+        # Get-MemberArguments). Recorded per task at spawn, so a resumed run is
+        # started the way its first run was.
+        memberIsolation      = $true
     }
+    $config = [ordered]@{}
+    foreach ($name in $builtIn.Keys) { $config[$name] = $builtIn[$name] }
     $p = Get-DeputyPaths
-    if (Test-Path $p.ConfigFile) {
-        $user = Get-Content $p.ConfigFile -Raw | ConvertFrom-Json
-        foreach ($prop in $user.PSObject.Properties) {
-            if ($null -ne $prop.Value) { $defaults[$prop.Name] = $prop.Value }
+    foreach ($file in $p.ConfigFile, $p.LocalConfigFile) {
+        $layer = Read-ConfigFile $file
+        if (-not $layer) { continue }
+        foreach ($prop in $layer.PSObject.Properties) {
+            $config[$prop.Name] = if ($null -ne $prop.Value) { $prop.Value } else { $builtIn[$prop.Name] }
         }
     }
-    [pscustomobject]$defaults
+    [pscustomobject]$config
+}
+
+function Assert-ProjectFields($Fields, [string]$Where) {
+    # A projects default or entry must say something Deputy can act on. A typo
+    # here is not harmless: an unknown delivery mode used to be read as
+    # direct-pr, which has the member push.
+    if (-not (Test-JsonObject $Fields)) { throw "$Where must be a JSON object." }
+    $delivery = Get-EventField $Fields 'delivery'
+    if ($null -ne $delivery -and $script:DeliveryModes -notcontains $delivery) {
+        throw "$Where has delivery '$delivery', which is not one of: $($script:DeliveryModes -join ', ')."
+    }
+    $validate = $Fields.PSObject.Properties['validate']
+    if ($validate -and $null -ne $validate.Value) {
+        $commands = $validate.Value
+        if ($commands -isnot [array] -or @($commands | Where-Object { $_ -isnot [string] -or -not $_.Trim() }).Count -gt 0) {
+            throw "$Where has a validate value that is not a list of commands. Write it as [""command"", ...]."
+        }
+    }
+}
+
+function Test-ProjectMatch($Entry, [string]$RepoPath) {
+    # Does a projects entry name this repo? A match with a slash in it is a
+    # path, compared as a full path whatever its separators; anything else is
+    # the repo's folder name.
+    $match = [string](Get-EventField $Entry 'match')
+    if ($match -match '[\\/]') { return Test-SamePath $match $RepoPath }
+    $match -ieq (Split-Path -Leaf $RepoPath)
 }
 
 function Get-ProjectProfile([string]$RepoPath) {
-    # Delivery profile for a repo, from config\projects.json. An empty
-    # validate list means auto-detect at validation time (see
-    # Get-AutoValidateCommands). Explicit entries override detection.
-    $file = Join-Path (Get-DeputyPaths).Root 'config' 'projects.json'
-    $default = [pscustomobject]@{ delivery = 'no-mistakes'; validate = @() }
-    if (-not (Test-Path $file)) { return $default }
-    $cfg = Get-Content $file -Raw | ConvertFrom-Json
-    if ($cfg.PSObject.Properties['default'] -and $cfg.default) { $default = $cfg.default }
-    $leaf = Split-Path -Leaf $RepoPath
-    foreach ($proj in ($cfg.projects ?? @())) {
-        $isPath = $proj.match -match '[\\/]'
-        if (($isPath -and ($proj.match -ieq $RepoPath)) -or (-not $isPath -and ($proj.match -ieq $leaf))) {
-            return $proj
+    <#
+    .SYNOPSIS
+    A repo's delivery profile: its delivery mode and its gate commands.
+
+    Read from config\projects.local.json (private) over config\projects.json
+    (tracked). The default block is merged key by key: local over tracked over
+    the built-in default (no-mistakes, auto-detected gate). Project entries are
+    matched local first, then tracked, and the first match wins; it is laid
+    over the default key by key, so an entry may name only what it changes. An
+    empty validate list means auto-detect at validation time (see
+    Get-AutoValidateCommands).
+
+    Source and ValidateSource say where the profile and its gate commands came
+    from, for the gate's evidence.
+    #>
+    $p = Get-DeputyPaths
+    $layers = @(
+        foreach ($file in $p.ProjectsFile, $p.LocalProjectsFile) {
+            $config = Read-ConfigFile $file
+            if (-not $config) { continue }
+            $name = Get-ConfigDisplayName $file
+            $default = Get-EventField $config 'default'
+            if ($null -ne $default) { Assert-ProjectFields $default "$name (default)" }
+            $entries = @(Get-EventField $config 'projects' | Where-Object { $null -ne $_ })
+            foreach ($entry in $entries) {
+                if (-not (Test-JsonObject $entry) -or -not "$(Get-EventField $entry 'match')".Trim()) {
+                    throw "$name has a projects entry without a match (a repo folder name, or a full path)."
+                }
+                Assert-ProjectFields $entry "$name (match '$($entry.match)')"
+            }
+            [pscustomobject]@{ Name = $name; Default = $default; Entries = $entries }
+        }
+    )
+
+    $result = [ordered]@{
+        delivery = 'no-mistakes'; validate = @(); match = $null
+        source = 'built-in default'; validateSource = 'built-in default'
+    }
+    $apply = {
+        param($Fields, [string]$From)
+        $result.source = $From
+        foreach ($key in 'delivery', 'validate') {
+            # Read the property itself: through the pipeline an empty list
+            # would come back as null, and "validate": [] (auto-detect) could
+            # never override a pinned default.
+            $prop = $Fields.PSObject.Properties[$key]
+            if (-not $prop -or $null -eq $prop.Value) { continue }
+            $result[$key] = $prop.Value
+            if ($key -eq 'validate') { $result.validateSource = $From }
         }
     }
-    $default
+    # The default: tracked, then local on top.
+    foreach ($layer in $layers) {
+        if ($layer.Default) { & $apply $layer.Default "$($layer.Name) (default)" }
+    }
+    # The entry: local entries are matched first.
+    [array]::Reverse($layers)
+    foreach ($layer in $layers) {
+        $entry = $layer.Entries | Where-Object { Test-ProjectMatch $_ $RepoPath } | Select-Object -First 1
+        if (-not $entry) { continue }
+        $result.match = [string]$entry.match
+        & $apply $entry "$($layer.Name) (match '$($entry.match)')"
+        break
+    }
+    [pscustomobject]@{
+        delivery       = [string]$result.delivery
+        validate       = [string[]]@($result.validate)
+        match          = $result.match
+        source         = $result.source
+        validateSource = $result.validateSource
+    }
 }
 
 function Test-GitRef([string]$RepoPath, [string]$Ref) {
@@ -175,6 +316,60 @@ function Resolve-DefaultRef([string]$RepoPath) {
 function Get-DefaultBranch([string]$RepoPath) {
     # Short name of the default branch, or $null when it cannot be resolved.
     (Resolve-DefaultRef $RepoPath).Branch
+}
+
+function Resolve-BaseRef([string]$RepoPath, [string]$BaseBranch) {
+    <#
+    .SYNOPSIS
+    The anchor a task's work is measured against: the branch it was cut from.
+    That is the task's base branch when it has one (dep-spawn.ps1 -BaseBranch,
+    kept as baseBranch in task state), else the default branch
+    (Resolve-DefaultRef). Same shape as Resolve-DefaultRef.
+
+    A base branch resolves the way treehouse cuts from it: the remote-tracking
+    origin/<base> first, then the local branch. It never falls back to the
+    default branch - an unresolvable base returns Ref = $null (Health
+    'unresolved'), because measuring the work against a branch it was not cut
+    from would count the base's own commits as the member's.
+    #>
+    if (-not $BaseBranch) { return Resolve-DefaultRef $RepoPath }
+    foreach ($ref in "refs/remotes/origin/$BaseBranch", "refs/heads/$BaseBranch") {
+        if (Test-GitRef $RepoPath $ref) {
+            $where = if ($ref -like 'refs/remotes/*') { "remote-tracking origin/$BaseBranch" } else { "local branch $BaseBranch" }
+            return [pscustomobject]@{ Branch = $BaseBranch; Ref = $ref; Source = "base branch '$BaseBranch', $where"; Health = 'ok' }
+        }
+    }
+    [pscustomobject]@{
+        Branch = $null
+        Ref    = $null
+        Source = "base branch '$BaseBranch' is unresolved (no origin/$BaseBranch and no local $BaseBranch)"
+        Health = 'unresolved'
+    }
+}
+
+function Resolve-TaskBaseRef($State, [string]$RepoPath) {
+    # A task's anchor, read in $RepoPath: its recorded base branch, or the
+    # default branch when it has none.
+    Resolve-BaseRef $RepoPath ([string](Get-EventField $State 'baseBranch'))
+}
+
+function Test-BranchName([string]$Name) {
+    # Can git name a branch this? A leading dash is refused too, because a
+    # command line would read it as an option.
+    if (-not $Name -or $Name.StartsWith('-')) { return $false }
+    git check-ref-format --branch $Name *> $null
+    $LASTEXITCODE -eq 0
+}
+
+function Get-TaskBranchName([string]$Prefix, [string]$TaskId) {
+    # A ship task's branch: the configured prefix and the task id. The id is
+    # unique, so two tasks can never collide on a branch however alike their
+    # briefings read - which names cut from the briefing's text did.
+    $branch = '{0}{1}' -f $Prefix, (Assert-TaskId $TaskId)
+    if (-not (Test-BranchName $branch)) {
+        throw "'$branch' is not a valid branch name. Check branchPrefix ('$Prefix') in config\deputy.json and config\deputy.local.json."
+    }
+    $branch
 }
 
 function Get-AutoValidateCommands([string]$Worktree, [string]$DefaultRef) {
@@ -924,10 +1119,102 @@ function Get-TreehouseProblems {
     elseif (-not (Test-TreehouseVersion $text)) {
         "treehouse $($parsed.Text) is older than the minimum $min. Fix: $script:TreehouseUpdateFix"
     }
+    # The flags dep-spawn.ps1 leases with. All three are in treehouse 3.0.0 and
+    # later, so the version floor covers them; asking the binary itself also
+    # catches a build that reports a good version and lacks one.
     $help = try { (treehouse get --help 2>&1 | Out-String) } catch { '' }
-    if ($help -notmatch '--lease(?![\w-])') {
-        "treehouse get --help does not list --lease, which Deputy needs to lease worktrees. Fix: $script:TreehouseUpdateFix"
+    $needed = [ordered]@{
+        '--lease'  = 'to lease worktrees'
+        '--branch' = "to create each ship task's branch"
+        '--base'   = 'to cut a worktree from a base branch'
     }
+    foreach ($flag in $needed.Keys) {
+        if ($help -notmatch ([regex]::Escape($flag) + '(?![\w-])')) {
+            "treehouse get --help does not list $flag, which Deputy needs $($needed[$flag]). Fix: $script:TreehouseUpdateFix"
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Leases. dep-spawn.ps1 checks what treehouse handed it before a member is
+# launched there, and gives back a lease it will not use.
+# ---------------------------------------------------------------------------
+
+function Get-LeaseProblems {
+    <#
+    .SYNOPSIS
+    Is a fresh lease fit to launch a member in? One line per problem, nothing
+    when it is.
+
+    The lease must be a git worktree of its own - the top of the worktree git
+    finds there (git rev-parse) - and not the repository's own checkout: a
+    member launched anywhere else would work in, and could wreck, the
+    Sheriff's checkout or some unrelated tree. A ship task's worktree must also
+    be on the branch the lease was asked to create.
+
+    Only git's answers are compared with each other, never with the path as
+    treehouse or the caller wrote it: git may print a long path where the
+    other has an 8.3 short one (C:\Users\RUNNER~1\...), and a path that differs
+    only in spelling must not read as a different directory.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$LeasePath,
+        [Parameter(Mandatory)][string]$RepoPath,
+        [string]$Branch
+    )
+    if (-not $LeasePath -or -not (Test-Path -LiteralPath $LeasePath -PathType Container)) {
+        "the lease path '$LeasePath' is not a directory"
+        return
+    }
+    $top = (git -C $LeasePath rev-parse --show-toplevel 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $top) {
+        "'$LeasePath' is not inside a git worktree (git rev-parse --show-toplevel failed there)"
+        return
+    }
+    # Empty when the lease is the top of its worktree, 'sub/dir/' below it.
+    $prefix = (git -C $LeasePath rev-parse --show-prefix 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $prefix) {
+        "git resolves the lease '$LeasePath' to the worktree '$top', not to the lease itself"
+        return
+    }
+    $repoTop = (git -C $RepoPath rev-parse --show-toplevel 2>$null | Out-String).Trim()
+    if (-not $repoTop) {
+        "the checkout of '$RepoPath' cannot be resolved, so the lease cannot be shown to be separate from it"
+        return
+    }
+    if (Test-SamePath $top $repoTop) {
+        "the lease '$LeasePath' is the repository's own checkout, not an isolated worktree"
+        return
+    }
+    if ($Branch) {
+        $current = (git -C $LeasePath branch --show-current 2>$null | Out-String).Trim()
+        if ($current -ne $Branch) {
+            $on = if ($current) { "on '$current'" } else { 'on a detached HEAD' }
+            "the worktree is $on, not on the task branch '$Branch'"
+        }
+    }
+}
+
+function Undo-Lease {
+    <#
+    .SYNOPSIS
+    Give back a lease dep-spawn.ps1 took and will not launch a member in.
+    Returns $true when treehouse released it.
+
+    Guarded by the lease id, so nothing but that lease can be released, and
+    never forced: without --force treehouse leaves a slot with changes in it
+    alone rather than resetting it, and refuses a path it does not manage -
+    which is what a lease that failed the isolation check may be.
+    #>
+    param([Parameter(Mandatory)]$Lease, [Parameter(Mandatory)][string]$RepoPath)
+    Push-Location $RepoPath
+    try {
+        # Nothing on stdin: a confirmation prompt reads EOF and declines.
+        $null | treehouse return $Lease.path --if-lease-id $Lease.lease_id *> $null
+        $LASTEXITCODE -eq 0
+    }
+    catch { $false }
+    finally { Pop-Location }
 }
 
 function Get-DeputyCloneProblems([string]$Root) {
@@ -1125,6 +1412,18 @@ function Test-PathUnder([string]$Path, [string]$Root) {
     if (-not $r) { return $false }
     $p.Equals($r, [StringComparison]::OrdinalIgnoreCase) -or
         $p.StartsWith($r + [System.IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-SamePath([string]$A, [string]$B) {
+    # Do two paths name the same directory, however their separators, case and
+    # trailing slashes are written? (git prints C:/x/y where Windows has C:\x\y.)
+    if (-not $A -or -not $B) { return $false }
+    try {
+        $x = [System.IO.Path]::GetFullPath($A).TrimEnd('\', '/')
+        $y = [System.IO.Path]::GetFullPath($B).TrimEnd('\', '/')
+    }
+    catch { return $false }
+    $x.Equals($y, [StringComparison]::OrdinalIgnoreCase)
 }
 
 function ConvertTo-UtcDateTime($Value) {
@@ -1351,6 +1650,100 @@ function Get-MemberReportInstructions([switch]$PullRequest) {
     $lines -join "`n"
 }
 
+# Every briefing carries this sentence, and AGENTS.md opens with it, word for
+# word (a test holds the two together). A member working on a repository whose
+# own instructions describe a Deputy - Deputy itself - must not take that role,
+# and those instructions are loaded as project context whatever the hooks do.
+$script:MemberRoleSentence = 'A posse member launched by Deputy into a worktree of this repository follows its briefing and is not the Deputy.'
+
+function Get-MemberBriefing {
+    <#
+    .SYNOPSIS
+    The briefing a member is given on stdin: who it is, its task, the ground
+    rules of its kind, the definition of done of its delivery mode, and how to
+    report. One function for every kind, so the parts they share cannot drift
+    apart.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('ship', 'scout')][string]$Kind,
+        [Parameter(Mandatory)][string]$Task,
+        [Parameter(Mandatory)][string]$Worktree,
+        # ship: no-mistakes or direct-pr.
+        [string]$Delivery,
+        # ship: the branch the lease created and checked out.
+        [string]$Branch,
+        # The branch the worktree was cut from, when it is known.
+        [string]$BaseBranch,
+        # scout: where the full report goes.
+        [string]$ReportPath
+    )
+    if ($Kind -eq 'ship') {
+        if (-not $Branch) { throw 'A ship briefing needs the branch the lease created.' }
+        if ($script:DeliveryModes -notcontains $Delivery) {
+            throw "Delivery '$Delivery' is not one of: $($script:DeliveryModes -join ', ')."
+        }
+    }
+    elseif (-not $ReportPath) { throw 'A scout briefing needs the report path.' }
+    $base = if ($BaseBranch) { $BaseBranch } else { 'the default branch' }
+
+    $lines = @(
+        'You are a posse member reporting to the Deputy. Assignment kind: {0}.' -f $(
+            if ($Kind -eq 'ship') { 'ship (deliver working code)' } else { 'scout (investigate and report, change nothing)' })
+        ''
+        'Task:'
+        $Task
+        ''
+        'Your role:'
+        ("- $script:MemberRoleSentence If this repository's own instructions (AGENTS.md, CLAUDE.md) describe a " +
+            'Deputy or a supervisor, that role is not yours: do the work yourself, and never spawn, message or supervise posse members.')
+        ''
+        'Ground rules:'
+    )
+    if ($Kind -eq 'ship') {
+        $lines += @(
+            ("- You are in a leased git worktree at $Worktree, already on your own branch $Branch, cut from $base. " +
+                'Work only inside this worktree and on this branch: do not switch branches, create other branches, or rebase onto another branch.')
+            "- Implement the task with quality. Run the repo's relevant tests and lint before finishing, and fix failures you cause."
+            '- If you are blocked or the task turns out to be wrong or impossible, stop and say so clearly instead of guessing.'
+            ''
+        )
+        if ($Delivery -eq 'no-mistakes') {
+            $lines += @(
+                'Definition of done (no-mistakes delivery):'
+                "- All your work is committed on $Branch with clear messages, and git status is clean. Never add co-author lines."
+                '- Do NOT push and do NOT open a pull request. The Deputy validates your branch with its no-mistakes gate and publishes it.'
+            )
+        }
+        else {
+            $baseFlag = if ($BaseBranch) { "--base $BaseBranch " } else { '' }
+            $lines += @(
+                'Definition of done (direct-pr delivery):'
+                "- All your work is committed on $Branch with clear messages. Never add co-author lines."
+                ("- The branch is pushed and a pull request is open against $base (for example: gh pr create $baseFlag" +
+                    '--title "..." --body "..."). If the repo has no remote you can push to, commit locally and say so in your report.')
+            )
+        }
+    }
+    else {
+        $lines += @(
+            ("- You are in a leased git worktree at $Worktree, on a detached HEAD of $base. It is read-only by convention: " +
+                'do not modify files in the repo, do not commit, do not open pull requests.')
+            '- Investigate thoroughly: read code, run read-only commands, trace the answer.'
+            '- If you are blocked or the question turns out to be wrong or unanswerable, stop and say so clearly instead of guessing.'
+            ''
+            'Definition of done (scout):'
+            "- Your full report is written as markdown to this exact path: $ReportPath"
+            '- Nothing in the worktree is changed: git status is clean.'
+        )
+    }
+    $lines += ''
+    $lines += Get-MemberReportInstructions -PullRequest:($Kind -eq 'ship' -and $Delivery -eq 'direct-pr')
+    if ($Kind -eq 'scout') {
+        $lines += 'For a scout, summary holds the key findings in a few sentences; the full report is the file at the path above.'
+    }
+    $lines -join "`n"
+}
+
 function ConvertTo-InvariantNumber($Value) {
     # A number read from JSON or a command line as a double, or $null when it
     # is not one. Never through the current culture: 1.5 must not become 15.
@@ -1370,9 +1763,15 @@ function Get-MemberArguments {
     -Name), or a finished one continued (-SessionId with -Resume).
 
     Everything except the session flags is the same for both, which is the
-    point: permissions, model, effort, budget and the report schema belong to
-    the process, not to the stored session, so a resumed run has to be given
-    them again.
+    point: permissions, isolation, model, effort, budget and the report schema
+    belong to the process, not to the stored session, so a resumed run has to
+    be given them again.
+
+    -Isolation launches the member without the operator's personal setup:
+    --strict-mcp-config (no MCP servers, since none are given with
+    --mcp-config) and --disable-slash-commands (no skills, no slash commands).
+    Authentication, the user's and the repository's CLAUDE.md, hooks and
+    plugins' agents are not affected (see README, "Member environment").
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -1381,6 +1780,7 @@ function Get-MemberArguments {
         [string]$Model,
         [string]$PermissionMode = 'bypassPermissions',
         [string[]]$AllowedTools,
+        [switch]$Isolation,
         [string]$Effort,
         $MaxBudgetUsd,
         [string[]]$AddDir
@@ -1395,9 +1795,14 @@ function Get-MemberArguments {
     if ($Model) { $arguments += @('--model', "$Model") }
     if ($PermissionMode -eq 'bypassPermissions') { $arguments += '--dangerously-skip-permissions' }
     else {
-        $arguments += @('--permission-mode', $PermissionMode)
+        # Nobody can answer a permission prompt in a headless run. With
+        # --permission-prompts none anything that would prompt is denied on
+        # the spot, so the member hears no and can report what it could not
+        # do; the permission mode and the grants still decide everything else.
+        $arguments += @('--permission-mode', $PermissionMode, '--permission-prompts', 'none')
         if ($AllowedTools) { $arguments += @('--allowedTools', ($AllowedTools -join ',')) }
     }
+    if ($Isolation) { $arguments += @('--strict-mcp-config', '--disable-slash-commands') }
     foreach ($dir in @($AddDir | Where-Object { $_ })) { $arguments += @('--add-dir', $dir) }
     if ($Effort) { $arguments += @('--effort', $Effort) }
     if ($null -ne $MaxBudgetUsd -and "$MaxBudgetUsd" -ne '') {
@@ -1424,6 +1829,9 @@ function Get-TaskMemberArguments($State, [switch]$Resume) {
         Model          = [string](& $read 'model')
         PermissionMode = [string](& $read 'permissionMode')
         AllowedTools   = @(& $read 'allowedTools' | Where-Object { $_ })
+        # A task spawned before memberIsolation existed ran without it, and a
+        # resumed run must not change the environment the session started in.
+        Isolation      = [bool](& $read 'memberIsolation')
         Effort         = [string](& $read 'effort')
         MaxBudgetUsd   = (& $read 'maxBudgetUsd')
         # Scouts write their report into the deputy state dir, outside their worktree
@@ -2005,15 +2413,16 @@ function Test-TaskLanded($State) {
     A ship task has landed when its worktree is clean (untracked files count as
     dirty) and one of these holds:
 
-    - every commit ahead of the default branch is reachable from a
-      remote-tracking branch, after a fetch;
+    - every commit ahead of its base is reachable from a remote-tracking
+      branch, after a fetch;
     - its pull request is merged, and either the PR's head contains the local
-      HEAD or the local tree is identical to the freshly fetched default branch
-      (a squash merge leaves no commit of the branch behind, only its content).
+      HEAD or the local tree is identical to the freshly fetched base (a squash
+      merge leaves no commit of the branch behind, only its content).
 
-    A branch with no commits ahead of the default branch has nothing to lose,
-    and neither has a task whose worktree and local branch are both gone. A
-    scout has landed when its report file exists.
+    The base is the task's base branch when it was spawned with one, else the
+    default branch (Resolve-TaskBaseRef). A branch with no commits ahead of its
+    base has nothing to lose, and neither has a task whose worktree and local
+    branch are both gone. A scout has landed when its report file exists.
 
     Returns Landed and the Reason either way, plus what dep-return.ps1 needs to
     know about the remote branch: PrState (none, open, closed, merged, or
@@ -2112,9 +2521,11 @@ function Test-TaskLanded($State) {
         finally { $env:GIT_TERMINAL_PROMPT = $previousPrompt }
     }
 
-    $anchor = Resolve-DefaultRef $dir
+    # Ahead of what the task was cut from: its base branch, else the default.
+    $anchor = Resolve-TaskBaseRef $State $dir
     if (-not $anchor.Ref) {
-        $verdict.Reason = "the default branch of $dir cannot be resolved ($($anchor.Source)), so nothing can be proven about what is ahead of it"
+        $what = if (Get-EventField $State 'baseBranch') { 'the base branch' } else { 'the default branch' }
+        $verdict.Reason = "$what of $dir cannot be resolved ($($anchor.Source)), so nothing can be proven about what is ahead of it"
         return $verdict
     }
     $ahead = @(git -C $dir rev-list $tip "^$($anchor.Ref)" 2>$null)

@@ -13,10 +13,10 @@ starts from nothing and pays for the context a second time.
 It refuses unless the task's process is gone and its worktree still exists:
 you cannot type into a running member, and a returned task has no worktree to
 work in. The resumed run is started with the same flags as the first one
-(permissions, model, effort, budget, report schema), reads the message on
-stdin, and appends to the same log. The task goes back to `running`, and the
-watcher reports the resumed run's result as a new wake. Each follow-up is
-recorded in task state (followUps).
+(permissions, isolation, model, effort, budget, report schema), reads the
+message on stdin, and appends to the same log. The task goes back to
+`running`, and the watcher reports the resumed run's result as a new wake.
+Each follow-up is recorded in task state (followUps).
 
 A gate verdict from an earlier run is cleared: the member is about to change
 the branch, so dep-validate.ps1 has to judge it again. That holds after

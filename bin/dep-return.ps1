@@ -11,10 +11,11 @@ this script proves the work landed before it touches anything, and refuses
 dep-lib.ps1:
 
 - a ship task's worktree is clean, untracked files included, and either every
-  commit ahead of the default branch is on a remote-tracking branch after a
-  fetch, or its pull request is merged and contains the local work (the PR's
-  head contains the local HEAD, or the local tree is identical to the up-to-date
-  default branch, which is what a squash merge leaves);
+  commit ahead of its base (its base branch, else the default branch) is on a
+  remote-tracking branch after a fetch, or its pull request is merged and
+  contains the local work (the PR's head contains the local HEAD, or the local
+  tree is identical to the up-to-date base, which is what a squash merge
+  leaves);
 - a scout task's report file exists.
 
 -Discard overrides a refusal and throws the unlanded work away. It needs the

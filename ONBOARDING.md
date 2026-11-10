@@ -23,6 +23,8 @@ cd C:\apps\deputy
 
 The clone is the whole install - no build step. Your clone is also your instance: task state and logs live inside it, private to you.
 
+Your own settings are private too. Put them in `config\deputy.local.json` (model, budget, permission mode, ...) and `config\projects.local.json` (the gate commands or delivery mode of the repos you work on). Both are gitignored and win over the tracked `config\deputy.json` and `config\projects.json`, which you leave as they are on `main` - so `git pull` never conflicts with your pins. Create a local file only when you need it, with only the keys you want to change; the README's "Configuration" section has the details.
+
 Now check the toolchain. The doctor prints one line per problem, each with the exact command that fixes it, and nothing at all when everything is in order:
 
 ```powershell
@@ -46,6 +48,8 @@ Talk naturally. Include the repo path the first time; parallel requests are enco
 
 > Fix the flaky login test in C:\src\myapp, and separately investigate why the nightly export job is slow.
 
+Work lands on the repo's default branch unless you say otherwise. To work on another branch, name it ("backport the fix onto release/2.4 in C:\src\myapp"): the member's worktree is cut from it, the gate checks against it and the PR targets it.
+
 The Deputy will:
 - dispatch each task to its own posse member, in its own isolated git worktree (your checkout of the repo is never touched),
 - go quiet while they work - a watcher wakes it only when something needs a decision,
@@ -56,8 +60,8 @@ The Deputy will:
 ## 5. What to expect
 
 - **Delivered PRs** carry a validation evidence file at `.deputy/evidence/<taskId>.md` - proof of what was run and that it passed, pinned to the validated commit.
-- **Validation is automatic**: the gate detects `npm test`/`lint`, `cargo test`, `go test`, `dotnet test`, or `pytest` from the repo's default branch. To pin exact commands or opt a repo out, edit `config\projects.json` (see README).
-- **A gate with nothing to run is not a pass**: if your repo has no detectable test command, the Deputy reports the work as *unverified* and refuses to publish until you pin commands in `config\projects.json` or explicitly approve publishing unvalidated work.
+- **Validation is automatic**: the gate detects `npm test`/`lint`, `cargo test`, `go test`, `dotnet test`, or `pytest` from the repo's default branch. To pin exact commands or opt a repo out, add the repo to your `config\projects.local.json` (see README, "Delivery modes").
+- **A gate with nothing to run is not a pass**: if your repo has no detectable test command, the Deputy reports the work as *unverified* and refuses to publish until you pin commands in `config\projects.local.json` or explicitly approve publishing unvalidated work.
 - **Merging and tearing down are guarded**: the Deputy merges only a PR that is open, conflict-free, green at its current commit and unchanged since it was published, and tells you every reason when it will not. It returns a worktree only after proving the work landed (pushed, or merged); throwing unlanded work away takes your explicit word.
 - **Open PRs are watched**: after a PR is opened the Deputy is told when it is merged (it then tears the task down) and when a check on it turns red (it then tells you).
 - **Failures are normal output**: if a member gets stuck or its work fails the gate, the Deputy diagnoses, retries with better instructions, or escalates to you with its analysis.
@@ -74,9 +78,10 @@ pwsh -NoProfile -File bin\dep-posse.ps1 logs <taskId> # readable live log
 
 ## Troubleshooting
 
-- **Member stalls immediately** - almost always permissions: headless agents cannot answer prompts. Keep the default permission mode, or grant tools explicitly (README, Permissions section).
+- **Member reports it was denied permission** - headless agents cannot answer prompts, so outside `bypassPermissions` anything not granted is denied and the member reports it (usually as `blocked`). Keep the default permission mode, or grant the tools it needs with `-AllowedTools` (README, "Permissions for posse members").
 - **`gh` errors about token scopes** - `gh pr view` needs `read:org`; re-auth with `gh auth login` or add the scope to your PAT.
-- **Spawn refuses with "Refusing to lease a worktree"** - treehouse is older than 3.0.1 or its version cannot be read. Run `pwsh -NoProfile -File bin\dep-doctor.ps1` and apply the fix it names (`treehouse update`, with no tasks leased, straight to the latest release - never to 3.0.0).
+- **Spawn refuses with "Refusing to launch a member"** - the worktree treehouse leased was not a worktree of its own (or not on the task's new branch), so nothing was started in it and the lease was given back. The line after it says what was wrong; `treehouse status` (run inside the repo) shows the pool.
+- **Spawn refuses with "Refusing to lease a worktree"** - treehouse is older than 3.0.1, its version cannot be read, or its `get` lacks a flag Deputy needs. Run `pwsh -NoProfile -File bin\dep-doctor.ps1` and apply the fix it names (`treehouse update`, with no tasks leased, straight to the latest release - never to 3.0.0).
 - **Worktree stuck as leased** - `treehouse status` (run inside the repo) to inspect; `pwsh -NoProfile -File bin\dep-return.ps1 <taskId>` releases it safely: it refuses, and says why, if the task's work has not landed anywhere (add `-Discard` only when you mean to throw that work away).
 
 ## Updating

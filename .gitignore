@@ -1,3 +1,5 @@
 state/
 logs/
 CLAUDE.local.md
+config/deputy.local.json
+config/projects.local.json

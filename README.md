@@ -50,7 +50,7 @@ dep-return.ps1 .... proves the work landed, then: worktree back to the pool,
 
 - Windows with PowerShell 7 or later
 - git, and [GitHub CLI](https://cli.github.com/) authenticated (`gh auth login`)
-- [treehouse](https://github.com/kunchenguid/treehouse) **3.0.1 or later** on PATH, with `treehouse get --lease`
+- [treehouse](https://github.com/kunchenguid/treehouse) **3.0.1 or later** on PATH, with `treehouse get --lease`, `-b/--branch` and `--base` (all three are in every release from 3.0.0 on)
 - [Claude Code](https://claude.com/claude-code) on PATH
 
 Check all of it in one go - silent means healthy, otherwise one line per problem with the exact fix:
@@ -109,8 +109,8 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 
 | Command | What it does |
 | --- | --- |
-| `dep-doctor.ps1` | Toolchain check: PowerShell 7+, `git` / `gh` / `claude` / `treehouse` on PATH, `gh auth status`, treehouse at least 3.0.1 with `get --lease`, and the Deputy clone on its default branch and not behind `origin`. One line per problem, each naming its fix; prints nothing when healthy. Exit 0 healthy, 1 on any problem. Report only - it never installs, updates or pulls |
-| `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>] [-Effort low\|medium\|high\|xhigh\|max] [-MaxBudgetUsd <n>]` | Lease a worktree, launch a headless posse member, register task state. The session gets an id Deputy chose (`--session-id`, kept as `sessionId` in task state) and the task id as its name, so it can be resumed. `-Effort` and `-MaxBudgetUsd` become `--effort` and `--max-budget-usd`; both default to the config and are left off when that is `null`. Refuses to lease when treehouse fails the doctor's version check |
+| `dep-doctor.ps1` | Toolchain check: PowerShell 7+, `git` / `gh` / `claude` / `treehouse` on PATH, `gh auth status`, treehouse at least 3.0.1 whose `get --help` lists `--lease`, `--branch` and `--base`, and the Deputy clone on its default branch and not behind `origin`. One line per problem, each naming its fix; prints nothing when healthy. Exit 0 healthy, 1 on any problem. Report only - it never installs, updates or pulls |
+| `dep-spawn.ps1 -Task <text> -Repo <path> [-Kind ship\|scout] [-BaseBranch <branch>] [-Model <m>] [-PermissionMode <mode>] [-AllowedTools <rules>] [-Effort low\|medium\|high\|xhigh\|max] [-MaxBudgetUsd <n>]` | Lease a worktree, launch a headless posse member, register task state (see "The spawn contract"). A ship task's branch is `<branchPrefix><taskId>`, created by the lease (`treehouse get -b`); `-BaseBranch` cuts the worktree from that branch (`--base`) and is kept as `baseBranch`. The lease must be a worktree of its own, or nothing is launched and the lease is given back. The session gets an id Deputy chose (`--session-id`, kept as `sessionId` in task state) and the task id as its name, so it can be resumed. `-Effort` and `-MaxBudgetUsd` become `--effort` and `--max-budget-usd`; both default to the config and are left off when that is `null`. Refuses to lease when treehouse fails the doctor's check, and refuses a base branch or branch prefix git cannot use before leasing anything |
 | `dep-send.ps1 <taskId> -Message <text>` | Send a follow-up to a member whose process has exited: starts `claude -p --resume <sessionId>` in the task's worktree with the message on stdin and the same flags as the first run, appends to the same log, sets the task back to `running` and records the follow-up in task state. Refuses while the member is alive, when the watcher has not reported the run's outcome yet, and when the worktree is gone (see "Resumable members") |
 | `dep-watch.ps1 [-Wait] [-IntervalSeconds n] [-StallMinutes n] [-DeadSeconds n] [-TimeoutMinutes n] [-PrPollSeconds n]` | Scan tasks for wake events, and poll the pull request of every published, unmerged task for `merged`, `degraded` and `closed` (see "Guarded merge, guarded teardown, and PR watching"); `-Wait` blocks until one fires (exit 0) or timeout (exit 2). A task counts as completed (or failed, interrupted, blocked, needs-decision) only when its final `result` event has arrived AND the member process has exited - a `result` seen while the process is alive is interim (the member may be waiting on background helpers) and wakes nobody. What the final result means is in "Resumable members". A task counts as died only when no process remains AND its log has been silent past `-DeadSeconds` (default 90). Every wake is appended to the durable queue with a sequence number before its task record is updated. One watcher at a time: it holds `state\watcher.lock` and touches `state\watcher.beat` on every poll, and a second one says so and exits 0 (see "Wakes that survive") |
 | `dep-wake.ps1 drain` | Print every unacknowledged wake, oldest first, with what its task looks like now. The last line is the exact `ack -Through <seq>` command for what was printed. Changes nothing |
@@ -121,8 +121,8 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw] [-Follow]` | Human-readable log tail (or raw stream-json), follow-ups shown as `[send]` lines; `-Follow` live-tails |
 | `dep-posse.ps1 result <taskId>` | Final report text, the status the member reported, follow-ups sent, cost, scout report path, PR URL |
 | `dep-posse.ps1 kill <taskId>` | Stop a runaway member's process tree (lease kept for inspection). Kills only processes proven to be the task's - see "What Deputy will kill" |
-| `dep-validate.ps1 <taskId>` | Run the no-mistakes gate in the task's worktree; commits evidence on pass. Exit 0 passed, 1 failed, 2 unverified (no commands to run) |
-| `dep-publish.ps1 <taskId> [-AllowUnverified]` | Push the branch and open the PR, recording its number and head commit (`prNumber`, `prHead`); refuses a failed or unverified gate, and a branch that moved after the gate judged it. On a task that already has a PR it pushes the branch's new validated commits to that PR, rewrites the PR description and moves `prHead` on. `-AllowUnverified` is the Sheriff's opt-in for repos with no gate, and labels the PR as never validated |
+| `dep-validate.ps1 <taskId>` | Run the no-mistakes gate in the task's worktree, anchored on the task's base branch (the default branch when it has none); commits evidence on pass. Exit 0 passed, 1 failed, 2 unverified (no commands to run) |
+| `dep-publish.ps1 <taskId> [-AllowUnverified]` | Push the branch and open the PR against the task's base branch (which must be on `origin`; the default branch when it has none), recording its number and head commit (`prNumber`, `prHead`); refuses a failed or unverified gate, and a branch that moved after the gate judged it. On a task that already has a PR it pushes the branch's new validated commits to that PR, rewrites the PR description and moves `prHead` on. `-AllowUnverified` is the Sheriff's opt-in for repos with no gate, and labels the PR as never validated |
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <taskId> [-Method squash\|merge\|rebase] [-AllowNoChecks]` | PR operations over GitHub's REST API (`gh api`), so no `read:org` token scope is needed. `checks` exits 0 when nothing is failing or pending, 1 on a failing check, 8 when one is only pending. `merge` (squash by default) refuses a PR that is not fit to merge, listing every failing condition, and records the merge only when it is proven; branch cleanup happens in dep-return |
 | `dep-return.ps1 <taskId> [-Discard]` | Prove the work landed (refuse with the reason and exit 1 otherwise), then kill stragglers (same proof as `kill`), return the lease (guarded by `--if-lease-id`), delete the task branch, archive state. `-Discard` skips the proof and needs the Sheriff's explicit word. The remote branch of an open PR is never deleted. After this the task can no longer be resumed |
 | `dep-dashboard.ps1 [-Id <taskId>] [-Tail n]` | Live posse view in Windows Terminal: auto-refreshing status tab + a live-tail tab per active member. Re-running adds new members' tabs to the same window; `-Id` opens one task (active or archived) |
@@ -165,11 +165,54 @@ The two `Stop` hooks cooperate: the guard gives the watcher that the other hook 
 
 In print mode (`claude -p`) Claude Code waits for an `asyncRewake` hook instead of going idle, so a one-shot Deputy is simply held until the wake arrives.
 
+## The spawn contract
+
+Several small weaknesses used to sit at the moment of dispatch, and each one surfaced later as a confusing failure: branch names derived from the task's prose collided, the member was trusted to create its own branch, a member working on Deputy itself was told it was the Deputy, and every member loaded the operator's personal MCP servers and skills. `dep-spawn.ps1` now settles all of that before a member starts.
+
+**A branch per task, created by the lease.** A ship task's branch is `<branchPrefix><taskId>` (for example `deputy/posse-20261110-142233-kqz`): unique per task, whatever the briefing says. `treehouse get --lease -b <branch>` creates and checks it out, and the briefing tells the member it is already on its branch and must not switch. A prefix git cannot use in a branch name is refused before anything is leased. `dep-validate.ps1` still fails a worktree that is on any other branch. A scout gets a detached worktree and no branch.
+
+**A base branch per task.** `-BaseBranch <branch>` cuts the worktree from that branch (`treehouse get --base`) and is kept as `baseBranch` in task state. Everything that measures the work against "where it started" then uses it instead of the default branch:
+
+| Step | What the base branch decides |
+| --- | --- |
+| `dep-validate.ps1` | the gate's anchor: what "commits ahead" means, and the ref manifests are read from. The evidence says `base-branch anchor:` |
+| `dep-publish.ps1` | the pull request's base (`gh pr create --base`), and the commits the PR title is read from. The base must be on `origin`: a local-only base is refused before anything is pushed |
+| `dep-return.ps1` | the landed check: commits ahead of the base, and the tree a squash merge is compared with |
+| `direct-pr` briefings | the `--base` the member opens its own pull request against |
+
+A base branch resolves the way treehouse cuts from it: `origin/<base>` when it exists, else the local branch. It never falls back to the default branch: a base that can no longer be resolved is an `ANCHOR WARNING`, and the landed check refuses rather than measure the work against a branch it was not cut from. Without `-BaseBranch` the lease is cut from treehouse's default; if treehouse reports a different base than the repository's default branch (a pool configured with `base_branch` in `treehouse.toml`), that branch becomes the task's `baseBranch` the same way, and the spawn output says so.
+
+**An isolated lease, or none.** After leasing, `git -C <lease> rev-parse --show-toplevel` must resolve to the lease path itself and not to the repository's own checkout, and a ship task's worktree must be on its new branch. Otherwise no member is launched, the lease is given back with `treehouse return --if-lease-id` - guarded by its id and never forced, so treehouse leaves alone anything it does not manage or that has changes in it - and the new branch is deleted. The same happens when anything else fails between the lease and the launch.
+
+**Not the Deputy.** `AGENTS.md` opens with a role exception, and every briefing carries the same sentence: *A posse member launched by Deputy into a worktree of this repository follows its briefing and is not the Deputy.* A member working on Deputy loads this repository's `AGENTS.md` as project instructions whatever the hooks do (they already do nothing for a member, see `Test-DeputyHome`), so the instructions themselves have to say it.
+
+**One briefing.** The ship (no-mistakes), ship (direct-pr) and scout briefings are one function, `Get-MemberBriefing` in `dep-lib.ps1`: the role, the task, the ground rules of the kind, a *definition of done* per delivery mode (no-mistakes: committed on the branch, clean, not pushed; direct-pr: a pull request open against the base; scout: the report written, nothing changed), and the structured report.
+
+### Member environment
+
+With `memberIsolation` on (the default), members are launched with `--strict-mcp-config` and `--disable-slash-commands`: no MCP servers (none are passed with `--mcp-config`), no skills and no slash commands. That keeps a member's context to its task, and keeps the operator's connected services - mail, calendars, chat, whatever is configured - out of reach of an unattended agent. Authentication, the user's own `CLAUDE.md`, the repository's `CLAUDE.md`, hooks, plugins' agents and the built-in tools other than `Skill` are unaffected. The setting is recorded per task (`memberIsolation`), and `dep-send.ps1` resumes with what the first run had; a task spawned before the setting existed resumes without it. Set `"memberIsolation": false` in `config\deputy.local.json` to give members your full setup.
+
+What was verified on a real Claude Code (2.1.322, Windows 11), with a throwaway member started through Deputy's own launcher in a git repository under the temp directory with no remote, before the default was set. Counts are from the `init` event, and hooks are the `SessionStart` hooks that ran:
+
+| | Without isolation | With `memberIsolation` |
+| --- | --- | --- |
+| MCP servers | 27 | 0 |
+| Skills | 78 | 0 |
+| Slash commands | 119 | 0 |
+| `SessionStart` hooks run | 4 | 4 |
+| Tools | 64 (33 of them from MCP servers) | 30: the MCP servers' tools and the `Skill` tool are gone |
+| Plugins / agents | 6 / 8 | 6 / 8 |
+| Authenticates (subscription login, no API key) | yes | yes |
+| Loads the repository's `CLAUDE.md` | yes: quoted the codeword it held | yes: quoted the codeword it held |
+| Loads the user's own `CLAUDE.md` | yes: named its path | yes: named its path, and the one character it forbids |
+
+Hooks are not isolated: user-level and plugin hooks still run in members, so keep them fast and side-effect free, or make them check `DEPUTY_POSSE_TASK`, which every member has in its environment.
+
 ## Resumable members
 
 A member used to be one shot: it could not ask a question, be corrected, or be continued after an outage. The only answer to any of those was a respawn, which starts from nothing and pays a second time for a context that can cost several dollars to build. Three things change that.
 
-**A session Deputy can name.** `dep-spawn.ps1` generates a UUID per task, starts the member with `--session-id <uuid> -n <taskId>` and keeps the id as `sessionId` in task state. `dep-send.ps1 <taskId> -Message <text>` then starts `claude -p --resume <sessionId>` in the same worktree, with the message on stdin and the same flags as the first run - permissions, model, effort, budget and report schema belong to the process, not to the stored session, so a resumed run is given them again. The member carries on with everything it knew. It can be sent to any task whose process has exited and whose worktree is still leased, whatever its status; `dep-return.ps1` ends that.
+**A session Deputy can name.** `dep-spawn.ps1` generates a UUID per task, starts the member with `--session-id <uuid> -n <taskId>` and keeps the id as `sessionId` in task state. `dep-send.ps1 <taskId> -Message <text>` then starts `claude -p --resume <sessionId>` in the same worktree, with the message on stdin and the same flags as the first run - permissions, isolation, model, effort, budget and report schema belong to the process, not to the stored session, so a resumed run is given them again. The member carries on with everything it knew. It can be sent to any task whose process has exited and whose worktree is still leased, whatever its status; `dep-return.ps1` ends that.
 
 **A structured final report.** Every member runs with `--json-schema`, so its last message is an object, not prose to be guessed at:
 
@@ -280,7 +323,7 @@ On top of that, pid 0 and pid 4 are never candidates, a worktree listing of more
 
 Captured command output in the evidence is redacted on a best-effort basis (common `key=value` secrets, connection-string credentials, well-known token shapes) before it is written anywhere. Redaction is pattern-based and cannot catch everything - test suites should not print secrets.
 
-**Gate commands are auto-detected** unless configured. Detection reads manifests with `git show` from the repo's default branch - never from the task branch or the worktree's files, so a branch cannot reconfigure its own gate:
+**Gate commands are auto-detected** unless configured. Detection reads manifests with `git show` from the repo's default branch (or the task's base branch, see "The spawn contract") - never from the task branch or the worktree's files, so a branch cannot reconfigure its own gate:
 
 | Found on default branch | Gate command |
 | --- | --- |
@@ -290,18 +333,18 @@ Captured command output in the evidence is redacted on a best-effort basis (comm
 | `*.sln` / `*.csproj` | `dotnet test` |
 | `pytest.ini` or `[tool.pytest]` in `pyproject.toml` | `pytest` |
 
-The default branch is resolved as `origin/HEAD`, then `origin/main` / `origin/master`, then - for a repo with no remote configured - the local `main` / `master`. Every candidate must actually exist: a stale `origin/HEAD` left by a default branch that was renamed or deleted upstream falls through to the next candidate. Never the checked-out branch, which inside a posse worktree is the task branch. A repo with no remote and an unconventional default branch name resolves to nothing at all; pin its commands in `config\projects.json`.
+The default branch is resolved as `origin/HEAD`, then `origin/main` / `origin/master`, then - for a repo with no remote configured - the local `main` / `master`. Every candidate must actually exist: a stale `origin/HEAD` left by a default branch that was renamed or deleted upstream falls through to the next candidate. Never the checked-out branch, which inside a posse worktree is the task branch. A repo with no remote and an unconventional default branch name resolves to nothing at all; pin its commands in `config\projects.local.json`.
 
-**A bad anchor is loud, whatever the gate.** The anchor decides which ref manifests are read from and what "ahead of the default branch" means, so every run records its provenance in the evidence (`- default-branch anchor: ...`) - including runs whose commands were pinned rather than detected. A stale or unresolvable anchor additionally prints `ANCHOR WARNING` in the gate output, is kept as `anchorWarning` in task state, and shows up in `dep-posse.ps1 result`. It does not fail the branch: it is the repo that needs fixing (`git remote set-head origin -a`), and only the Sheriff can do that. An anchor that resolved normally stays out of the gate's output.
+**A bad anchor is loud, whatever the gate.** The anchor decides which ref manifests are read from and what "ahead of the default branch" means, so every run records its provenance in the evidence (`- default-branch anchor: ...`, or `- base-branch anchor: ...` for a task with a base branch) - including runs whose commands were pinned rather than detected. A stale or unresolvable anchor additionally prints `ANCHOR WARNING` in the gate output, is kept as `anchorWarning` in task state, and shows up in `dep-posse.ps1 result`. It does not fail the branch: it is the repo that needs fixing (`git remote set-head origin -a`), and only the Sheriff can do that. An anchor that resolved normally stays out of the gate's output.
 
 The gate's *command list* is Deputy-controlled; the test code those commands execute lives on the task branch, and is reviewed on the PR like any other change.
 
 **An empty gate is not a pass.** If nothing is configured and nothing is detected, `dep-validate.ps1` records `validation=unverified`, exits 2, and says so loudly - a gate that gates nothing must not read as green. `dep-publish.ps1` refuses an unverified task the same way it refuses a failed one. Two ways forward:
 
-1. Pin the repo's gate commands in `config\projects.json` and re-run `dep-validate.ps1` - fixes the repo for good.
+1. Pin the repo's gate commands in `config\projects.local.json` (or, for a pin every clone should share, `config\projects.json` in a pull request) and re-run `dep-validate.ps1` - fixes the repo for good.
 2. `dep-publish.ps1 <taskId> -AllowUnverified` - the Sheriff's explicit opt-in for a repo with genuinely nothing to run. The PR body then states in plain text that no tests and no lint were executed against the branch, and the task records `publishedUnverified`.
 
-`config\projects.json` overrides detection per repo - pin exact commands, or opt a repo out to `direct-pr` (the member pushes and opens the PR itself; needs `gh` access):
+The projects config overrides detection per repo - pin exact commands, or opt a repo out to `direct-pr` (the member pushes and opens the PR itself; needs `gh` access). Your own pins go in `config\projects.local.json`, which is gitignored; `config\projects.json` holds the tracked defaults every clone shares (see "Configuration"). Both have the same shape:
 
 ```json
 {
@@ -313,7 +356,7 @@ The gate's *command list* is Deputy-controlled; the test code those commands exe
 }
 ```
 
-`match` is a repo folder name, or a full path if it contains a slash. An empty `validate` list means auto-detect.
+`match` is a repo folder name, or a full path if it contains a slash (compared as a path, whatever its separators). An empty `validate` list means auto-detect. `delivery` must be `no-mistakes` or `direct-pr`; anything else is refused rather than guessed at. An entry may name only the keys it changes: the rest come from the `default` block. The local file's entries are matched first, and its `default` keys win over the tracked ones.
 
 The security property of no-mistakes: the agent that wrote the code never holds the pen on validation or publishing. Members need no `gh` or push access at all, and a branch cannot rubber-stamp its own gate.
 
@@ -328,7 +371,7 @@ So the title is a summary the branch proposed for itself, not a claim Deputy vou
 
 ## Permissions for posse members
 
-Headless members cannot answer permission prompts: anything not pre-approved stalls the task on its first gated action. Two ways to run them:
+Headless members cannot answer permission prompts, so anything that is neither allowed by the permission mode nor granted is denied - the member does not get to do it. Two ways to run them:
 
 1. **`bypassPermissions`** (the config default): members run fully unattended. Simple, and appropriate for repos and machines you trust - which is the usual posture for an autonomous posse.
 2. **`acceptEdits` + explicit grants**: least privilege, recommended for no-mistakes repos since members need so little:
@@ -339,14 +382,39 @@ Headless members cannot answer permission prompts: anything not pre-approved sta
 
    Pass `-AllowedTools` as a single comma-joined string when invoking via `pwsh -File` (it does not parse array literals). Scout members automatically get `--add-dir` access to `state\` for their report.
 
+   In every mode but `bypassPermissions`, members run with `--permission-prompts none`: anything that would prompt is denied on the spot, with a message that tells the member nobody can approve it, not to retry it, and to carry on with the parts of the task that need no approval. The member then says what it could not do in its report - usually as `blocked` - and you answer with `dep-send.ps1`, or respawn with the grant it needed. `--permission-prompts none` is added by `Get-MemberArguments`, so a resumed run has it too.
+
+What was observed on a real Claude Code (2.1.322, Windows 11): a throwaway member in `acceptEdits` mode, started through Deputy's own launcher in a git repository under the temp directory with no remote, told to run `git tag deputy-probe` and to report a denial word for word:
+
+| Command line | What happened |
+| --- | --- |
+| No grant, without `--permission-prompts` (Deputy before this change) | denied within seconds, with only `This command requires approval`; the member reported `blocked`. It did not stall |
+| No grant, `--permission-prompts none` | denied within seconds, with the explicit message above; the member reported `blocked` and did not retry |
+| As above, plus the repository's own `.claude/settings.json` allowing `Bash(git tag:*)` | still denied: the project allowlist is not honored in a directory that was never trusted interactively |
+| `-AllowedTools "Bash(git tag:*)"` | ran |
+| A read-only command (`git status --short`), no grant | ran: Claude Code allows read-only commands by itself |
+
 Two traps worth knowing:
 
-- The target repo's own `.claude/settings.json` allowlist does **not** apply: leased worktrees are untrusted directories, so project settings are not honored there. Grants must come from the spawner (`-AllowedTools`) or your user-level settings.
+- The target repo's own `.claude/settings.json` allowlist does **not** apply (observed above): leased worktrees are directories nobody trusted interactively. Grants must come from the spawner (`-AllowedTools`) or your user-level settings. Not checked: a worktree of a repository whose main checkout you have trusted.
 - `bypassPermissions` means members run shell commands unattended in their worktree. Point Deputy only at repos you trust, on a machine you trust.
 
 ## Configuration
 
-`config\deputy.json`:
+Configuration comes in two layers. The tracked files, `config\deputy.json` and `config\projects.json`, are the defaults every clone shares; they change only through pull requests, like any other file. Your own settings go in `config\deputy.local.json` and `config\projects.local.json`, which are gitignored, so personal pins - a model, a budget, the gate of a repository only you work on - never make your clone drift from `main`. Neither local file exists until you create it, and nothing is moved into them for you.
+
+- **Deputy settings** are merged key by key: the built-in defaults, then `config\deputy.json`, then `config\deputy.local.json`. A key the local file does not name keeps its tracked value, and `null` in either file means the built-in default, so a local `null` undoes a tracked value.
+- **Project profiles** (see "Delivery modes"): the `default` blocks are merged key by key, local over tracked, and the local file's `projects` entries are matched before the tracked ones. The tracked `deputy` entry stays in `config\projects.json`: it is how Deputy gates its own pull requests, for everyone.
+
+A local file that is not valid JSON, or a project entry with an unknown `delivery` or a `validate` that is not a list, is an error that names the file, never a silent fall back to the defaults.
+
+For example, a `config\deputy.local.json` that names only the keys it changes:
+
+```json
+{ "model": "opus", "maxBudgetUsd": 10 }
+```
+
+The keys:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -354,11 +422,12 @@ Two traps worth knowing:
 | `permissionMode` | `bypassPermissions` | Default permission mode for headless members (see Permissions above) |
 | `watchIntervalSeconds` | `15` | Watcher poll interval |
 | `stallMinutes` | `10` | Minutes without log activity before a stalled wake |
-| `branchPrefix` | `deputy/` | Branch name prefix for ship tasks |
+| `branchPrefix` | `deputy/` | Prefix of a ship task's branch, which is `<branchPrefix><taskId>`. A prefix git cannot use in a branch name is refused at spawn |
 | `autoWatch` | `true` | Whether the `Stop` / `StopFailure` hook runs the watcher and rewakes the session (see "Wakes that survive") |
 | `effort` | `null` | Default `--effort` for posse members: `low`, `medium`, `high`, `xhigh` or `max` (`null` = leave the flag off). `dep-spawn.ps1 -Effort` overrides it |
 | `maxBudgetUsd` | `null` | Default `--max-budget-usd` for one run of a posse member (`null` = no cap). `dep-spawn.ps1 -MaxBudgetUsd` overrides it |
 | `prPollMinutes` | `5` | Minutes between the watcher's reads of one published task's pull request (`0` = no PR watching, no `merged`, `degraded` or `closed` wakes) |
+| `memberIsolation` | `true` | Launch members with `--strict-mcp-config --disable-slash-commands`: no MCP servers, skills or slash commands from your setup (see "Member environment"). Recorded per task, so a resumed run matches its first run |
 
 ## Layout
 
@@ -366,7 +435,7 @@ Two traps worth knowing:
 bin\        toolbelt (dep-doctor, dep-spawn, dep-send, dep-watch, dep-wake, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-dashboard, dep-lib)
             and the session hooks (dep-session-start, dep-hook-guard, dep-hook-stop)
 .claude\    settings.json (the session hooks), skills\
-config\     deputy.json, projects.json
+config\     deputy.json, projects.json (tracked defaults); deputy.local.json, projects.local.json (yours, gitignored)
 tools\      Deputy's own gate: Invoke-Lint.ps1, Invoke-Tests.ps1, plus the module pins (gate-modules.psd1) and Install-GateModules.ps1
 tests\      Pester suite for the toolbelt
 .github\    workflows\ci.yml runs the gate on pull requests and pushes to main
@@ -381,7 +450,7 @@ PSScriptAnalyzerSettings.psd1   lint gate settings
 
 ## Working on Deputy itself
 
-Deputy gates its own repo with the same mechanism it applies to everything else: `config\projects.json` pins `match: deputy` to the two commands below, so a posse member working on Deputy is validated rather than waved through.
+Deputy gates its own repo with the same mechanism it applies to everything else: `config\projects.json` pins `match: deputy` to the two commands below, so a posse member working on Deputy is validated rather than waved through. That pin is tracked on purpose, unlike personal pins: every clone gates Deputy the same way. A member working on Deputy loads this repository's `AGENTS.md` as project instructions; its opening role exception, and the same sentence in the member's briefing, tell it that it is not the Deputy.
 
 ```powershell
 pwsh -NoProfile -File tools\Invoke-Lint.ps1    # PSScriptAnalyzer over bin\, tools\, tests\ (exit 1 on any finding)
@@ -394,7 +463,7 @@ Both run on exact module versions pinned in `tools\gate-modules.psd1`, and refus
 pwsh -NoProfile -File tools\Install-GateModules.ps1
 ```
 
-The tests build throwaway git repos and throwaway Deputy installs under `$env:TEMP` - no network, and they never touch the real `state\` or `logs\`. They need only `git` and `pwsh`: no treehouse, no claude, and no signed-in `gh`. Where a test has to see what a member process was given (`dep-spawn.ps1`, `dep-send.ps1`), fake `claude` and `treehouse` shims go first on `PATH`. Everything that reads or merges a pull request (`dep-pr.ps1`, `dep-publish.ps1`, `dep-return.ps1`, the watcher's PR polling) runs against a fake `gh` on `PATH` that answers `gh api` from a routes file, and against local bare repositories as `origin`.
+The tests build throwaway git repos and throwaway Deputy installs under `$env:TEMP` - no network, and they never touch the real `state\` or `logs\`. They need only `git` and `pwsh`: no treehouse, no claude, and no signed-in `gh`. Where a test has to see what a member process was given (`dep-spawn.ps1`, `dep-send.ps1`), fake `claude` and `treehouse` shims go first on `PATH`; the `treehouse` shim leases a real linked worktree of a throwaway repository and cuts the branch it is asked for, so the spawn contract is checked against real git state. Everything that reads or merges a pull request (`dep-pr.ps1`, `dep-publish.ps1`, `dep-return.ps1`, the watcher's PR polling) runs against a fake `gh` on `PATH` that answers `gh api` from a routes file, and against local bare repositories as `origin`.
 
 ### CI
 
