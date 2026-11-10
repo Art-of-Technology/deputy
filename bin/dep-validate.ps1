@@ -3,17 +3,24 @@
 .SYNOPSIS
 Run the no-mistakes validation gate for a finished ship task, in its worktree.
 
-The gate is deterministic and Deputy-controlled: commands come from
-config\projects.json, never from the repo under validation, and the posse
-member is not involved. On a green run the evidence is committed to the task
-branch (PR-viewable) and the task is marked validation=passed, which is what
-authorizes dep-publish.ps1. On a red run the failure summary is recorded in
-task state for the respawn briefing.
+The gate is deterministic and Deputy-controlled: commands come from the
+Deputy config (config\projects.local.json over config\projects.json) or are
+detected from manifests on the task's base, never from the branch under
+validation, and the posse member is not involved. On a green run the evidence
+is committed to the task branch (PR-viewable) and the task is marked
+validation=passed, which is what authorizes dep-publish.ps1. On a red run the
+failure summary is recorded in task state for the respawn briefing.
+
+The base is the branch the task was cut from: its base branch when it was
+spawned with one (baseBranch in task state), else the default branch. It is
+the anchor for what "commits ahead" means and for the manifests detection
+reads.
 
 A gate with no commands is neither: it proves nothing, so it is recorded as
 validation=unverified and dep-publish.ps1 refuses it unless the Sheriff
 approves -AllowUnverified. Fix an unverified repo by pinning its commands in
-config\projects.json.
+config\projects.local.json (or config\projects.json, for a pin every clone
+should share).
 
 Exit codes: 0 = passed, 1 = failed, 2 = unverified (nothing ran).
 #>
@@ -35,35 +42,46 @@ $wt = $task.worktree
 # A re-run must not inherit the previous run's verdict or its explanation
 foreach ($stale in 'validationNote', 'validationError', 'anchorWarning', 'validatedHead') { Set-TaskField $task $stale $null }
 
-$anchor = Resolve-DefaultRef $wt
+# The anchor: what the branch was cut from. The task's base branch when it was
+# spawned with one (-BaseBranch), else the default branch.
+$baseBranch = [string](Get-EventField $task 'baseBranch')
+$anchor = Resolve-BaseRef $wt $baseBranch
+$anchorName = if ($baseBranch) { 'base-branch anchor' } else { 'default-branch anchor' }
 $projProfile = Get-ProjectProfile $task.repo
 $commands = @($projProfile.validate)
-$gateSource = 'configured in deputy config\projects.json'
+$gateSource = "configured in deputy $($projProfile.validateSource)"
 if ($commands.Count -eq 0) {
-    $commands = @(Get-AutoValidateCommands $wt $anchor.Ref)
+    # Never detected from anything but the trusted anchor.
+    $commands = if ($anchor.Ref) { @(Get-AutoValidateCommands $wt $anchor.Ref) } else { @() }
     $gateSource = if ($anchor.Ref) {
         "auto-detected from manifests on $($anchor.Ref) ($($anchor.Source))"
     }
-    else { 'auto-detection had no trusted default branch to read manifests from' }
+    else { "auto-detection had no trusted ref to read manifests from ($($anchor.Source))" }
 }
 
 # The anchor is the gate's trust root whether or not detection ran: it decides
-# which ref manifests are read from, and what "ahead of the default branch"
-# means. So its provenance is reported here, before the gate and independently
-# of how the commands were resolved - a repo that pins its commands used to be
-# the one place a stale origin/HEAD stayed invisible. Proportionate on purpose:
-# a healthy anchor is recorded in the evidence only, while a stale or
-# unresolved one is printed and kept in task state, because those are the cases
-# that need a repo-level fix from the Sheriff.
+# which ref manifests are read from, and what "ahead of the base" means. So its
+# provenance is reported here, before the gate and independently of how the
+# commands were resolved - a repo that pins its commands used to be the one
+# place a stale origin/HEAD stayed invisible. Proportionate on purpose: a
+# healthy anchor is recorded in the evidence only, while a stale or unresolved
+# one is printed and kept in task state, because those are the cases that need
+# a repo-level fix from the Sheriff.
 $anchorWarning = switch ($anchor.Health) {
     'stale' {
         "$($anchor.Source). The gate anchored on $($anchor.Ref) instead. Fix it at the repo level " +
         "with: git remote set-head origin -a (in $($task.repo))"
     }
     'unresolved' {
-        'could not resolve a trusted default branch for this repo (no origin/HEAD, no origin/main ' +
-        'or origin/master, no local main or master), so the branch was not checked for being ahead ' +
-        "of the default branch and manifests could not be read from a trusted ref (anchor: $($anchor.Source))"
+        if ($baseBranch) {
+            "could not resolve the task's base branch: $($anchor.Source). The branch was not checked for being " +
+            "ahead of it, and manifests could not be read from a trusted ref. Fetch or restore '$baseBranch' in $($task.repo)"
+        }
+        else {
+            'could not resolve a trusted default branch for this repo (no origin/HEAD, no origin/main ' +
+            'or origin/master, no local main or master), so the branch was not checked for being ahead ' +
+            "of the default branch and manifests could not be read from a trusted ref (anchor: $($anchor.Source))"
+        }
     }
     default { $null }
 }
@@ -102,7 +120,7 @@ function Deny-Verification([string]$Reason) {
     Save-Verdict
     Write-Output "VALIDATION UNVERIFIED: $Reason"
     Write-Output 'The gate ran nothing, so nothing about this branch is verified. This is NOT a pass.'
-    Write-Output "Fix: pin this repo's gate commands in config\projects.json, then re-run dep-validate.ps1 $Id."
+    Write-Output "Fix: pin this repo's gate commands in config\projects.local.json, then re-run dep-validate.ps1 $Id."
     Write-Output 'dep-publish.ps1 refuses an unverified task unless the Sheriff approves -AllowUnverified.'
     exit 2
 }
@@ -127,11 +145,15 @@ if ($anchor.Ref) {
 
 if ($commands.Count -eq 0) {
     if ($anchor.Ref) {
-        Deny-Verification ("no gate commands are configured for this repo in config\projects.json, " +
+        Deny-Verification ("no gate commands are configured for this repo in config\projects.json or config\projects.local.json, " +
             "and none could be detected from the manifests on $($anchor.Ref)")
     }
+    elseif ($baseBranch) {
+        Deny-Verification ('no gate commands are configured for this repo in config\projects.json or config\projects.local.json, ' +
+            "and the task's base branch could not be resolved ($($anchor.Source)), so manifests could not be read at all")
+    }
     else {
-        Deny-Verification ('no gate commands are configured for this repo in config\projects.json, ' +
+        Deny-Verification ('no gate commands are configured for this repo in config\projects.json or config\projects.local.json, ' +
             'and no trusted default branch could be resolved (no origin/HEAD, no origin/main or ' +
             'origin/master, no local main or master), so manifests could not be read at all')
     }
@@ -195,7 +217,7 @@ $lines = @(
     "- validated commit: $headSha"
     "- validated at: $(Get-Date -Format o)"
     "- gate source: $gateSource"
-    "- default-branch anchor: $($anchor.Ref ? "$($anchor.Ref) ($($anchor.Source))" : $anchor.Source)"
+    "- ${anchorName}: $($anchor.Ref ? "$($anchor.Ref) ($($anchor.Source))" : $anchor.Source)"
     "- verdict: $($allPassed ? 'PASSED' : 'FAILED')"
     $(if ($anchorWarning) { "- anchor warning: $anchorWarning" })
     ''

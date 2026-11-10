@@ -192,6 +192,33 @@ Describe 'Get-MemberArguments' {
         Get-FlagValue $arguments '--allowedTools' | Should -Be 'Bash(git *),Bash(npm *)'
     }
 
+    It 'has nobody answer permission prompts in every mode but bypassPermissions' {
+        # A headless member cannot answer one: whatever would prompt is denied.
+        foreach ($mode in 'acceptEdits', 'auto', 'dontAsk', 'manual', 'plan') {
+            Get-FlagValue @(Get-MemberArguments -SessionId $script:sid -PermissionMode $mode) '--permission-prompts' |
+                Should -Be 'none' -Because "mode $mode"
+        }
+        @(Get-MemberArguments -SessionId $script:sid) | Should -Not -Contain '--permission-prompts'
+    }
+
+    It 'isolates the member from MCP servers, skills and commands only when asked' {
+        $isolated = @(Get-MemberArguments -SessionId $script:sid -Isolation)
+        $isolated | Should -Contain '--strict-mcp-config'
+        $isolated | Should -Contain '--disable-slash-commands'
+        $isolated | Should -Not -Contain '--mcp-config'
+        $plain = @(Get-MemberArguments -SessionId $script:sid)
+        $plain | Should -Not -Contain '--strict-mcp-config'
+        $plain | Should -Not -Contain '--disable-slash-commands'
+    }
+
+    It 'resumes a task with the isolation it was spawned with, and an older task without it' {
+        $isolated = [pscustomobject]@{ id = 'posse-20260101-120000-abc'; kind = 'ship'; sessionId = $script:sid; memberIsolation = $true }
+        @(Get-TaskMemberArguments $isolated -Resume) | Should -Contain '--strict-mcp-config'
+        @(Get-TaskMemberArguments $isolated -Resume) | Should -Contain '--disable-slash-commands'
+        $older = [pscustomobject]@{ id = 'posse-20260101-120000-abc'; kind = 'ship'; sessionId = $script:sid }
+        @(Get-TaskMemberArguments $older -Resume) | Should -Not -Contain '--strict-mcp-config'
+    }
+
     It 'refuses <Name>' -ForEach @(
         @{ Name = 'an unknown effort level'; Extra = @{ Effort = 'extreme' }; Message = 'not one of' }
         @{ Name = 'a zero budget'; Extra = @{ MaxBudgetUsd = 0 }; Message = 'not a positive amount' }
@@ -418,8 +445,10 @@ Describe 'dep-spawn.ps1' {
         $script:spawnDir = Join-Path $script:root 'spawn'
         $script:spawnInstall = New-DeputyInstall -Path (Join-Path $script:spawnDir 'deputy') -SourceRoot $script:sourceRoot
         $script:spawnRepo = New-TestRepo -Path (Join-Path $script:spawnDir 'repo')
+        # A linked worktree of the repo, as a treehouse slot is: dep-spawn.ps1
+        # refuses a lease that is not a worktree of its own.
         $script:spawnLease = Join-Path $script:spawnDir 'leased'
-        New-Item -ItemType Directory -Force $script:spawnLease | Out-Null
+        Invoke-Git @('-C', $script:spawnRepo, 'worktree', 'add', '-q', '--detach', $script:spawnLease)
         $script:spawnLease = (Resolve-Path $script:spawnLease).Path
         $script:spawnShims = New-MemberShims -Path (Join-Path $script:spawnDir 'shims') -LeasePath $script:spawnLease
         $script:spawnConfig = Join-Path $script:spawnInstall 'config' 'deputy.json'
@@ -477,7 +506,8 @@ Describe 'dep-spawn.ps1' {
 
         It 'passes the whole argument list a member needs' {
             @($script:shipSpawn.Call.args) | Should -Be @('-p', '--output-format', 'stream-json', '--verbose',
-                '--model', 'test-model', '--dangerously-skip-permissions', '--effort', 'high',
+                '--model', 'test-model', '--dangerously-skip-permissions',
+                '--strict-mcp-config', '--disable-slash-commands', '--effort', 'high',
                 '--max-budget-usd', '3', '--json-schema', $script:schema,
                 '--session-id', $script:shipSpawn.State.sessionId, '-n', $script:shipSpawn.Id)
         }
@@ -486,6 +516,7 @@ Describe 'dep-spawn.ps1' {
             $script:shipSpawn.State.effort | Should -Be 'high'
             $script:shipSpawn.State.maxBudgetUsd | Should -Be 3
             $script:shipSpawn.State.model | Should -Be 'test-model'
+            $script:shipSpawn.State.memberIsolation | Should -BeTrue
             $script:shipSpawn.State.logOffset | Should -Be 0
             @($script:shipSpawn.State.followUps).Count | Should -Be 0
         }

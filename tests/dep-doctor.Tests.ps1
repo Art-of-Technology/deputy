@@ -24,6 +24,8 @@ Usage:
   treehouse get [flags]
 
 Flags:
+      --base string           Branch to cut this worktree from
+  -b, --branch string         Create and check out a new Git branch at the acquired commit
       --json                  Print lease allocation as JSON (requires --lease)
       --lease                 Durably lease a worktree without opening a subshell
       --lease-holder string   Optional label recorded as the lease holder
@@ -34,7 +36,21 @@ Usage:
   treehouse get [flags]
 
 Flags:
+      --base string           Branch to cut this worktree from
+  -b, --branch string         Create and check out a new Git branch at the acquired commit
       --lease-holder string   Optional label recorded as the holder
+'@
+    # A help text from before the branch flags: --base-dir and --branches are
+    # not the flags Deputy needs.
+    $script:NO_BRANCH_HELP = @'
+Usage:
+  treehouse get [flags]
+
+Flags:
+      --base-dir string       Something else entirely
+      --branches              Something else entirely
+      --json                  Print lease allocation as JSON (requires --lease)
+      --lease                 Durably lease a worktree without opening a subshell
 '@
 
     # In-process fake: a function shadows any treehouse on PATH. What it prints
@@ -185,6 +201,17 @@ Describe 'Get-TreehouseProblems' {
         $problems = @(Get-TreehouseProblems)
         $problems | Should -HaveCount 1
         $problems[0] | Should -Match 'does not list --lease'
+    }
+
+    It 'reports a treehouse whose get cannot create a branch or take a base' {
+        # dep-spawn.ps1 leases every ship task with -b <branch>, and -BaseBranch
+        # with --base.
+        $script:fakeHelp = $script:NO_BRANCH_HELP
+        $problems = @(Get-TreehouseProblems)
+        $problems | Should -HaveCount 2
+        $problems[0] | Should -Match 'does not list --branch'
+        $problems[1] | Should -Match 'does not list --base'
+        $problems | ForEach-Object { $_ | Should -Match 'Fix: treehouse update' }
     }
 
     It 'reports a missing treehouse with its install command, and nothing else' {
