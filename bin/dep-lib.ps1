@@ -75,6 +75,10 @@ function Get-DeputyConfig {
         # rewakes the session (dep-hook-stop.ps1). Off leaves the queue, the
         # session-start report and the stop guard in place.
         autoWatch            = $true
+        # Defaults for dep-spawn.ps1 -Effort and -MaxBudgetUsd. Null leaves the
+        # flag off the member's command line.
+        effort               = $null
+        maxBudgetUsd         = $null
     }
     $p = Get-DeputyPaths
     if (Test-Path $p.ConfigFile) {
@@ -495,6 +499,12 @@ function Format-Wake {
     if ($Wake.prUrl) { '  pr: {0}' -f $Wake.prUrl }
     if ($Wake.prUrlRejected) { "  pr REJECTED (not this task's repo): {0}" -f $Wake.prUrlRejected }
     if ($Wake.summary) { '  {0}' -f $Wake.summary }
+    if ($Wake.question) { '  question: {0}' -f $Wake.question }
+    if ($script:FollowUpWakes -contains $Wake.event) {
+        # These are answered in the member's own session, not with a respawn.
+        '  follow-ups sent so far: {0}. Answer in the same session with: {1}' -f
+            [int]$Wake.followUps, (Get-SendCommand $Wake.taskId)
+    }
 }
 
 function Get-WakeCommand([string]$Arguments) {
@@ -1183,6 +1193,468 @@ function Stop-TaskProcesses($State) {
         }
     }
     $killed
+}
+
+# ---------------------------------------------------------------------------
+# Member sessions. A member is a headless claude session with an id Deputy
+# chose, so it can be resumed: dep-spawn.ps1 starts it, dep-send.ps1 continues
+# it with a follow-up message once its process has exited. Both build their
+# command line and launch through the functions here, so a resumed run is
+# started exactly like the first one.
+# ---------------------------------------------------------------------------
+
+$script:MemberEffortLevels = @('low', 'medium', 'high', 'xhigh', 'max')
+
+# The statuses a member can end its structured final report with, and the wake
+# each one becomes. 'done' and 'failed' keep the wakes they always had.
+$script:MemberReportWakes = [ordered]@{
+    'done'           = 'completed'
+    'blocked'        = 'blocked'
+    'needs-decision' = 'needs-decision'
+    'failed'         = 'failed'
+}
+
+# Wakes that are answered with dep-send.ps1 rather than a respawn.
+$script:FollowUpWakes = @('interrupted', 'blocked', 'needs-decision')
+
+# HTTP statuses of a server-side failure that is expected to pass by itself.
+$script:TransientApiStatuses = @(429, 500, 502, 503, 529)
+
+function Get-MemberReportSchema {
+    # The JSON schema of a member's final report, passed as --json-schema. One
+    # line, and deliberately free of spaces and of anything a shell could read
+    # as an operator: it travels on a command line.
+    $schema = [ordered]@{
+        type                 = 'object'
+        properties           = [ordered]@{
+            status   = [ordered]@{ type = 'string'; enum = @($script:MemberReportWakes.Keys) }
+            summary  = [ordered]@{ type = 'string' }
+            tests    = [ordered]@{ type = 'string' }
+            question = [ordered]@{ type = 'string' }
+            prUrl    = [ordered]@{ type = 'string' }
+        }
+        required             = @('status', 'summary')
+        additionalProperties = $false
+    }
+    $schema | ConvertTo-Json -Compress -Depth 6
+}
+
+function Get-MemberReportInstructions([switch]$PullRequest) {
+    # The closing section of every briefing: how a member fills in its report.
+    $lines = @(
+        'Your final message is your report to the Deputy, and it is structured: this session enforces a JSON schema on it. Fill it in honestly:'
+        '- status: "done" (the task is finished and you verified it), "blocked" (you cannot go on without something only the Deputy or the Sheriff can provide), "needs-decision" (there is a choice that is not yours to make) or "failed" (you tried and could not do it).'
+        '- summary: short and plain. What you did and found, or what stopped you.'
+        '- tests: the commands you ran and their exact results. Leave it out if you ran none.'
+        '- question: required when status is "blocked" or "needs-decision". The one thing you need answered, with the options you see and the one you recommend.'
+    )
+    if ($PullRequest) { $lines += '- prUrl: the URL of the pull request you opened. Leave it out if you opened none.' }
+    $lines += 'This session can be resumed: the Deputy can answer your question with a follow-up message and you carry on here with everything you know. So when you are blocked or a decision is not yours, stop and ask instead of guessing.'
+    $lines -join "`n"
+}
+
+function ConvertTo-InvariantNumber($Value) {
+    # A number read from JSON or a command line as a double, or $null when it
+    # is not one. Never through the current culture: 1.5 must not become 15.
+    if ($null -eq $Value) { return $null }
+    $parsed = 0.0
+    $text = [string]::Format([cultureinfo]::InvariantCulture, '{0}', $Value)
+    if ([double]::TryParse($text, [System.Globalization.NumberStyles]::Float, [cultureinfo]::InvariantCulture, [ref]$parsed)) {
+        return $parsed
+    }
+    $null
+}
+
+function Get-MemberArguments {
+    <#
+    .SYNOPSIS
+    The claude arguments for a member run: a new session (-SessionId with
+    -Name), or a finished one continued (-SessionId with -Resume).
+
+    Everything except the session flags is the same for both, which is the
+    point: permissions, model, effort, budget and the report schema belong to
+    the process, not to the stored session, so a resumed run has to be given
+    them again.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [switch]$Resume,
+        [string]$Name,
+        [string]$Model,
+        [string]$PermissionMode = 'bypassPermissions',
+        [string[]]$AllowedTools,
+        [string]$Effort,
+        $MaxBudgetUsd,
+        [string[]]$AddDir
+    )
+    $parsedId = [guid]::Empty
+    if (-not [guid]::TryParse($SessionId, [ref]$parsedId)) { throw "Session id '$SessionId' is not a UUID." }
+    if ($Effort -and $script:MemberEffortLevels -notcontains $Effort) {
+        throw "Effort '$Effort' is not one of: $($script:MemberEffortLevels -join ', ')."
+    }
+
+    $arguments = @('-p', '--output-format', 'stream-json', '--verbose')
+    if ($Model) { $arguments += @('--model', "$Model") }
+    if ($PermissionMode -eq 'bypassPermissions') { $arguments += '--dangerously-skip-permissions' }
+    else {
+        $arguments += @('--permission-mode', $PermissionMode)
+        if ($AllowedTools) { $arguments += @('--allowedTools', ($AllowedTools -join ',')) }
+    }
+    foreach ($dir in @($AddDir | Where-Object { $_ })) { $arguments += @('--add-dir', $dir) }
+    if ($Effort) { $arguments += @('--effort', $Effort) }
+    if ($null -ne $MaxBudgetUsd -and "$MaxBudgetUsd" -ne '') {
+        $budget = ConvertTo-InvariantNumber $MaxBudgetUsd
+        if ($null -eq $budget -or $budget -le 0) { throw "MaxBudgetUsd '$MaxBudgetUsd' is not a positive amount." }
+        $arguments += @('--max-budget-usd', $budget.ToString([cultureinfo]::InvariantCulture))
+    }
+    $arguments += @('--json-schema', (Get-MemberReportSchema))
+    if ($Resume) { $arguments += @('--resume', $SessionId) }
+    else {
+        $arguments += @('--session-id', $SessionId)
+        if ($Name) { $arguments += @('-n', $Name) }
+    }
+    $arguments
+}
+
+function Get-TaskMemberArguments($State, [switch]$Resume) {
+    # A task's member arguments, from what its record says it was spawned with.
+    $read = { param($name) if ($State.PSObject.Properties[$name]) { $State.$name } else { $null } }
+    $settings = @{
+        SessionId      = [string](& $read 'sessionId')
+        Resume         = [bool]$Resume
+        Name           = $State.id
+        Model          = [string](& $read 'model')
+        PermissionMode = [string](& $read 'permissionMode')
+        AllowedTools   = @(& $read 'allowedTools' | Where-Object { $_ })
+        Effort         = [string](& $read 'effort')
+        MaxBudgetUsd   = (& $read 'maxBudgetUsd')
+        # Scouts write their report into the deputy state dir, outside their worktree
+        AddDir         = @(if ($State.kind -eq 'scout') { (Get-DeputyPaths).State })
+    }
+    if (-not $settings.PermissionMode) { $settings.PermissionMode = 'bypassPermissions' }
+    Get-MemberArguments @settings
+}
+
+function ConvertTo-ProcessArgument([string]$Value) {
+    # One argument, quoted the way the Windows C runtime reads a command line:
+    # backslashes are literal except in front of a double quote, where they
+    # double, and a quote inside the argument is escaped with one more.
+    if ($Value -ne '' -and $Value -notmatch '[\s"]') { return $Value }
+    $text = [System.Text.StringBuilder]::new('"')
+    $backslashes = 0
+    foreach ($char in $Value.ToCharArray()) {
+        if ($char -eq [char]'\') { $backslashes++; continue }
+        if ($char -eq [char]'"') { $null = $text.Append([char]'\', (2 * $backslashes) + 1) }
+        else { $null = $text.Append([char]'\', $backslashes) }
+        $null = $text.Append($char)
+        $backslashes = 0
+    }
+    $null = $text.Append([char]'\', 2 * $backslashes).Append([char]'"')
+    $text.ToString()
+}
+
+function Get-MemberCommandLine([string]$Executable, [string[]]$Arguments) {
+    # The program to start and its full command line. A .cmd or .bat shim is
+    # not an executable, so it runs under cmd.exe; /s makes cmd strip exactly
+    # the outer pair of quotes and take the rest as written.
+    $line = (@($Executable) + @($Arguments) | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' '
+    if ($Executable -match '\.(cmd|bat)$') {
+        $shell = $env:ComSpec
+        return [pscustomobject]@{
+            FilePath    = $shell
+            CommandLine = '{0} /d /s /c "{1}"' -f (ConvertTo-ProcessArgument $shell), $line
+        }
+    }
+    [pscustomobject]@{ FilePath = $Executable; CommandLine = $line }
+}
+
+function Start-MemberProcess {
+    <#
+    .SYNOPSIS
+    Start a member process in a worktree: stdin from a file, stdout and stderr
+    APPENDED to the task's logs, no window. Returns its pid and start time.
+
+    Start-Process cannot do this - its redirection truncates the target, and a
+    resumed run has to continue the log the first run wrote. So the process is
+    created directly, with the three files as its standard handles and nothing
+    else inherited: a member that inherited the caller's own output pipe would
+    hold it open for as long as it runs.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TaskId,
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [Parameter(Mandatory)][string]$StdinFile,
+        [Parameter(Mandatory)][string]$StdoutLog,
+        [Parameter(Mandatory)][string]$StderrLog
+    )
+    if (-not ('Deputy.MemberLauncher' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+namespace Deputy {
+    public static class MemberLauncher {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SecurityAttributes {
+            public int Length;
+            public IntPtr SecurityDescriptor;
+            public int InheritHandle;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct StartupInfo {
+            public int Cb;
+            public IntPtr Reserved;
+            public IntPtr Desktop;
+            public IntPtr Title;
+            public int X, Y, XSize, YSize, XCountChars, YCountChars, FillAttribute, Flags;
+            public short ShowWindow;
+            public short Reserved2Size;
+            public IntPtr Reserved2;
+            public IntPtr StdInput, StdOutput, StdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct StartupInfoEx {
+            public StartupInfo StartupInfo;
+            public IntPtr AttributeList;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ProcessInformation {
+            public IntPtr Process, Thread;
+            public int ProcessId, ThreadId;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateFileW(string name, uint access, uint share,
+            ref SecurityAttributes security, uint disposition, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute,
+            IntPtr value, IntPtr size, IntPtr previous, IntPtr returnSize);
+
+        [DllImport("kernel32.dll")]
+        private static extern void DeleteProcThreadAttributeList(IntPtr list);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool CreateProcessW(string application, System.Text.StringBuilder commandLine,
+            IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint flags,
+            IntPtr environment, string currentDirectory, ref StartupInfoEx startupInfo,
+            out ProcessInformation processInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit,
+            out long kernel, out long user);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+        private static IntPtr Open(string path, uint access, uint disposition) {
+            SecurityAttributes security = new SecurityAttributes();
+            security.Length = Marshal.SizeOf(typeof(SecurityAttributes));
+            security.InheritHandle = 1;
+            const uint ShareAll = 0x1 | 0x2 | 0x4, AttributeNormal = 0x80;
+            IntPtr handle = CreateFileW(path, access, ShareAll, ref security, disposition, AttributeNormal, IntPtr.Zero);
+            if (handle == InvalidHandle) {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot open " + path);
+            }
+            return handle;
+        }
+
+        // Returns { pid, creation time as a UTC file time }.
+        public static long[] Start(string application, string commandLine, string workingDirectory,
+            string stdinFile, string stdoutLog, string stderrLog) {
+            const uint GenericRead = 0x80000000, AppendData = 0x0004, Synchronize = 0x00100000;
+            const uint OpenExisting = 3, OpenAlways = 4;
+            const int UseStdHandles = 0x100, UseShowWindow = 0x1;
+            const uint ExtendedStartupInfo = 0x00080000, NewConsole = 0x00000010;
+            IntPtr HandleListAttribute = new IntPtr(0x00020002);
+
+            IntPtr input = IntPtr.Zero, output = IntPtr.Zero, error = IntPtr.Zero;
+            IntPtr attributeList = IntPtr.Zero, handleList = IntPtr.Zero;
+            bool listReady = false;
+            try {
+                input = Open(stdinFile, GenericRead, OpenExisting);
+                // Append-only access: every write lands at the end of the file,
+                // whatever else has written to it since.
+                output = Open(stdoutLog, AppendData | Synchronize, OpenAlways);
+                error = Open(stderrLog, AppendData | Synchronize, OpenAlways);
+
+                // Only these three handles are inherited.
+                handleList = Marshal.AllocHGlobal(IntPtr.Size * 3);
+                Marshal.WriteIntPtr(handleList, 0, input);
+                Marshal.WriteIntPtr(handleList, IntPtr.Size, output);
+                Marshal.WriteIntPtr(handleList, IntPtr.Size * 2, error);
+                IntPtr size = IntPtr.Zero;
+                InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+                attributeList = Marshal.AllocHGlobal(size);
+                if (!InitializeProcThreadAttributeList(attributeList, 1, 0, ref size)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot prepare the handle list");
+                }
+                listReady = true;
+                if (!UpdateProcThreadAttribute(attributeList, 0, HandleListAttribute, handleList,
+                        (IntPtr)(IntPtr.Size * 3), IntPtr.Zero, IntPtr.Zero)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot set the handle list");
+                }
+
+                StartupInfoEx startup = new StartupInfoEx();
+                startup.StartupInfo.Cb = Marshal.SizeOf(typeof(StartupInfoEx));
+                // A console of its own, hidden, which the member's own child
+                // processes share instead of each opening a window.
+                startup.StartupInfo.Flags = UseStdHandles | UseShowWindow;
+                startup.StartupInfo.ShowWindow = 0;
+                startup.StartupInfo.StdInput = input;
+                startup.StartupInfo.StdOutput = output;
+                startup.StartupInfo.StdError = error;
+                startup.AttributeList = attributeList;
+
+                ProcessInformation info;
+                System.Text.StringBuilder line = new System.Text.StringBuilder(commandLine);
+                if (!CreateProcessW(application, line, IntPtr.Zero, IntPtr.Zero, true,
+                        ExtendedStartupInfo | NewConsole, IntPtr.Zero, workingDirectory, ref startup, out info)) {
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "Cannot start " + application);
+                }
+                try {
+                    long creation, exit, kernel, user;
+                    if (!GetProcessTimes(info.Process, out creation, out exit, out kernel, out user)) creation = 0;
+                    return new long[] { info.ProcessId, creation };
+                }
+                finally {
+                    CloseHandle(info.Thread);
+                    CloseHandle(info.Process);
+                }
+            }
+            finally {
+                if (listReady) DeleteProcThreadAttributeList(attributeList);
+                if (attributeList != IntPtr.Zero) Marshal.FreeHGlobal(attributeList);
+                if (handleList != IntPtr.Zero) Marshal.FreeHGlobal(handleList);
+                if (input != IntPtr.Zero) CloseHandle(input);
+                if (output != IntPtr.Zero) CloseHandle(output);
+                if (error != IntPtr.Zero) CloseHandle(error);
+            }
+        }
+    }
+}
+'@
+    }
+
+    $claude = Get-Command claude -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $command = Get-MemberCommandLine $claude.Source $Arguments
+
+    # Mark the member's environment (it is inherited from this process) so that
+    # Deputy's own session hooks can tell a posse member from the Deputy: a
+    # member working on the Deputy repository itself loads the same
+    # .claude\settings.json, and there the hooks must do nothing (see
+    # Test-DeputyHome).
+    $previousMarker = $env:DEPUTY_POSSE_TASK
+    $env:DEPUTY_POSSE_TASK = $TaskId
+    try {
+        $started = [Deputy.MemberLauncher]::Start($command.FilePath, $command.CommandLine, $WorkingDirectory,
+            $StdinFile, $StdoutLog, $StderrLog)
+    }
+    finally { $env:DEPUTY_POSSE_TASK = $previousMarker }
+
+    [pscustomobject]@{
+        ProcessId = [int]$started[0]
+        StartedAt = if ($started[1] -gt 0) { [datetime]::FromFileTimeUtc($started[1]).ToLocalTime().ToString('o') } else { $null }
+    }
+}
+
+function Get-EventField($Object, [string]$Name) {
+    # A property of a parsed JSON object, or $null when it is not there.
+    if ($Object -is [pscustomobject] -and $Object.PSObject.Properties[$Name]) { $Object.$Name } else { $null }
+}
+
+function Test-TransientApiError($ResultEvent, [string]$Text) {
+    # Did this error result come from a server-side failure that is expected to
+    # pass (rate limit, overload, a 5xx)? The session itself is intact then, so
+    # it is continued rather than started again. The status field decides when
+    # it is there; the text is read only for an API error it names.
+    $status = 0
+    if ([int]::TryParse([string](Get-EventField $ResultEvent 'api_error_status'), [ref]$status) -and
+        $script:TransientApiStatuses -contains $status) {
+        return $true
+    }
+    if ($status -gt 0) { return $false }  # a status that is not transient: believe it
+    if ($Text -match '(?i)\boverloaded(_error)?\b') { return $true }
+    $Text -match ('(?i)\bAPI\s+error\b\D{0,20}(' + ($script:TransientApiStatuses -join '|') + ')\b')
+}
+
+function Get-MemberReport($ResultEvent) {
+    # The structured final report in a result event, or $null when there is
+    # none that follows the schema (an older session, a schema the member could
+    # not satisfy). The caller then falls back to the result text.
+    $structured = Get-EventField $ResultEvent 'structured_output'
+    if ($structured -isnot [pscustomobject]) { return $null }
+    $status = [string](Get-EventField $structured 'status')
+    if (-not $script:MemberReportWakes.Contains($status)) { return $null }
+    $report = [ordered]@{ status = $status }
+    foreach ($field in 'summary', 'tests', 'question', 'prUrl') {
+        $value = Get-EventField $structured $field
+        $report[$field] = if ($null -ne $value -and "$value".Trim()) { "$value".Trim() } else { $null }
+    }
+    [pscustomobject]$report
+}
+
+function Format-MemberReport($Report, [switch]$NoQuestion) {
+    # A structured report as the text a person reads: in dep-posse.ps1 result,
+    # and as the summary of the pull request.
+    $parts = @()
+    if ($Report.summary) { $parts += $Report.summary }
+    if ($Report.tests) { $parts += "Tests: $($Report.tests)" }
+    if ($Report.question -and -not $NoQuestion) { $parts += "Question: $($Report.question)" }
+    if ($parts.Count -eq 0) { $parts += "The member reported '$($Report.status)' and said nothing else." }
+    $parts -join "`n`n"
+}
+
+function Get-MemberOutcome($ResultEvent) {
+    <#
+    .SYNOPSIS
+    What a member's final result event means: the wake it becomes, the text of
+    the result, and the structured report when there is one.
+
+    | result                                       | wake                    |
+    | is_error, transient API failure              | interrupted             |
+    | is_error, anything else                      | failed                  |
+    | structured report                            | by its status (see map) |
+    | plain text (no report, or not to the schema) | completed               |
+    #>
+    $text = [string](Get-EventField $ResultEvent 'result')
+    if (-not $text.Trim()) {
+        # An error result often has no text, only a list of errors.
+        $text = (@(Get-EventField $ResultEvent 'errors') | Where-Object { $_ } | ForEach-Object { "$_" }) -join '; '
+    }
+    if (Get-EventField $ResultEvent 'is_error') {
+        if (-not $text.Trim()) { $text = "The session ended with an error ($(Get-EventField $ResultEvent 'subtype'))." }
+        $wake = if (Test-TransientApiError $ResultEvent $text) { 'interrupted' } else { 'failed' }
+        return [pscustomobject]@{ Wake = $wake; Text = $text; Report = $null }
+    }
+    $report = Get-MemberReport $ResultEvent
+    if ($report) {
+        return [pscustomobject]@{
+            Wake   = $script:MemberReportWakes[$report.status]
+            Text   = Format-MemberReport $report
+            Report = $report
+        }
+    }
+    [pscustomobject]@{ Wake = 'completed'; Text = $text; Report = $null }
+}
+
+function Get-TaskFollowUps($State) {
+    # The follow-up messages dep-send.ps1 has sent to a task, oldest first.
+    @(Get-EventField $State 'followUps' | Where-Object { $_ })
+}
+
+function Get-SendCommand([string]$Id, [string]$Message = '...') {
+    'pwsh -NoProfile -File "{0}" {1} -Message "{2}"' -f (Join-Path (Get-DeputyPaths).Bin 'dep-send.ps1'), $Id, $Message
 }
 
 function Limit-Text([string]$Text, [int]$Max = 200) {

@@ -66,5 +66,8 @@ Move-Item -Force (Get-TaskStatePath $Id) (Join-Path $paths.Archive "$Id.json")
 if (Test-Path $task.briefing) {
     Move-Item -Force $task.briefing (Join-Path $paths.Archive "$Id-briefing.md")
 }
+# So do the follow-up messages dep-send.ps1 wrote for it
+Get-ChildItem -Path $paths.State -Filter "$Id-followup-*.md" -File -ErrorAction SilentlyContinue |
+    ForEach-Object { Move-Item -Force $_.FullName (Join-Path $paths.Archive $_.Name) }
 
 Write-Output "archived $Id (final status: $($task.finalStatus))"

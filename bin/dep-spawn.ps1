@@ -4,9 +4,14 @@
 Spawn a posse member: lease a treehouse worktree and launch a headless claude
 session in it to work the given task.
 
+The session gets an id Deputy chose (--session-id, recorded as sessionId in
+task state) and the task id as its name, so that dep-send.ps1 can resume it
+with a follow-up message once its process has exited.
+
 .EXAMPLE
 .\dep-spawn.ps1 -Task "Fix the flaky auth test" -Repo C:\src\myapp
 .\dep-spawn.ps1 -Task "Why is startup slow?" -Repo C:\src\myapp -Kind scout
+.\dep-spawn.ps1 -Task "Rework the cache layer" -Repo C:\src\myapp -Effort high -MaxBudgetUsd 15
 #>
 [CmdletBinding()]
 param(
@@ -27,7 +32,16 @@ param(
     # Permission rules granted by the spawner, e.g. 'Bash(git *)','Bash(gh *)'.
     # Needed for non-bypass modes: a leased worktree is an untrusted directory,
     # so the repo's own .claude/settings.json allowlist is not honored there.
-    [string[]]$AllowedTools
+    [string[]]$AllowedTools,
+
+    # Reasoning effort for the member (--effort). Default: the effort key in
+    # config\deputy.json; when that is null too, the flag is left off.
+    [ValidateSet('', 'low', 'medium', 'high', 'xhigh', 'max')]
+    [string]$Effort,
+
+    # Spending cap in USD for one run of the member (--max-budget-usd).
+    # Default: the maxBudgetUsd key in config\deputy.json; null leaves it off.
+    [Nullable[double]]$MaxBudgetUsd
 )
 
 . "$PSScriptRoot\dep-lib.ps1"
@@ -50,6 +64,28 @@ if ($treehouseProblems.Count -gt 0) {
 $id = New-TaskId
 if (-not $Model) { $Model = $config.model }
 if (-not $PermissionMode) { $PermissionMode = $config.permissionMode }
+# The config's values go into variables of their own: $Effort and $MaxBudgetUsd
+# are typed parameters, and a bad config value assigned to one of them fails
+# with a message about a variable instead of about the config.
+$memberEffort = $Effort ? $Effort : $config.effort
+$memberBudget = ($null -ne $MaxBudgetUsd) ? $MaxBudgetUsd : $config.maxBudgetUsd
+
+# What the member is launched with. It goes into task state as it is, because
+# dep-send.ps1 has to start a resumed run with the same settings. Building the
+# arguments here, before anything is leased, also means a bad effort level or
+# budget costs no worktree.
+$sessionId = [guid]::NewGuid().ToString()
+$member = [pscustomobject]@{
+    id             = $id
+    kind           = $Kind
+    sessionId      = $sessionId
+    model          = $Model
+    permissionMode = $PermissionMode
+    allowedTools   = @($AllowedTools | Where-Object { $_ })
+    effort         = $memberEffort ? "$memberEffort" : $null
+    maxBudgetUsd   = $memberBudget
+}
+$claudeArgs = @(Get-TaskMemberArguments $member)
 
 # Lease a worktree. The treehouse pool is per-repo, so run from inside it.
 Push-Location $repoPath
@@ -87,7 +123,7 @@ Ground rules:
 - Do NOT push and do NOT open a pull request. This repo uses the Deputy's no-mistakes gate: after you finish, the Deputy validates your branch and publishes it. Leave the worktree checked out on your branch with a clean status.
 - If you are blocked or the task turns out to be wrong or impossible, stop and say so clearly instead of guessing.
 
-Your final message is your report to the Deputy. Keep it short: what you changed and your test results (or the blocker).
+$(Get-MemberReportInstructions)
 "@
 }
 elseif ($Kind -eq 'ship') {
@@ -105,7 +141,7 @@ Ground rules:
 - Push the branch and open a pull request with gh (for example: gh pr create --title "..." --body "..."). If the repo has no remote you can push to, commit locally and say so in your report.
 - If you are blocked or the task turns out to be wrong or impossible, stop and say so clearly instead of guessing.
 
-Your final message is your report to the Deputy. Keep it short: what you changed, test results, and the PR URL (or the blocker).
+$(Get-MemberReportInstructions -PullRequest)
 "@
 }
 else {
@@ -121,7 +157,8 @@ Ground rules:
 - Investigate thoroughly: read code, run read-only commands, trace the answer.
 - Write your full report as markdown to this exact path: $reportPath
 
-Your final message is your report summary to the Deputy: the key findings in a few sentences, and note that the full report is at the path above.
+$(Get-MemberReportInstructions)
+For a scout, summary holds the key findings in a few sentences; the full report is the file at the path above.
 "@
 }
 
@@ -131,46 +168,8 @@ Set-Content -Path $briefingFile -Value $briefing -Encoding utf8
 $stdoutLog = Join-Path $paths.Logs "$id.jsonl"
 $stderrLog = Join-Path $paths.Logs "$id.err.log"
 
-$claudeArgs = @('-p', '--output-format', 'stream-json', '--verbose')
-if ($Model) { $claudeArgs += @('--model', "$Model") }
-if ($PermissionMode -eq 'bypassPermissions') { $claudeArgs += '--dangerously-skip-permissions' }
-else {
-    $claudeArgs += @('--permission-mode', $PermissionMode)
-    if ($AllowedTools) { $claudeArgs += @('--allowedTools', ($AllowedTools -join ',')) }
-}
-# Scouts write their report into the deputy state dir, outside their worktree
-if ($Kind -eq 'scout') { $claudeArgs += @('--add-dir', $paths.State) }
-
-# Start-Process with redirected stdio needs a real executable, not a .cmd shim
-$claudeCmd = Get-Command claude -ErrorAction Stop
-$exe = $claudeCmd.Source
-if ($exe -match '\.(cmd|bat)$') {
-    $claudeArgs = @('/d', '/c', $exe) + $claudeArgs
-    $exe = $env:ComSpec
-}
-
-# Start-Process joins -ArgumentList elements with spaces but does NOT quote
-# them, so args containing spaces get split. Pre-quote into a single string.
-$argString = ($claudeArgs | ForEach-Object {
-    if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
-}) -join ' '
-
-# Mark the member's environment (it is inherited from this process) so that
-# Deputy's own session hooks can tell a posse member from the Deputy: a member
-# working on the Deputy repository itself loads the same .claude\settings.json,
-# and there the hooks must do nothing (see Test-DeputyHome).
-$previousMarker = $env:DEPUTY_POSSE_TASK
-$env:DEPUTY_POSSE_TASK = $id
-try {
-    $proc = Start-Process -FilePath $exe -ArgumentList $argString `
-        -WorkingDirectory $lease.path `
-        -RedirectStandardInput $briefingFile `
-        -RedirectStandardOutput $stdoutLog `
-        -RedirectStandardError $stderrLog `
-        -WindowStyle Hidden -PassThru
-}
-finally { $env:DEPUTY_POSSE_TASK = $previousMarker }
-
+$launched = Start-MemberProcess -TaskId $id -Arguments $claudeArgs -WorkingDirectory $lease.path `
+    -StdinFile $briefingFile -StdoutLog $stdoutLog -StderrLog $stderrLog
 $state = [pscustomobject]@{
     id             = $id
     kind           = $Kind
@@ -181,10 +180,14 @@ $state = [pscustomobject]@{
     branch         = if ($Kind -eq 'ship') { $branch } else { $null }
     delivery       = $delivery
     validation     = $null
-    pid            = $proc.Id
-    pidStartedAt   = $(try { $proc.StartTime.ToString('o') } catch { $null })
+    pid            = $launched.ProcessId
+    pidStartedAt   = $launched.StartedAt
+    sessionId      = $sessionId
     model          = $Model
     permissionMode = $PermissionMode
+    allowedTools   = $member.allowedTools
+    effort         = $member.effort
+    maxBudgetUsd   = $member.maxBudgetUsd
     status         = 'running'
     result         = $null
     prUrl          = $null
@@ -196,12 +199,21 @@ $state = [pscustomobject]@{
     lastLogBytes   = 0
     lastActivityAt = (Get-Date -Format o)
     stallNotified  = $false
+    # Where the current run's output starts in the log. dep-send.ps1 moves it
+    # forward, so the watcher never reads an earlier run's result as this one's.
+    logOffset      = 0
+    followUps      = @()
+    report         = $null
+    totalCostUsd   = $null
+    numTurns       = $null
+    durationMs     = $null
 }
 Write-TaskState $state
 
-Write-Output ("spawned $id ($Kind{0}) pid=$($proc.Id)" -f ($delivery ? ", $delivery" : ''))
+Write-Output ("spawned $id ($Kind{0}) pid=$($launched.ProcessId)" -f ($delivery ? ", $delivery" : ''))
 Write-Output "  repo:     $repoPath"
 Write-Output "  worktree: $($lease.path)"
 if ($Kind -eq 'ship') { Write-Output "  branch:   $branch" }
 Write-Output "  log:      $stdoutLog"
+Write-Output "  session:  $sessionId"
 Write-Output "Supervise with: pwsh -NoProfile -File `"$(Join-Path $paths.Bin 'dep-watch.ps1')`" -Wait"

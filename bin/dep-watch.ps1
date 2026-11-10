@@ -2,11 +2,25 @@
 <#
 .SYNOPSIS
 Watch running posse tasks and surface actionable wake events: completed,
-failed, died, stalled.
+failed, interrupted, blocked, needs-decision, died, stalled.
 
-A task is completed (or failed) only when its final result event has arrived
-AND the member process has exited. A result event seen while the process is
-still alive is interim and produces no wake on its own.
+A task is completed (or failed, interrupted, blocked, needs-decision) only when
+its final result event has arrived AND the member process has exited. A result
+event seen while the process is still alive is interim and produces no wake on
+its own.
+
+What the final result means is decided by Get-MemberOutcome (dep-lib.ps1):
+- an error result caused by a transient server failure (HTTP 429, 500, 502,
+  503, 529, "overloaded") is `interrupted`, not `failed`: the session is intact
+  and dep-send.ps1 continues it;
+- a structured final report (the --json-schema every member is started with)
+  maps by its status: done is `completed`, blocked is `blocked`, needs-decision
+  is `needs-decision`, failed is `failed`;
+- a result with no structured report is handled as text, as it always was.
+
+Only the current run is read: after dep-send.ps1 resumes a member, the log
+holds the earlier runs' results too, and the task's logOffset marks where the
+current one starts.
 
 Default: one scan, print any events, exit.
 -Wait: block (polling) until at least one actionable event occurs, print it,
@@ -55,7 +69,7 @@ function ConvertFrom-StreamLine([string]$Line) {
     try { $Line | ConvertFrom-Json -ErrorAction Stop } catch { $null }
 }
 
-function Get-SessionResult([string]$LogPath) {
+function Get-SessionResult([string]$LogPath, [long]$Offset = 0) {
     <#
     .SYNOPSIS
     The LAST {"type":"result",...} event in a stream-json log, and whether the
@@ -66,6 +80,9 @@ function Get-SessionResult([string]$LogPath) {
     helper reports back and emits another. So the last result is the only
     candidate for the final one, and it is Interim when assistant or user
     events follow it. Returns $null when the log holds no result event.
+
+    -Offset is where the current run starts in the log, in bytes. Everything
+    before it belongs to runs that were already handled.
     #>
     if (-not (Test-Path $LogPath)) { return $null }
     $last = $null
@@ -77,6 +94,11 @@ function Get-SessionResult([string]$LogPath) {
     }
     catch { return $null }
     try {
+        if ($Offset -gt 0) {
+            # A log shorter than its recorded offset has no current run yet.
+            if ($Offset -gt $stream.Length) { return $null }
+            $null = $stream.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+        }
         $reader = [System.IO.StreamReader]::new($stream)
         while ($null -ne ($line = $reader.ReadLine())) {
             # Cheap substring tests first: logs run to megabytes, and only the
@@ -103,7 +125,7 @@ function Get-SessionResult([string]$LogPath) {
     if (-not $last) { return $null }
     [pscustomobject]@{
         Event   = $last
-        Text    = $last.PSObject.Properties['result'] ? [string]$last.result : ''
+        Text    = (Get-MemberOutcome $last).Text
         Interim = $continued
     }
 }
@@ -120,7 +142,47 @@ function Test-PrUrlBelongsToRepo([string]$RepoPath, [string]$Owner, [string]$Rep
     $origin.Trim() -match $pattern
 }
 
+function Set-TaskPrUrl($Task, [string]$Text, $Report) {
+    # A structured report names its PR in a field of its own; otherwise the
+    # URL is looked for in the result text. Either way it is the member's word,
+    # and is only kept as prUrl when it points at the task's own repo.
+    $claimed = $Report ? [string]$Report.prUrl : $Text
+    if (-not $claimed) { return }
+    if ($claimed -match 'https://github\.com/([^/\s)"'']+)/([^/\s)"'']+)/pull/\d+') {
+        if (Test-PrUrlBelongsToRepo $Task.repo $Matches[1] $Matches[2]) {
+            Set-TaskField $Task 'prUrl' $Matches[0]
+        }
+        else {
+            Set-TaskField $Task 'prUrlRejected' $Matches[0]
+        }
+    }
+    elseif ($Report) {
+        # The prUrl field held something that is not a pull request URL.
+        Set-TaskField $Task 'prUrlRejected' (Limit-Text $claimed 200)
+    }
+}
+
+function Set-TaskUsage($Task, $ResultEvent) {
+    # What the run cost, from its final result. total_cost_usd is the cost of
+    # the whole session, earlier runs included (a resumed run reports the
+    # running total), so it replaces the stored figure and never lowers it.
+    # num_turns and duration_ms count the one run, so they add up.
+    $cost = ConvertTo-InvariantNumber (Get-EventField $ResultEvent 'total_cost_usd')
+    if ($null -ne $cost) {
+        $known = ConvertTo-InvariantNumber (Get-EventField $Task 'totalCostUsd')
+        Set-TaskField $Task 'totalCostUsd' ([math]::Max($cost, [double]($known ?? 0)))
+    }
+    foreach ($pair in @(@('num_turns', 'numTurns'), @('duration_ms', 'durationMs'))) {
+        $value = ConvertTo-InvariantNumber (Get-EventField $ResultEvent $pair[0])
+        if ($null -ne $value) {
+            $known = ConvertTo-InvariantNumber (Get-EventField $Task $pair[1])
+            Set-TaskField $Task $pair[1] ([long]($value + ($known ?? 0)))
+        }
+    }
+}
+
 function New-Wake($Task, [string]$EventName, [string]$Summary) {
+    $report = Get-EventField $Task 'report'
     [pscustomobject]@{
         seq           = 0   # set by Add-WakeEvent
         at            = (Get-Date -Format o)
@@ -131,6 +193,10 @@ function New-Wake($Task, [string]$EventName, [string]$Summary) {
         prUrl         = $Task.prUrl
         prUrlRejected = $Task.prUrlRejected
         summary       = $Summary
+        # For the wakes that are answered with dep-send.ps1: what the member
+        # asked, and how many follow-ups it has been sent already.
+        question      = ($EventName -in @('blocked', 'needs-decision') -and $report) ? $report.question : $null
+        followUps     = @(Get-TaskFollowUps $Task).Count
     }
 }
 
@@ -154,22 +220,21 @@ function Invoke-Scan {
         # after it, and no member process. A result seen while the process is
         # alive is interim - the member may be waiting on background helpers
         # and go on to do more work - so it must not wake the Deputy.
-        $session = Get-SessionResult $task.stdoutLog
+        $session = Get-SessionResult $task.stdoutLog ([long](Get-EventField $task 'logOffset'))
         if ($session -and -not $session.Interim -and -not $alive) {
-            $ok = -not ($session.Event.PSObject.Properties['is_error'] -and $session.Event.is_error)
-            Set-TaskField $task 'status' ($ok ? 'completed' : 'failed')
+            # The wake and the task's status share one name: completed, failed,
+            # interrupted, blocked or needs-decision.
+            $outcome = Get-MemberOutcome $session.Event
+            Set-TaskField $task 'status' $outcome.Wake
             Set-TaskField $task 'endedAt' (Get-Date -Format o)
-            $text = $session.Text
-            Set-TaskField $task 'result' $text
-            if ($text -match 'https://github\.com/([^/\s)"'']+)/([^/\s)"'']+)/pull/\d+') {
-                if (Test-PrUrlBelongsToRepo $task.repo $Matches[1] $Matches[2]) {
-                    Set-TaskField $task 'prUrl' $Matches[0]
-                }
-                else {
-                    Set-TaskField $task 'prUrlRejected' $Matches[0]
-                }
-            }
-            $wake = New-Wake $task $task.status (Limit-Text $text 500)
+            Set-TaskField $task 'result' $outcome.Text
+            Set-TaskField $task 'report' $outcome.Report
+            Set-TaskPrUrl $task $outcome.Text $outcome.Report
+            Set-TaskUsage $task $session.Event
+            # The wake carries the question on a line of its own (New-Wake), so
+            # the summary does not repeat it.
+            $said = $outcome.Report ? (Format-MemberReport $outcome.Report -NoQuestion) : $outcome.Text
+            $wake = New-Wake $task $outcome.Wake (Limit-Text $said 500)
         }
         elseif (-not $alive -and ((Get-Date) - [datetime]$task.lastActivityAt).TotalSeconds -ge $DeadSeconds) {
             # No process (by pid or worktree occupancy) AND the log has been

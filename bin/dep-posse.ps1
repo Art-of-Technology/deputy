@@ -8,7 +8,7 @@ Posse operations: status, logs, results, emergency stop.
 .\dep-posse.ps1 status -Watch         # live-refreshing status (dashboard pane)
 .\dep-posse.ps1 logs posse-...        # readable log tail (-Raw for raw jsonl)
 .\dep-posse.ps1 logs posse-... -Follow # live-tail a member's log (dashboard pane)
-.\dep-posse.ps1 result posse-...      # full final report of a finished task
+.\dep-posse.ps1 result posse-...      # full final report of a finished task, its cost and follow-ups
 .\dep-posse.ps1 kill posse-...        # stop a runaway task (lease kept; use dep-return to release)
 #>
 [CmdletBinding()]
@@ -38,6 +38,12 @@ function Format-Age([string]$Start, [string]$End) {
     else { '{0:n0}s' -f $span.TotalSeconds }
 }
 
+function Format-Cost($Usd, [string]$Prefix = '') {
+    # A cost in USD as text, or nothing when it is not known.
+    if ($null -eq $Usd -or "$Usd" -eq '') { return '' }
+    $Prefix + ([double]$Usd).ToString('$0.00', [cultureinfo]::InvariantCulture)
+}
+
 function Format-StreamLine($obj) {
     switch ($obj.type) {
         'system' {
@@ -57,7 +63,13 @@ function Format-StreamLine($obj) {
             }
         }
         'result' {
-            '[result] {0} turns={1}' -f $obj.subtype, $obj.num_turns
+            '[result] {0} turns={1}{2}' -f $obj.subtype, $obj.num_turns, (Format-Cost (Get-EventField $obj 'total_cost_usd') ' cost=')
+        }
+        'deputy' {
+            # dep-send.ps1 marks each follow-up it sends in the member's log.
+            if ((Get-EventField $obj 'subtype') -eq 'follow_up') {
+                '[send] #{0} {1}' -f $obj.number, (Limit-Text $obj.message 220)
+            }
         }
     }
 }
@@ -77,6 +89,8 @@ function Show-Status {
             Age    = Format-Age $_.spawnedAt $_.endedAt
             Repo   = Split-Path -Leaf $_.repo
             Gate   = if ($_.PSObject.Properties['validation'] -and $_.validation) { $_.validation } else { '-' }
+            # The session's running total, as of the last result the watcher read.
+            Cost   = ($cost = Format-Cost (Get-EventField $_ 'totalCostUsd')) ? $cost : '-'
             Pr     = $_.prUrl
             Task   = Limit-Text $_.task 60
         }
@@ -149,6 +163,25 @@ switch ($Action) {
         }
         $report = Join-Path (Get-DeputyPaths).State "$Id-report.md"
         if (Test-Path $report) { Write-Output ''; Write-Output "Full scout report: $report" }
+        $structured = Get-EventField $task 'report'
+        if ($structured) {
+            Write-Output ''
+            Write-Output "Reported status: $($structured.status)"
+        }
+        $followUps = @(Get-TaskFollowUps $task)
+        if ($followUps.Count -gt 0) {
+            Write-Output ''
+            Write-Output "Follow-ups sent (dep-send.ps1): $($followUps.Count)"
+            foreach ($followUp in $followUps) {
+                Write-Output ('  #{0} after {1}: {2}' -f $followUp.number, $followUp.afterStatus, (Limit-Text $followUp.message 160))
+            }
+        }
+        $cost = Format-Cost (Get-EventField $task 'totalCostUsd')
+        if ($cost) {
+            $seconds = [double](Get-EventField $task 'durationMs') / 1000
+            Write-Output ''
+            Write-Output ('Cost: {0} over {1} turn(s), {2:n0}s of member time' -f $cost, (Get-EventField $task 'numTurns'), $seconds)
+        }
         if ($task.PSObject.Properties['validation'] -and $task.validation) {
             Write-Output ''
             Write-Output "Gate: $($task.validation)"

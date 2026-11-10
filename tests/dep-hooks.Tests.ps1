@@ -701,11 +701,24 @@ Describe 'The hooks in a posse worktree' {
         (Invoke-Guard $install).ExitCode | Should -Be 2
     }
 
-    It 'marks every member it spawns, so the first case holds for real members' {
-        # dep-spawn.ps1 cannot run here (it needs treehouse and claude), so
-        # this pins the contract in its source: the marker is set around the
-        # launch and restored afterwards.
+    It 'marks every member it starts, so the first case holds for real members' {
+        # This pins the contract in the source: the marker is set around the
+        # launch and restored afterwards. The launch is Start-MemberProcess in
+        # dep-lib.ps1, shared by the two scripts that start a member - the
+        # first run (dep-spawn.ps1) and a resumed one (dep-send.ps1) - so both
+        # must go through it with their task id. dep-send.Tests.ps1 checks the
+        # same thing on what a member process actually receives.
+        $lib = Get-Content (Join-Path $script:sourceRoot 'bin' 'dep-lib.ps1') -Raw
+        $lib | Should -Match '(?s)\$env:DEPUTY_POSSE_TASK = \$TaskId\s+try \{\s+\$started = \[Deputy\.MemberLauncher\]::Start\(.*?finally \{ \$env:DEPUTY_POSSE_TASK = \$previousMarker \}'
         $spawn = Get-Content (Join-Path $script:sourceRoot 'bin' 'dep-spawn.ps1') -Raw
-        $spawn | Should -Match '(?s)\$env:DEPUTY_POSSE_TASK = \$id\s+try \{\s+\$proc = Start-Process.*?finally \{ \$env:DEPUTY_POSSE_TASK = \$previousMarker \}'
+        $spawn | Should -Match 'Start-MemberProcess -TaskId \$id\b'
+        $send = Get-Content (Join-Path $script:sourceRoot 'bin' 'dep-send.ps1') -Raw
+        $send | Should -Match 'Start-MemberProcess -TaskId \$Id\b'
+        # Nothing starts a member any other way.
+        foreach ($script in Get-ChildItem (Join-Path $script:sourceRoot 'bin') -Filter '*.ps1') {
+            $text = Get-Content $script.FullName -Raw
+            if ($script.Name -ne 'dep-lib.ps1') { $text | Should -Not -Match 'MemberLauncher' }
+            $text | Should -Not -Match 'Start-Process[^\r\n]*claude'
+        }
     }
 }
