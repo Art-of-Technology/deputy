@@ -12,11 +12,17 @@ param()
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
-if (-not (Get-Module -ListAvailable PSScriptAnalyzer)) {
-    Write-Output 'PSScriptAnalyzer is not installed. Install-Module PSScriptAnalyzer -Scope CurrentUser'
+# The gate runs on one pinned version (tools\gate-modules.psd1): analyzer rules
+# change between releases, and a finding must not depend on whose machine ran it.
+$pinned = [version](Import-PowerShellDataFile (Join-Path $PSScriptRoot 'gate-modules.psd1')).PSScriptAnalyzer
+$analyzer = Get-Module -ListAvailable PSScriptAnalyzer |
+    Where-Object { $_.Version -eq $pinned } |
+    Select-Object -First 1
+if (-not $analyzer) {
+    Write-Output "PSScriptAnalyzer $pinned is required and not installed. Run: pwsh -NoProfile -File tools\Install-GateModules.ps1"
     exit 1
 }
-Import-Module PSScriptAnalyzer
+Import-Module $analyzer.Path -Force
 
 $targets = @('bin', 'tools', 'tests') |
     ForEach-Object { Join-Path $root $_ } |
@@ -28,7 +34,7 @@ $findings = @($targets | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Recurs
 
 $scanned = ($targets | ForEach-Object { Split-Path -Leaf $_ }) -join ', '
 if ($findings.Count -eq 0) {
-    Write-Output "PSScriptAnalyzer: clean ($scanned)"
+    Write-Output "PSScriptAnalyzer ${pinned}: clean ($scanned)"
     exit 0
 }
 
@@ -37,5 +43,5 @@ if ($findings.Count -eq 0) {
 $findings | ForEach-Object {
     Write-Output ('{0}:{1} [{2}] {3} - {4}' -f $_.ScriptName, $_.Line, $_.Severity, $_.RuleName, $_.Message)
 }
-Write-Output "PSScriptAnalyzer: $($findings.Count) finding(s) in $scanned"
+Write-Output "PSScriptAnalyzer ${pinned}: $($findings.Count) finding(s) in $scanned"
 exit 1

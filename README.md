@@ -188,8 +188,9 @@ Two traps worth knowing:
 ```
 bin\        toolbelt (dep-spawn, dep-watch, dep-posse, dep-validate, dep-publish, dep-pr, dep-return, dep-dashboard, dep-lib)
 config\     deputy.json, projects.json
-tools\      Deputy's own gate: Invoke-Lint.ps1, Invoke-Tests.ps1
+tools\      Deputy's own gate: Invoke-Lint.ps1, Invoke-Tests.ps1, plus the module pins (gate-modules.psd1) and Install-GateModules.ps1
 tests\      Pester suite for the toolbelt
+.github\    workflows\ci.yml runs the gate on pull requests and pushes to main
 state\      one json per task, wake-queue.jsonl, scout reports, validation records, archive\   (runtime)
 logs\       <taskId>.jsonl stream logs + stderr                                                (runtime)
 AGENTS.md   the Deputy's operating contract (harness-neutral)
@@ -207,7 +208,17 @@ pwsh -NoProfile -File tools\Invoke-Lint.ps1    # PSScriptAnalyzer over bin\, too
 pwsh -NoProfile -File tools\Invoke-Tests.ps1   # Pester suite in tests\ (-Filter dep-lib to narrow)
 ```
 
-Both need modules: `Install-Module PSScriptAnalyzer, Pester -Scope CurrentUser` (Pester 5+). The tests build throwaway git repos and throwaway Deputy installs under `$env:TEMP` - no network, and they never touch the real `state\` or `logs\`.
+Both run on exact module versions pinned in `tools\gate-modules.psd1`, and refuse to run on any other version so that a result never depends on whose machine produced it. Install them once (and again after a pin changes):
+
+```powershell
+pwsh -NoProfile -File tools\Install-GateModules.ps1
+```
+
+The tests build throwaway git repos and throwaway Deputy installs under `$env:TEMP` - no network, and they never touch the real `state\` or `logs\`. They need only `git` and `pwsh`: no treehouse, no claude, and no signed-in `gh`.
+
+### CI
+
+`.github\workflows\ci.yml` runs the same two commands on `windows-latest` for every pull request and every push to `main`, so a PR is checked however it was opened - not only when Deputy's own gate shipped it. The job installs the pinned modules with `tools\Install-GateModules.ps1` (cached, keyed on the pin file), fails on a non-zero exit from either command, runs with read-only `contents` permission, and cancels a run that a newer push to the same ref has superseded.
 
 ## Credits
 
