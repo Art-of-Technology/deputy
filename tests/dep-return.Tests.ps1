@@ -36,7 +36,9 @@ BeforeAll {
             [switch]$Pushed,
             # Record this pull request on the task.
             [string]$PrUrl,
-            [string]$Kind = 'ship'
+            [string]$Kind = 'ship',
+            # The delivery mode the task's record says.
+            [string]$Delivery = 'gated'
         )
         $script:n++
         $dir = Join-Path $script:root "case$($script:n)"
@@ -48,7 +50,7 @@ BeforeAll {
         if ($Pushed) { Invoke-Git @('-C', $worktree, 'push', '-q', 'origin', 'deputy/task') }
 
         $install = New-DeputyInstall -Path (Join-Path $dir 'deputy') -SourceRoot $script:sourceRoot
-        $id = New-TestTaskState -InstallRoot $install -Repo $repo -Worktree $worktree -Branch 'deputy/task'
+        $id = New-TestTaskState -InstallRoot $install -Repo $repo -Worktree $worktree -Branch 'deputy/task' -Delivery $Delivery
         $statePath = Join-Path $install 'state' "$id.json"
         $state = Get-Content $statePath -Raw | ConvertFrom-Json
         $state.kind = $Kind
@@ -359,6 +361,18 @@ Describe 'dep-return.ps1' {
             $run.Output | Should -Match 'kept remote branch origin/deputy/task: pull request #7 is still open'
             Test-RemoteBranch $s | Should -BeTrue
         }
+    }
+
+    It 'returns a task recorded before the rename, as delivery no-mistakes, and archives it as it was' {
+        $s = New-ReturnScenario -Pushed -Delivery 'no-mistakes'
+        $run = Invoke-Return $s
+        $run.ExitCode | Should -Be 0 -Because $run.Output
+        $run.Output | Should -Not -Match 'WARNING'
+        Test-TreehouseReturned $s | Should -BeTrue
+        $archived = Get-Content (Join-Path $s.Install 'state' 'archive' "$($s.Id).json") -Raw | ConvertFrom-Json
+        $archived.delivery | Should -BeExactly 'no-mistakes'
+        # Read back, the archived record is the gated delivery.
+        Get-TaskDelivery $archived | Should -BeExactly 'gated'
     }
 
     It 'keeps the remote branch when it is the only copy of the commits' {

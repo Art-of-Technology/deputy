@@ -574,6 +574,49 @@ Describe 'dep-watch.ps1 with a structured final report' {
     }
 }
 
+Describe 'dep-watch.ps1 naming a ship task''s delivery mode' {
+    BeforeAll {
+        function Invoke-ShipWatch([hashtable]$Extra) {
+            Invoke-FinishedWatch -Extra (@{ kind = 'ship'; branch = 'deputy/task' } + $Extra) -Lines @(
+                (New-StreamEvent init),
+                (New-ReportEvent @{ status = 'done'; summary = 'Fixed the flaky test.' })
+            )
+        }
+    }
+
+    It 'wakes a ship task recorded as <Recorded> with (ship, <Shown>)' -ForEach @(
+        @{ Recorded = 'gated'; Shown = 'gated' }
+        @{ Recorded = 'direct-pr'; Shown = 'direct-pr' }
+        # A task recorded before the rename: gated all the same, and nothing
+        # to warn about.
+        @{ Recorded = 'no-mistakes'; Shown = 'gated' }
+    ) {
+        $watched = Invoke-ShipWatch @{ delivery = $Recorded }
+        $watched.Run.Output | Should -Match ([regex]::Escape(": completed (ship, $Shown)"))
+        $watched.Run.Output | Should -Not -Match 'WARNING'
+        $watched.Wake.delivery | Should -BeExactly $Shown
+        # The record itself is the toolbelt's history, and stays as written.
+        $watched.State.delivery | Should -BeExactly $Recorded
+        $watched.State.status | Should -Be 'completed'
+    }
+
+    It 'says the same when the wake is drained from the queue' {
+        $scenario = New-WatchScenario -Exited -Extra @{ kind = 'ship'; branch = 'deputy/task'; delivery = 'no-mistakes' } -Lines @(
+            (New-StreamEvent init),
+            (New-ReportEvent @{ status = 'done'; summary = 'Fixed the flaky test.' })
+        )
+        $null = Invoke-Watch $scenario
+        $drain = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-wake.ps1' -Arguments @('drain')
+        $drain.Output | Should -Match ([regex]::Escape("$($scenario.Id): completed (ship, gated) seq="))
+    }
+
+    It 'wakes a ship task whose record names no delivery mode by its kind alone' {
+        $watched = Invoke-ShipWatch @{}
+        $watched.Run.Output | Should -Match ([regex]::Escape(': completed (ship)'))
+        $watched.Wake.delivery | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'dep-watch.ps1 recording what a run cost' {
     It 'persists total_cost_usd, num_turns and duration_ms from the final result' {
         $watched = Invoke-FinishedWatch -Lines @(

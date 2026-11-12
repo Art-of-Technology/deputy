@@ -115,6 +115,8 @@ if ($config.memberIsolation -isnot [bool]) {
 
 $legacyWarning = Get-LegacyConfigWarning $config
 if ($legacyWarning) { Write-Warning $legacyWarning }
+$deliveryWarning = Get-DeliveryAliasWarning $projProfile
+if ($deliveryWarning) { Write-Warning $deliveryWarning }
 $chosen = Resolve-MemberSettings -Kind $Kind -Model $Model -Effort $Effort -Config $config -Project $projProfile
 if (-not $PermissionMode) { $PermissionMode = $config.permissionMode }
 # The config's value goes into a variable of its own: $MaxBudgetUsd is a typed

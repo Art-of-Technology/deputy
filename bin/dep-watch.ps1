@@ -136,6 +136,10 @@ function New-Wake($Task, [string]$EventName, [string]$Summary) {
         taskId        = $Task.id
         event         = $EventName
         kind          = $Task.kind
+        # A ship task's delivery mode decides what its completed wake calls
+        # for: gated is validated and published by the Deputy, direct-pr
+        # already has its pull request.
+        delivery      = Get-TaskDelivery $Task
         repo          = $Task.repo
         prUrl         = $Task.prUrl
         prUrlRejected = $Task.prUrlRejected

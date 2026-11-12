@@ -30,9 +30,9 @@ dep-watch.ps1 ..... polls stream-json logs + process liveness, and the pull
    |  dep-send.ps1 (interrupted, blocked, needs-decision: resume the member's
    |                session with a follow-up; it carries on where it was)
    v
-delivery .......... direct-pr:   member already pushed and opened the PR
-                    no-mistakes: dep-validate.ps1 gates the branch, then
-                                 dep-publish.ps1 pushes and opens the PR
+delivery .......... direct-pr: member already pushed and opened the PR
+                    gated:     dep-validate.ps1 gates the branch, then
+                               dep-publish.ps1 pushes and opens the PR
    |
    v
 dep-pr.ps1 merge .. merges only a PR it has proven fit to merge
@@ -92,7 +92,7 @@ pwsh -NoProfile -File bin\dep-posse.ps1 status
 pwsh -NoProfile -File bin\dep-posse.ps1 logs <taskId>
 pwsh -NoProfile -File bin\dep-posse.ps1 result <taskId>
 
-# deliver (no-mistakes repos: gate, then publish)
+# deliver (gated repos: gate, then publish)
 pwsh -NoProfile -File bin\dep-validate.ps1 <taskId>
 pwsh -NoProfile -File bin\dep-publish.ps1 <taskId>
 
@@ -121,7 +121,7 @@ pwsh -NoProfile -File bin\dep-return.ps1 <taskId>
 | `dep-posse.ps1 logs <taskId> [-Tail n] [-Raw] [-Follow]` | Human-readable log tail (or raw stream-json), follow-ups shown as `[send]` lines; `-Follow` live-tails |
 | `dep-posse.ps1 result <taskId>` | Final report text, the status the member reported, follow-ups sent, cost with turns and active time over all runs, model and where it came from, scout report path, PR URL |
 | `dep-posse.ps1 kill <taskId>` | Stop a runaway member's process tree (lease kept for inspection), counting the usage of the run it stops. Kills only processes proven to be the task's - see "What Deputy will kill" |
-| `dep-validate.ps1 <taskId>` | Run the no-mistakes gate in the task's worktree, anchored on the task's base branch (the default branch when it has none); commits evidence on pass. Exit 0 passed, 1 failed, 2 unverified (no commands to run) |
+| `dep-validate.ps1 <taskId>` | Run Deputy's gate in the task's worktree, anchored on the task's base branch (the default branch when it has none); commits evidence on pass. Exit 0 passed, 1 failed, 2 unverified (no commands to run) |
 | `dep-publish.ps1 <taskId> [-AllowUnverified]` | Push the branch and open the PR against the task's base branch (which must be on `origin`; the default branch when it has none), recording its number and head commit (`prNumber`, `prHead`); refuses a failed or unverified gate, and a branch that moved after the gate judged it. On a task that already has a PR it pushes the branch's new validated commits to that PR, rewrites the PR description and moves `prHead` on. `-AllowUnverified` is the Sheriff's opt-in for repos with no gate, and labels the PR as never validated |
 | `dep-pr.ps1 <view\|checks\|diff\|merge> <taskId> [-Method squash\|merge\|rebase] [-AllowNoChecks]` | PR operations over GitHub's REST API (`gh api`), so no `read:org` token scope is needed. `checks` exits 0 when nothing is failing or pending, 1 on a failing check, 8 when one is only pending. `merge` (squash by default) refuses a PR that is not fit to merge, listing every failing condition, and records the merge only when it is proven; branch cleanup happens in dep-return |
 | `dep-return.ps1 <taskId> [-Discard]` | Prove the work landed (refuse with the reason and exit 1 otherwise), then kill stragglers (same proof as `kill`), return the lease (guarded by `--if-lease-id`), delete the task branch, archive state. `-Discard` skips the proof and needs the Sheriff's explicit word. The remote branch of an open PR is never deleted. After this the task can no longer be resumed |
@@ -186,7 +186,7 @@ A base branch resolves the way treehouse cuts from it: `origin/<base>` when it e
 
 **Not the Deputy.** `AGENTS.md` opens with a role exception, and every briefing carries the same sentence: *A posse member launched by Deputy into a worktree of this repository follows its briefing and is not the Deputy.* A member working on Deputy loads this repository's `AGENTS.md` as project instructions whatever the hooks do (they already do nothing for a member, see `Test-DeputyHome`), so the instructions themselves have to say it.
 
-**One briefing.** The ship (no-mistakes), ship (direct-pr) and scout briefings are one function, `Get-MemberBriefing` in `dep-lib.ps1`: the role, the task, the ground rules of the kind, a *definition of done* per delivery mode (no-mistakes: committed on the branch, clean, not pushed; direct-pr: a pull request open against the base; scout: the report written, nothing changed), and the structured report.
+**One briefing.** The ship (gated), ship (direct-pr) and scout briefings are one function, `Get-MemberBriefing` in `dep-lib.ps1`: the role, the task, the ground rules of the kind, a *definition of done* per delivery mode (gated: committed on the branch, clean, not pushed; direct-pr: a pull request open against the base; scout: the report written, nothing changed), and the structured report.
 
 ### Member environment
 
@@ -236,7 +236,7 @@ The watcher reads `structured_output` from the final `result` event and keeps it
 | report `failed`, or an error result | `failed` | diagnose; correct it with `dep-send.ps1`, respawn, or escalate |
 | error result from a transient server failure: `api_error_status` 429, 500, 502, 503 or 529, or a text naming one of those API errors or `overloaded` | `interrupted` | `dep-send.ps1 <taskId> -Message "Continue where you left off."` once, then escalate |
 
-`interrupted`, `blocked` and `needs-decision` wakes print the member's question, how many follow-ups the task has already been sent, and the `dep-send.ps1` command. They go through the same durable queue as every other wake.
+`interrupted`, `blocked` and `needs-decision` wakes print the member's question, how many follow-ups the task has already been sent, and the `dep-send.ps1` command. They go through the same durable queue as every other wake. A ship task's wakes name its delivery mode beside its kind, `(ship, gated)` or `(ship, direct-pr)`, because that decides what a `completed` wake calls for.
 
 **One log, several runs.** A resumed run appends to the task's log. `dep-send.ps1` first writes a marker line (`{"type":"deputy","subtype":"follow_up",...}`, shown as `[send]` by `dep-posse.ps1 logs`) and records the byte offset after it as `logOffset`; the watcher reads results only from there on, so an earlier run's result is never mistaken for the resumed run's. A resumed run that writes nothing ends as `died`, not as a second `completed`. Each follow-up is kept in task state (`followUps`: number, time, the status it answered, pid, message) and its text in `state\<taskId>-followup-<n>.md`.
 
@@ -321,9 +321,11 @@ An open pull request counts as work for the watcher: the `Stop` hooks keep one r
 
 On top of that, pid 0 and pid 4 are never candidates, a worktree listing of more than 50 processes is discarded whole as a mislisting (with a warning), and the calling process and its ancestors are never killed. Anything that fails the proof is left running and named in a `left pid N running` warning, so it is visible rather than silently skipped.
 
-## Delivery modes (no-mistakes gate)
+## Delivery modes (gated and direct-pr)
 
-**No-mistakes is the default for every repo** - Deputy works on repos it has never seen, so the gate cannot depend on a hand-maintained list. The flow:
+**What `gated` runs.** The repo's own test and lint commands - pinned in the projects config, or detected from its manifests (below) - run by the Deputy in the task's worktree, and nothing else. It is not the [no-mistakes](https://github.com/kunchenguid/no-mistakes) tool, whose pipeline adds an AI review, automatic fixes, documentation, the push, the PR and a wait for CI: Deputy does not run that tool in any mode. The mode was called `no-mistakes` until it was renamed so that nobody reads a green gate as that pipeline having run.
+
+**Gated is the default for every repo** - Deputy works on repos it has never seen, so the gate cannot depend on a hand-maintained list. The flow:
 
 1. The member's job ends at "implement, test, commit locally" (it never pushes or opens PRs).
 2. On completion the Deputy runs `dep-validate.ps1` in the worktree - a deterministic gate the member has no control over.
@@ -357,19 +359,19 @@ The projects config overrides detection per repo - pin exact commands, or opt a 
 
 ```json
 {
-  "default": { "delivery": "no-mistakes", "validate": [] },
+  "default": { "delivery": "gated", "validate": [] },
   "projects": [
-    { "match": "myapp", "delivery": "no-mistakes", "validate": ["npm run test:ci"] },
+    { "match": "myapp", "delivery": "gated", "validate": ["npm run test:ci"] },
     { "match": "legacy-app", "delivery": "direct-pr", "validate": [] }
   ]
 }
 ```
 
-`match` is a repo folder name, or a full path if it contains a slash (compared as a path, whatever its separators). An empty `validate` list means auto-detect. `delivery` must be `no-mistakes` or `direct-pr`; anything else is refused rather than guessed at. An entry may name only the keys it changes: the rest come from the `default` block. The local file's entries are matched first, and its `default` keys win over the tracked ones.
+`match` is a repo folder name, or a full path if it contains a slash (compared as a path, whatever its separators). An empty `validate` list means auto-detect. `delivery` must be `gated` or `direct-pr`; anything else is refused rather than guessed at. The old name `no-mistakes` is still read as `gated` for one release, with a warning at spawn that names the file: change it to `gated`, because the name is reserved for the real no-mistakes pipeline and will stop meaning Deputy's gate. A task recorded under the old name before the rename is simply read as gated, with no warning. An entry may name only the keys it changes: the rest come from the `default` block. The local file's entries are matched first, and its `default` keys win over the tracked ones.
 
 An entry (or the `default` block) may also name a `model` and an `effort` for the members working in that repo, over the per-kind default (see "Choosing the model"): `{ "match": "myapp", "model": "claude-sonnet-5-5", "effort": "high" }`. `null`, or no key, leaves the choice to the per-kind default.
 
-The security property of no-mistakes: the agent that wrote the code never holds the pen on validation or publishing. Members need no `gh` or push access at all, and a branch cannot rubber-stamp its own gate.
+The security property of the gated delivery: the agent that wrote the code never holds the pen on validation or publishing. Members need no `gh` or push access at all, and a branch cannot rubber-stamp its own gate.
 
 **Whose text the PR title is.** `dep-publish.ps1` derives the title from the branch's one member commit subject when there is exactly one of them (Deputy's own evidence commit never counts), and from the Sheriff's briefing otherwise. That is a trust boundary worth naming rather than leaving implicit: on a single-commit branch, the title of a pull request on your organisation's repository is text a headless posse member wrote, where it used to be the Sheriff's own words. What that text can do is deliberately bounded to being a headline:
 
@@ -385,7 +387,7 @@ So the title is a summary the branch proposed for itself, not a claim Deputy vou
 Headless members cannot answer permission prompts, so anything that is neither allowed by the permission mode nor granted is denied - the member does not get to do it. Two ways to run them:
 
 1. **`bypassPermissions`** (the config default): members run fully unattended. Simple, and appropriate for repos and machines you trust - which is the usual posture for an autonomous posse.
-2. **`acceptEdits` + explicit grants**: least privilege, recommended for no-mistakes repos since members need so little:
+2. **`acceptEdits` + explicit grants**: least privilege, recommended for gated repos since members need so little:
 
    ```powershell
    pwsh -NoProfile -File bin\dep-spawn.ps1 ... -PermissionMode acceptEdits -AllowedTools "Bash(git *),Bash(npm *)"

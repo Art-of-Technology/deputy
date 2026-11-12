@@ -117,9 +117,9 @@ function New-DeputyInstall {
     New-Item -ItemType Directory -Force (Join-Path $Path 'config') | Out-Null
     Copy-Item -Recurse -Force (Join-Path $SourceRoot 'bin') (Join-Path $Path 'bin')
     $projects = [ordered]@{
-        default  = [ordered]@{ delivery = 'no-mistakes'; validate = @() }
+        default  = [ordered]@{ delivery = 'gated'; validate = @() }
         projects = @(
-            if ($Match) { [ordered]@{ match = $Match; delivery = 'no-mistakes'; validate = $Validate } }
+            if ($Match) { [ordered]@{ match = $Match; delivery = 'gated'; validate = $Validate } }
         )
     }
     ($projects | ConvertTo-Json -Depth 6) |
@@ -140,7 +140,10 @@ function New-TestTaskState {
         [string]$Id = 'posse-20260101-120000-abc',
         [string]$Task = 'test task',
         # The branch the task was cut from, when it is not the default branch.
-        [string]$BaseBranch
+        [string]$BaseBranch,
+        # As the task's record has it. A record written before the rename says
+        # no-mistakes.
+        [string]$Delivery = 'gated'
     )
     $stateDir = Join-Path $InstallRoot 'state'
     New-Item -ItemType Directory -Force $stateDir | Out-Null
@@ -152,7 +155,7 @@ function New-TestTaskState {
         worktree   = $Worktree
         branch     = $Branch
         baseBranch = $BaseBranch ? $BaseBranch : $null
-        delivery   = 'no-mistakes'
+        delivery   = $Delivery
         validation = $null
         status     = 'completed'
         spawnedAt  = '2026-01-01T12:00:00.0000000+00:00'

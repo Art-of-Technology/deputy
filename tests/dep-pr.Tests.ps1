@@ -414,13 +414,15 @@ Describe 'dep-publish.ps1 and the pull request' {
     BeforeAll {
         function New-PublishScenario {
             # A finished, validated ship task with a real (local, bare) origin,
-            # and a fake gh that "opens" pull request #7.
+            # and a fake gh that "opens" pull request #7. -Delivery is the
+            # delivery mode its record says.
+            param([string]$Delivery = 'gated')
             $script:n++
             $dir = Join-Path $script:root "case$($script:n)"
             $repo = New-TestRepo -Path (Join-Path $dir 'repo') -WithRemote -TaskBranch 'deputy/task'
             $install = New-DeputyInstall -Path (Join-Path $dir 'deputy') -SourceRoot $script:sourceRoot `
                 -Match (Split-Path -Leaf $repo) -Validate @('exit 0')
-            $id = New-TestTaskState -InstallRoot $install -Repo $repo -Worktree $repo -Branch 'deputy/task'
+            $id = New-TestTaskState -InstallRoot $install -Repo $repo -Worktree $repo -Branch 'deputy/task' -Delivery $Delivery
             $shim = New-GhShim -Path (Join-Path $dir 'shims')
             Set-GhRoutes -Path $shim -Routes @{ 'pr create' = @{ url = $script:prUrl } }
             $env:PATH = $shim + [System.IO.Path]::PathSeparator + $script:savedPath
@@ -481,6 +483,23 @@ Describe 'dep-publish.ps1 and the pull request' {
         }
     }
 
+    Context 'a task recorded before the rename, as delivery no-mistakes' {
+        BeforeAll {
+            # New-PublishScenario has already validated it, and insists the
+            # gate passed.
+            $script:old = New-PublishScenario -Delivery 'no-mistakes'
+            $script:oldRun = Invoke-Step $script:old 'dep-publish.ps1'
+        }
+
+        It 'still publishes, and says nothing about the old name' {
+            $script:oldRun.ExitCode | Should -Be 0 -Because $script:oldRun.Output
+            $script:oldRun.Output | Should -Match "published $($script:old.Id)"
+            $script:oldRun.Output | Should -Not -Match 'WARNING'
+            Get-RemoteHead $script:old | Should -Be (Get-Head $script:old)
+            @(Get-GhCalls -Path $script:old.Shim | Where-Object { $_.kind -eq 'pr create' }) | Should -HaveCount 1
+        }
+    }
+
     Context 'a follow-up after publishing' {
         BeforeAll {
             $script:again = New-PublishScenario
@@ -520,7 +539,10 @@ Describe 'dep-publish.ps1 and the pull request' {
             $patch = @($calls | Where-Object { $_.method -eq 'PATCH' })
             $patch.Count | Should -Be 1
             $patch[0].endpoint | Should -Be "$script:api/pulls/7"
-            $patch[0].input.body | Should -Match 'Validated by the Deputy no-mistakes gate'
+            # Deputy's own gate, by what it ran: never the old name, which read
+            # as if the no-mistakes tool had run.
+            $patch[0].input.body | Should -Match ([regex]::Escape("Validated by the Deputy's gate (the repo's test and lint commands)"))
+            $patch[0].input.body | Should -Not -Match 'no-mistakes'
             $patch[0].input.body | Should -Match "Posse task: $($script:again.Id)"
         }
 
