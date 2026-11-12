@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-Run the no-mistakes validation gate for a finished ship task, in its worktree.
+Run Deputy's gate for a finished ship task (gated delivery), in its worktree.
 
 The gate is deterministic and Deputy-controlled: commands come from the
 Deputy config (config\projects.local.json over config\projects.json) or are

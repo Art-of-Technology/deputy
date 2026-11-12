@@ -4,7 +4,7 @@
 Publish a validated ship task: push its branch and open the PR - or, when the
 task already has a PR, push the branch's new validated commits to it.
 
-In no-mistakes delivery the posse member never pushes or talks to GitHub;
+In gated delivery the posse member never pushes or talks to GitHub;
 publishing is the Deputy's deterministic step, and it refuses to run unless
 dep-validate.ps1 has marked the task validation=passed for the commit the
 branch is at now.
@@ -84,11 +84,11 @@ if ($unverified) {
 
 function Get-PrBody {
     $evidenceNote = if ($unverified) {
-        "**NOT VALIDATED.** The Deputy's no-mistakes gate had no commands to run for this repo" +
+        "**NOT VALIDATED.** The Deputy's gate had no commands to run for this repo" +
         $(if ($validationNote) { " ($validationNote)" }) +
         ', so no tests and no lint were executed against this branch. Review it on that basis.'
     } elseif ($task.PSObject.Properties['validationEvidence'] -and $task.validationEvidence) {
-        "Validated by the Deputy no-mistakes gate; evidence at ``$($task.validationEvidence)`` on this branch."
+        "Validated by the Deputy's gate (the repo's test and lint commands); evidence at ``$($task.validationEvidence)`` on this branch."
     } else {
         'Published by Deputy.'
     }

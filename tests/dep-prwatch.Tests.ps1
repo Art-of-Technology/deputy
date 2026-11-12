@@ -119,7 +119,7 @@ Describe 'dep-watch.ps1 and a merged pull request' {
 
     It 'raises a merged wake through the queue' {
         $script:mergedRun.ExitCode | Should -Be 0
-        $script:mergedRun.Output | Should -Match "\[wake\] $($script:merged.Id): merged \(ship\) seq=1"
+        $script:mergedRun.Output | Should -Match "\[wake\] $($script:merged.Id): merged \(ship, gated\) seq=1"
         $script:mergedWakes.Count | Should -Be 1
         $script:mergedWakes[0].event | Should -Be 'merged'
         $script:mergedWakes[0].seq | Should -Be 1
@@ -130,7 +130,7 @@ Describe 'dep-watch.ps1 and a merged pull request' {
     It 'tells the Deputy to tear the task down' {
         $script:mergedRun.Output | Should -Match 'The work has landed\. Tear the task down with: pwsh .*dep-return\.ps1" posse-'
         $drain = Invoke-DeputyScript -InstallRoot $script:merged.Install -Script 'dep-wake.ps1' -Arguments @('drain')
-        $drain.Output | Should -Match ': merged \(ship\) seq=1'
+        $drain.Output | Should -Match ': merged \(ship, gated\) seq=1'
         $drain.Output | Should -Match 'Tear the task down with: pwsh .*dep-return\.ps1'
         $drain.Output | Should -Match 'ack -Through 1'
     }
@@ -168,7 +168,7 @@ Describe 'dep-watch.ps1 and a pull request whose checks fail' {
     }
 
     It 'raises a degraded wake that names the failing check' {
-        $script:degRun.Output | Should -Match ': degraded \(ship\) seq=1'
+        $script:degRun.Output | Should -Match ': degraded \(ship, gated\) seq=1'
         $script:degWakes.Count | Should -Be 1
         $script:degWakes[0].event | Should -Be 'degraded'
         $script:degWakes[0].summary | Should -Match 'Pull request #7 has 1 failing check\(s\) at a{10}: test \(failure\)\.'
@@ -191,7 +191,7 @@ Describe 'dep-watch.ps1 and a pull request whose checks fail' {
         $newHead = 'b' * 40
         Set-PullRequest $script:deg (New-PullRequestJson -HeadSha $newHead) $script:red
         Set-PollDue $script:deg
-        (Invoke-Watch $script:deg).Output | Should -Match ': degraded \(ship\) seq=2'
+        (Invoke-Watch $script:deg).Output | Should -Match ': degraded \(ship, gated\) seq=2'
         $wakes = Get-WakeQueue $script:deg
         $wakes.Count | Should -Be 2
         $wakes[1].summary | Should -Match 'failing check\(s\) at b{10}'
@@ -202,7 +202,7 @@ Describe 'dep-watch.ps1 and a pull request whose checks fail' {
     It 'still raises merged afterwards' {
         Set-PullRequest $script:deg (New-PullRequestJson -Merged -HeadSha ('b' * 40))
         Set-PollDue $script:deg
-        (Invoke-Watch $script:deg).Output | Should -Match ': merged \(ship\) seq=3'
+        (Invoke-Watch $script:deg).Output | Should -Match ': merged \(ship, gated\) seq=3'
     }
 }
 
@@ -226,7 +226,7 @@ Describe 'dep-watch.ps1 and a pull request closed without merging' {
 
     It 'raises a closed wake through the queue, and says the work has not landed' {
         $script:closedRun.ExitCode | Should -Be 0
-        $script:closedRun.Output | Should -Match "\[wake\] $($script:closed.Id): closed \(ship\) seq=1"
+        $script:closedRun.Output | Should -Match "\[wake\] $($script:closed.Id): closed \(ship, gated\) seq=1"
         $script:closedRun.Output | Should -Match "The work has NOT landed\. Tell the Sheriff, and do not return the worktree without the Sheriff's word\."
         $script:closedWakes.Count | Should -Be 1
         $script:closedWakes[0].event | Should -Be 'closed'
@@ -283,15 +283,15 @@ Describe 'dep-watch.ps1 and a pull request closed without merging' {
     It 'still raises degraded and merged for the reopened pull request, and closed again if it is closed again' {
         Set-PullRequest $script:closed (New-PullRequestJson -HeadSha $script:head) $script:red
         Set-PollDue $script:closed
-        (Invoke-Watch $script:closed).Output | Should -Match ': degraded \(ship\) seq=2'
+        (Invoke-Watch $script:closed).Output | Should -Match ': degraded \(ship, gated\) seq=2'
 
         Set-PullRequest $script:closed (New-PullRequestJson -State closed -HeadSha $script:head)
         Set-PollDue $script:closed
-        (Invoke-Watch $script:closed).Output | Should -Match ': closed \(ship\) seq=3'
+        (Invoke-Watch $script:closed).Output | Should -Match ': closed \(ship, gated\) seq=3'
 
         Set-PullRequest $script:closed (New-PullRequestJson -Merged -HeadSha $script:head)
         Set-PollDue $script:closed
-        (Invoke-Watch $script:closed).Output | Should -Match ': merged \(ship\) seq=4'
+        (Invoke-Watch $script:closed).Output | Should -Match ': merged \(ship, gated\) seq=4'
         (Get-WakeQueue $script:closed).Count | Should -Be 4
     }
 
@@ -301,7 +301,7 @@ Describe 'dep-watch.ps1 and a pull request closed without merging' {
         $script:watchers.Add($watcher.Process)
         Set-PullRequest $s (New-PullRequestJson -State closed -HeadSha $script:head)
         Wait-TestProcessExit -Process $watcher.Process -TimeoutSeconds 60 | Should -BeTrue
-        Get-Content $watcher.OutFile -Raw | Should -Match ': closed \(ship\)'
+        Get-Content $watcher.OutFile -Raw | Should -Match ': closed \(ship, gated\)'
         # And the next one has nothing to wait for.
         (Invoke-Watch $s @('-Wait')).Output | Should -Match 'no active posse tasks and no published pull request'
     }
@@ -365,7 +365,7 @@ Describe 'dep-watch.ps1 poll cadence' {
         # Read two seconds ago, with an interval of one: due again.
         $s = New-PrWatchScenario -PullRequest (New-PullRequestJson -Merged -HeadSha $script:head) `
             -Extra @{ prCheckedAt = (Get-Date).AddSeconds(-2).ToString('o') }
-        (Invoke-Watch $s @('-PrPollSeconds', '1')).Output | Should -Match ': merged \(ship\)'
+        (Invoke-Watch $s @('-PrPollSeconds', '1')).Output | Should -Match ': merged \(ship, gated\)'
     }
 
     It 'takes the interval from prPollMinutes in the config' {
@@ -373,7 +373,7 @@ Describe 'dep-watch.ps1 poll cadence' {
             -Extra @{ prCheckedAt = (Get-Date).AddHours(-1).ToString('o') }
         (Invoke-Watch $s).Output | Should -Match 'no new events'
         Set-StateField $s @{ prCheckedAt = (Get-Date).AddHours(-3).ToString('o') }
-        (Invoke-Watch $s).Output | Should -Match ': merged \(ship\)'
+        (Invoke-Watch $s).Output | Should -Match ': merged \(ship, gated\)'
     }
 
     It 'does not poll at all when prPollMinutes is 0' {
@@ -399,7 +399,7 @@ Describe 'dep-watch.ps1 -Wait with an open pull request' {
         Set-PullRequest $s (New-PullRequestJson -Merged -HeadSha $script:head)
         Wait-TestProcessExit -Process $watcher.Process -TimeoutSeconds 60 | Should -BeTrue
         $watcher.Process.ExitCode | Should -Be 0
-        Get-Content $watcher.OutFile -Raw | Should -Match ': merged \(ship\)'
+        Get-Content $watcher.OutFile -Raw | Should -Match ': merged \(ship, gated\)'
         (Get-WakeQueue $s)[0].event | Should -Be 'merged'
     }
 

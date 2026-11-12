@@ -17,6 +17,12 @@ effort keys now hold one value per kind of task, merged kind by kind; a project
 entry can override them; the old flat keys are still read, for one release,
 with a warning; and Resolve-MemberSettings applies one precedence order.
 
+And the name of the delivery mode: Deputy's own gate was called "no-mistakes",
+which made people assume the real no-mistakes pipeline had run. It is "gated"
+now. The old name is still read as gated for one release, with one warning
+that names the projects file, and with none for a task recorded before the
+rename. Resolve-DeliveryMode is the only place the old name is read.
+
 Every case that reads config files does so through dep-lib.ps1 in a separate
 process, from a throwaway Deputy install, so the real install's config is never
 read. Resolve-MemberSettings takes the config as an argument, so its cases run
@@ -205,18 +211,18 @@ Describe 'Get-ProjectProfile' {
     BeforeAll {
         $script:tracked = @'
 {
-  "default": { "delivery": "no-mistakes", "validate": [] },
+  "default": { "delivery": "gated", "validate": [] },
   "projects": [
-    { "match": "myapp", "delivery": "no-mistakes", "validate": ["tracked test"] },
+    { "match": "myapp", "delivery": "gated", "validate": ["tracked test"] },
     { "match": "legacy", "delivery": "direct-pr", "validate": [] }
   ]
 }
 '@
     }
 
-    It 'falls back to no-mistakes with an empty gate when there is no config' {
+    It 'falls back to gated with an empty gate when there is no config' {
         $projectProfile = Get-Profile (New-ConfigInstall) 'C:\src\anything'
-        $projectProfile.delivery | Should -Be 'no-mistakes'
+        $projectProfile.delivery | Should -Be 'gated'
         @($projectProfile.validate).Count | Should -Be 0
         $projectProfile.match | Should -BeNullOrEmpty
     }
@@ -249,7 +255,7 @@ Describe 'Get-ProjectProfile' {
     }
 
     It 'merges the default per key: local keys win, the others stay tracked' {
-        $tracked = '{ "default": { "delivery": "no-mistakes", "validate": ["tracked default test"] }, "projects": [] }'
+        $tracked = '{ "default": { "delivery": "gated", "validate": ["tracked default test"] }, "projects": [] }'
         $local = '{ "default": { "delivery": "direct-pr" } }'
         $projectProfile = Get-Profile (New-ConfigInstall -Projects $tracked -ProjectsLocal $local) 'C:\src\unlisted'
         $projectProfile.delivery | Should -Be 'direct-pr'
@@ -290,16 +296,132 @@ Describe 'Get-ProjectProfile' {
         (Get-Profile $install 'C:\src\unlisted').model | Should -Be 'default-model'
     }
 
+    It 'reads the old name no-mistakes as gated in <Name>, and lists the file' -ForEach @(
+        @{ Name = 'the tracked default'; Tracked = '{ "default": { "delivery": "no-mistakes" }, "projects": [] }'; Local = $null; File = 'config\projects.json' }
+        @{ Name = 'a tracked entry'; Tracked = '{ "projects": [ { "match": "myapp", "delivery": "no-mistakes" } ] }'; Local = $null; File = 'config\projects.json' }
+        @{ Name = 'the local default'; Tracked = $null; Local = '{ "default": { "delivery": "no-mistakes" } }'; File = 'config\projects.local.json' }
+        @{ Name = 'a local entry'; Tracked = $null; Local = '{ "projects": [ { "match": "myapp", "delivery": "no-mistakes" } ] }'; File = 'config\projects.local.json' }
+    ) {
+        $projectProfile = Get-Profile (New-ConfigInstall -Projects $Tracked -ProjectsLocal $Local) 'C:\src\myapp'
+        $projectProfile.delivery | Should -BeExactly 'gated'
+        @($projectProfile.deliveryAliases) | Should -Be @($File)
+    }
+
+    It 'lists a file that uses the old name in an entry that does not match the repo' {
+        # The warning is about the file, which its owner has to change whatever
+        # repo is being spawned for.
+        $local = '{ "projects": [ { "match": "other", "delivery": "no-mistakes" } ] }'
+        $projectProfile = Get-Profile (New-ConfigInstall -Projects $script:tracked -ProjectsLocal $local) 'C:\src\myapp'
+        $projectProfile.delivery | Should -Be 'gated'
+        @($projectProfile.deliveryAliases) | Should -Be @('config\projects.local.json')
+    }
+
+    It 'lists nothing when every file uses the current names' {
+        $local = '{ "projects": [ { "match": "legacy", "delivery": "direct-pr" } ] }'
+        @((Get-Profile (New-ConfigInstall -Projects $script:tracked -ProjectsLocal $local) 'C:\src\myapp').deliveryAliases).Count |
+            Should -Be 0
+    }
+
+    It 'lays a local mode over a tracked no-mistakes, and still lists the tracked file' {
+        $tracked = '{ "default": { "delivery": "no-mistakes" }, "projects": [ { "match": "myapp", "delivery": "no-mistakes" } ] }'
+        $local = '{ "default": { "delivery": "direct-pr" } }'
+        $install = New-ConfigInstall -Projects $tracked -ProjectsLocal $local
+        (Get-Profile $install 'C:\src\unlisted').delivery | Should -Be 'direct-pr'
+        $matched = Get-Profile $install 'C:\src\myapp'
+        $matched.delivery | Should -Be 'gated'
+        @($matched.deliveryAliases) | Should -Be @('config\projects.json')
+    }
+
+    It 'has one warning that names the file and says the name is reserved for the real pipeline' {
+        $tracked = '{ "default": { "delivery": "no-mistakes" }, "projects": [ { "match": "myapp", "delivery": "no-mistakes" } ] }'
+        $install = New-ConfigInstall -Projects $tracked
+        $warning = @(Invoke-DeputyLib -InstallRoot $install -Command "Get-DeliveryAliasWarning (Get-ProjectProfile 'C:\src\myapp')")
+        $warning | Should -HaveCount 1
+        $warning[0] | Should -Match ([regex]::Escape('config\projects.json still uses the delivery mode "no-mistakes"'))
+        $warning[0] | Should -Match 'reserved for the real no-mistakes pipeline'
+        $warning[0] | Should -Match ([regex]::Escape("will stop meaning Deputy's gate"))
+        $warning[0] | Should -Match ([regex]::Escape('"delivery": "gated"'))
+    }
+
+    It 'names both files in its one warning when both use the old name' {
+        $install = New-ConfigInstall -Projects '{ "default": { "delivery": "no-mistakes" } }' `
+            -ProjectsLocal '{ "projects": [ { "match": "myapp", "delivery": "no-mistakes" } ] }'
+        $warning = @(Invoke-DeputyLib -InstallRoot $install -Command "Get-DeliveryAliasWarning (Get-ProjectProfile 'C:\src\myapp')")
+        $warning | Should -HaveCount 1
+        $warning[0] | Should -Match ([regex]::Escape('config\projects.json, config\projects.local.json still use the delivery mode'))
+    }
+
+    It 'has no warning when no file uses the old name' {
+        $install = New-ConfigInstall -Projects $script:tracked
+        Invoke-DeputyLib -InstallRoot $install -Command "Get-DeliveryAliasWarning (Get-ProjectProfile 'C:\src\myapp')" |
+            Should -BeNullOrEmpty
+    }
+
     It 'refuses <Name>' -ForEach @(
         @{ Name = 'an unknown effort level on an entry'; Local = '{ "projects": [ { "match": "myapp", "effort": "turbo" } ] }'; Message = "*match 'myapp'*effort 'turbo'*not one of*" }
         @{ Name = 'a model that is not a string'; Local = '{ "default": { "model": ["a", "b"] } }'; Message = '*(default)*not a model name*' }
-        @{ Name = 'an unknown delivery mode'; Local = '{ "projects": [ { "match": "myapp", "delivery": "yolo" } ] }'; Message = '*delivery*yolo*' }
+        @{ Name = 'an unknown delivery mode'; Local = '{ "projects": [ { "match": "myapp", "delivery": "yolo" } ] }'; Message = "*delivery 'yolo'*not one of: gated, direct-pr*" }
+        @{ Name = 'a misspelt old name'; Local = '{ "default": { "delivery": "no-mistake" } }'; Message = "*(default)*delivery 'no-mistake'*not one of: gated, direct-pr*" }
+        @{ Name = 'a delivery that is not a name'; Local = '{ "projects": [ { "match": "myapp", "delivery": ["gated"] } ] }'; Message = "*match 'myapp'*a delivery value that is not a name*" }
+        @{ Name = 'an unknown delivery mode in an entry that does not match'; Local = '{ "projects": [ { "match": "other", "delivery": "yolo" } ] }'; Message = "*match 'other'*yolo*" }
         @{ Name = 'a validate list that is not a list'; Local = '{ "projects": [ { "match": "myapp", "validate": "npm test" } ] }'; Message = '*validate*list*' }
         @{ Name = 'an entry with no match'; Local = '{ "projects": [ { "validate": ["x"] } ] }'; Message = '*match*' }
         @{ Name = 'a file that is not JSON'; Local = '{ "projects": [ '; Message = '*projects.local.json*' }
     ) {
         $install = New-ConfigInstall -Projects $script:tracked -ProjectsLocal $Local
         { Get-Profile $install 'C:\src\myapp' } | Should -Throw $Message
+    }
+}
+
+Describe 'Resolve-DeliveryMode' {
+    BeforeAll {
+        . (Join-Path $script:sourceRoot 'bin' 'dep-lib.ps1')
+    }
+
+    It 'reads <Value> as <Mode>' -ForEach @(
+        @{ Value = 'gated'; Mode = 'gated'; Alias = $null }
+        @{ Value = 'direct-pr'; Mode = 'direct-pr'; Alias = $null }
+        @{ Value = 'no-mistakes'; Mode = 'gated'; Alias = 'no-mistakes' }
+        @{ Value = 'No-Mistakes'; Mode = 'gated'; Alias = 'no-mistakes' }
+        @{ Value = 'GATED'; Mode = 'gated'; Alias = $null }
+    ) {
+        $resolved = Resolve-DeliveryMode $Value
+        $resolved.Mode | Should -BeExactly $Mode
+        $resolved.Alias | Should -Be $Alias
+    }
+
+    It 'names no mode for <Name>' -ForEach @(
+        @{ Name = 'nothing'; Value = $null }
+        @{ Name = 'an empty name'; Value = '' }
+        @{ Name = 'an unknown name'; Value = 'yolo' }
+        @{ Name = 'a value that is not a name'; Value = 3 }
+    ) {
+        $resolved = Resolve-DeliveryMode $Value
+        $resolved.Mode | Should -BeNullOrEmpty
+        $resolved.Alias | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-TaskDelivery' {
+    BeforeAll {
+        . (Join-Path $script:sourceRoot 'bin' 'dep-lib.ps1')
+    }
+
+    It 'reads a ship task recorded as <Recorded> as <Mode>' -ForEach @(
+        @{ Recorded = 'gated'; Mode = 'gated' }
+        @{ Recorded = 'direct-pr'; Mode = 'direct-pr' }
+        # A record written before the rename, active or archived.
+        @{ Recorded = 'no-mistakes'; Mode = 'gated' }
+    ) {
+        $record = [pscustomobject]@{ id = 'posse-20260101-120000-abc'; kind = 'ship'; delivery = $Recorded }
+        Get-TaskDelivery $record | Should -BeExactly $Mode
+    }
+
+    It 'has no delivery mode for <Name>' -ForEach @(
+        @{ Name = 'a scout'; Record = [pscustomobject]@{ kind = 'scout'; delivery = $null } }
+        @{ Name = 'a ship record that names none'; Record = [pscustomobject]@{ kind = 'ship' } }
+    ) {
+        Get-TaskDelivery $Record | Should -BeNullOrEmpty
     }
 }
 
@@ -392,7 +514,7 @@ Describe 'the tracked configuration' {
         $tracked = Get-Content (Join-Path $script:sourceRoot 'config' 'projects.json') -Raw | ConvertFrom-Json
         $pin = @($tracked.projects | Where-Object { $_.match -eq 'deputy' })
         $pin.Count | Should -Be 1
-        $pin[0].delivery | Should -Be 'no-mistakes'
+        $pin[0].delivery | Should -Be 'gated'
         @($pin[0].validate) | Should -Be @(
             'pwsh -NoProfile -File tools/Invoke-Lint.ps1'
             'pwsh -NoProfile -File tools/Invoke-Tests.ps1'

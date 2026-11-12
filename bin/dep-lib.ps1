@@ -79,7 +79,13 @@ function Initialize-Deputy {
 # ---------------------------------------------------------------------------
 
 # The delivery modes a project can have (see README, "Delivery modes").
-$script:DeliveryModes = @('no-mistakes', 'direct-pr')
+$script:DeliveryModes = @('gated', 'direct-pr')
+
+# Old names of a delivery mode, still read for one release. The gated delivery
+# was first called "no-mistakes", but it never ran the no-mistakes tool (see
+# README, "Delivery modes"), and that name is kept free for it. Read only by
+# Resolve-DeliveryMode.
+$script:DeliveryAliases = @{ 'no-mistakes' = 'gated' }
 
 # The kinds of task a member can be spawned for. The models and effort keys of
 # the Deputy config hold one value per kind.
@@ -263,14 +269,54 @@ function Get-LegacyConfigWarning($Config) {
     ($found -join ', '), ($found.Count -eq 1 ? 's' : '')
 }
 
+function Resolve-DeliveryMode($Value) {
+    <#
+    .SYNOPSIS
+    The delivery mode a value from a projects file or a task record stands for.
+    The one place an old name of a delivery mode is read as the mode it now
+    has (see $script:DeliveryAliases).
+
+    Returns Mode, the mode as Deputy spells it (one of $script:DeliveryModes),
+    or $null when the value is not set or names no delivery mode; and Alias,
+    the old name the value used, or $null. A name is matched without regard to
+    case, like every other value PowerShell compares. Whether an old name is
+    worth a warning is the caller's decision: in a config file it is, in a task
+    record written before the rename it is not.
+    #>
+    $resolved = [pscustomobject]@{ Mode = $null; Alias = $null }
+    if ($Value -isnot [string]) { return $resolved }
+    $name = $Value.Trim().ToLowerInvariant()
+    if ($script:DeliveryAliases.ContainsKey($name)) {
+        $resolved.Alias = $name
+        $name = $script:DeliveryAliases[$name]
+    }
+    if ($script:DeliveryModes -ccontains $name) { $resolved.Mode = $name }
+    else { $resolved.Alias = $null }
+    $resolved
+}
+
+function Get-DeliveryAliasWarning($ProjectProfile) {
+    # The one warning for a projects file that still names a delivery mode by
+    # its old name, or $null when none does.
+    $found = @(Get-EventField $ProjectProfile 'deliveryAliases' | Where-Object { $_ })
+    if ($found.Count -eq 0) { return $null }
+    ('{0} still use{1} the delivery mode "no-mistakes". It is read as "gated" (Deputy''s own gate) for now, but the name ' +
+        'is reserved for the real no-mistakes pipeline and will stop meaning Deputy''s gate in a later release. ' +
+        'Change it to "delivery": "gated".') -f ($found -join ', '), ($found.Count -eq 1 ? 's' : '')
+}
+
 function Assert-ProjectFields($Fields, [string]$Where) {
     # A projects default or entry must say something Deputy can act on. A typo
     # here is not harmless: an unknown delivery mode used to be read as
     # direct-pr, which has the member push.
     if (-not (Test-JsonObject $Fields)) { throw "$Where must be a JSON object." }
-    $delivery = Get-EventField $Fields 'delivery'
-    if ($null -ne $delivery -and $script:DeliveryModes -notcontains $delivery) {
-        throw "$Where has delivery '$delivery', which is not one of: $($script:DeliveryModes -join ', ')."
+    # The property itself, not Get-EventField: through the pipeline a list of
+    # one name would come back as that name, and be taken for one.
+    $deliveryProp = $Fields.PSObject.Properties['delivery']
+    $delivery = $deliveryProp ? $deliveryProp.Value : $null
+    if ($null -ne $delivery -and -not (Resolve-DeliveryMode $delivery).Mode) {
+        $said = ($delivery -is [string]) ? "delivery '$delivery'" : 'a delivery value that is not a name'
+        throw "$Where has $said, which is not one of: $($script:DeliveryModes -join ', ')."
     }
     $validate = $Fields.PSObject.Properties['validate']
     if ($validate -and $null -ne $validate.Value) {
@@ -299,10 +345,10 @@ function Get-ProjectProfile([string]$RepoPath) {
 
     Read from config\projects.local.json (private) over config\projects.json
     (tracked). The default block is merged key by key: local over tracked over
-    the built-in default (no-mistakes, auto-detected gate, no model or effort
-    of its own). Project entries are matched local first, then tracked, and
-    the first match wins; it is laid over the default key by key, so an entry
-    may name only what it changes. An empty validate list means auto-detect at
+    the built-in default (gated, auto-detected gate, no model or effort of its
+    own). Project entries are matched local first, then tracked, and the first
+    match wins; it is laid over the default key by key, so an entry may name
+    only what it changes. An empty validate list means auto-detect at
     validation time (see Get-AutoValidateCommands). A null model or effort is
     not set, and leaves the choice to the per-kind default of the Deputy
     config (see Resolve-MemberSettings).
@@ -310,8 +356,15 @@ function Get-ProjectProfile([string]$RepoPath) {
     Source and ValidateSource say where the profile and its gate commands came
     from, for the gate's evidence; ModelSource and EffortSource the same for
     the model and effort.
+
+    A delivery written by its old name ("no-mistakes") is read as the mode it
+    now has (Resolve-DeliveryMode), so delivery is always the current name.
+    DeliveryAliases lists the files that still use an old name anywhere, in
+    any entry, matched or not, so dep-spawn.ps1 can warn
+    (Get-DeliveryAliasWarning).
     #>
     $p = Get-DeputyPaths
+    $aliasFiles = @()
     $layers = @(
         foreach ($file in $p.ProjectsFile, $p.LocalProjectsFile) {
             $config = Read-ConfigFile $file
@@ -326,12 +379,16 @@ function Get-ProjectProfile([string]$RepoPath) {
                 }
                 Assert-ProjectFields $entry "$name (match '$($entry.match)')"
             }
+            $aliased = @(@($default) + $entries | Where-Object {
+                    $null -ne $_ -and (Resolve-DeliveryMode (Get-EventField $_ 'delivery')).Alias
+                })
+            if ($aliased.Count -gt 0) { $aliasFiles += $name }
             [pscustomobject]@{ Name = $name; Default = $default; Entries = $entries }
         }
     )
 
     $result = [ordered]@{
-        delivery = 'no-mistakes'; validate = @(); match = $null
+        delivery = 'gated'; validate = @(); match = $null
         source = 'built-in default'; validateSource = 'built-in default'
         model = $null; modelSource = $null; effort = $null; effortSource = $null
     }
@@ -344,8 +401,13 @@ function Get-ProjectProfile([string]$RepoPath) {
             # never override a pinned default.
             $prop = $Fields.PSObject.Properties[$key]
             if (-not $prop -or $null -eq $prop.Value) { continue }
+            if ($key -eq 'delivery') {
+                # Already checked by Assert-ProjectFields: it names a mode.
+                $result.delivery = (Resolve-DeliveryMode $prop.Value).Mode
+                continue
+            }
             $result[$key] = $prop.Value
-            if ($key -ne 'delivery') { $result["${key}Source"] = $From }
+            $result["${key}Source"] = $From
         }
     }
     # The default: tracked, then local on top.
@@ -362,16 +424,26 @@ function Get-ProjectProfile([string]$RepoPath) {
         break
     }
     [pscustomobject]@{
-        delivery       = [string]$result.delivery
-        validate       = [string[]]@($result.validate)
-        match          = $result.match
-        source         = $result.source
-        validateSource = $result.validateSource
-        model          = $result.model
-        modelSource    = $result.modelSource
-        effort         = $result.effort
-        effortSource   = $result.effortSource
+        delivery        = [string]$result.delivery
+        validate        = [string[]]@($result.validate)
+        match           = $result.match
+        source          = $result.source
+        validateSource  = $result.validateSource
+        model           = $result.model
+        modelSource     = $result.modelSource
+        effort          = $result.effort
+        effortSource    = $result.effortSource
+        deliveryAliases = @($aliasFiles)
     }
+}
+
+function Get-TaskDelivery($State) {
+    # A ship task's delivery mode, as its record says, by the name it has now;
+    # $null for a scout, or a record that names none. A record written before
+    # the rename says "no-mistakes": that is the gated delivery all the same,
+    # and nothing to warn about - a task record is not the Sheriff's to edit.
+    if ($State.kind -ne 'ship') { return $null }
+    (Resolve-DeliveryMode (Get-EventField $State 'delivery')).Mode
 }
 
 function Resolve-MemberSettings {
@@ -951,7 +1023,10 @@ function Format-Wake {
     # One wake as the lines the Deputy reads. -Queued adds when it happened and
     # what its task looks like now, for a wake read back out of the queue.
     param([Parameter(Mandatory)]$Wake, [switch]$Queued)
-    $head = '[wake] {0}: {1} ({2})' -f $Wake.taskId, $Wake.event, $Wake.kind
+    # A ship wake names its delivery mode too: (ship, gated) or (ship,
+    # direct-pr). A wake queued before wakes carried one has none.
+    $delivery = Get-EventField $Wake 'delivery'
+    $head = '[wake] {0}: {1} ({2})' -f $Wake.taskId, $Wake.event, ($delivery ? "$($Wake.kind), $delivery" : $Wake.kind)
     if ($Wake.PSObject.Properties['seq'] -and $Wake.seq) { $head += " seq=$($Wake.seq)" }
     $head
     if ($Queued) {
@@ -1875,7 +1950,8 @@ function Get-MemberBriefing {
         [Parameter(Mandatory)][ValidateSet('ship', 'scout')][string]$Kind,
         [Parameter(Mandatory)][string]$Task,
         [Parameter(Mandatory)][string]$Worktree,
-        # ship: no-mistakes or direct-pr.
+        # ship: gated or direct-pr, by its current name (see
+        # Resolve-DeliveryMode for the old one).
         [string]$Delivery,
         # ship: the branch the lease created and checked out.
         [string]$Branch,
@@ -1914,11 +1990,11 @@ function Get-MemberBriefing {
             '- If you are blocked or the task turns out to be wrong or impossible, stop and say so clearly instead of guessing.'
             ''
         )
-        if ($Delivery -eq 'no-mistakes') {
+        if ($Delivery -eq 'gated') {
             $lines += @(
-                'Definition of done (no-mistakes delivery):'
+                'Definition of done (gated delivery):'
                 "- All your work is committed on $Branch with clear messages, and git status is clean. Never add co-author lines."
-                '- Do NOT push and do NOT open a pull request. The Deputy validates your branch with its no-mistakes gate and publishes it.'
+                "- Do NOT push and do NOT open a pull request. The Deputy validates your branch with its own gate (the repo's test and lint commands) and publishes it."
             )
         }
         else {

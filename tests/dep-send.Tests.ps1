@@ -69,7 +69,7 @@ BeforeAll {
             repo           = $dir
             worktree       = $worktree
             branch         = 'deputy/test-task'
-            delivery       = 'no-mistakes'
+            delivery       = 'gated'
             validation     = 'passed'
             validationNote = 'left over from the first run'
             pid            = $member.Id
@@ -344,7 +344,7 @@ Describe 'dep-send.ps1' {
             }
 
             It 'reports the resumed run, not the first one again' {
-                $script:watchRun.Output | Should -Match ': completed \(ship\)'
+                $script:watchRun.Output | Should -Match ': completed \(ship, gated\)'
                 $script:watchRun.Output | Should -Match 'Fake member finished\.'
                 $script:watchRun.Output | Should -Not -Match 'First run'
                 $script:watchedState.status | Should -Be 'completed'
@@ -433,7 +433,7 @@ Describe 'dep-send.ps1' {
             Wait-ResumedRun $scenario
 
             $watch = Invoke-DeputyScript -InstallRoot $scenario.Install -Script 'dep-watch.ps1'
-            $watch.Output | Should -Match ': interrupted \(ship\)'
+            $watch.Output | Should -Match ': interrupted \(ship, gated\)'
             $watch.Output | Should -Match 'follow-ups sent so far: 1\.'
             (Get-TestTaskState -InstallRoot $scenario.Install -Id $scenario.Id).status | Should -Be 'interrupted'
         }
@@ -528,7 +528,7 @@ Describe 'dep-spawn.ps1' {
             $script:shipSpawn.Call.stdin | Should -Match 'status: "done"'
             $script:shipSpawn.Call.stdin | Should -Match '"needs-decision"'
             $script:shipSpawn.Call.stdin | Should -Match 'can be resumed'
-            # no-mistakes delivery: the member opens no PR, so it is not asked for one
+            # gated delivery: the member opens no PR, so it is not asked for one
             $script:shipSpawn.Call.stdin | Should -Not -Match 'prUrl'
         }
 
@@ -644,7 +644,7 @@ Describe 'dep-spawn.ps1' {
 
         It 'spawned on the configured model' {
             Get-FlagValue @($script:pinned.Call.args) '--model' | Should -Be 'spawn-model'
-            $script:pinnedWatch.Output | Should -Match ': completed \(ship\)'
+            $script:pinnedWatch.Output | Should -Match ': completed \(ship, gated\)'
         }
 
         It 'resumes on the model and effort recorded at spawn, not on what the config says now' {

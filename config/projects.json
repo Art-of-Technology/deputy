@@ -1,12 +1,12 @@
 {
   "default": {
-    "delivery": "no-mistakes",
+    "delivery": "gated",
     "validate": []
   },
   "projects": [
     {
       "match": "deputy",
-      "delivery": "no-mistakes",
+      "delivery": "gated",
       "validate": [
         "pwsh -NoProfile -File tools/Invoke-Lint.ps1",
         "pwsh -NoProfile -File tools/Invoke-Tests.ps1"

@@ -17,7 +17,10 @@ What these pin down, one weakness each:
 - members can be launched without the operator's personal MCP servers, skills
   and commands (memberIsolation), on the first run and on every resumed run;
 - the three briefing templates are one function with a definition of done per
-  delivery mode.
+  delivery mode;
+- Deputy's own gate was called "no-mistakes", as if the no-mistakes tool ran;
+  the spawn line and the briefing say gated now, and a projects file that still
+  says no-mistakes is read as gated, with one warning that names the file.
 
 dep-spawn.ps1 runs as a real process against a throwaway install, with fake
 claude and treehouse first on PATH. The treehouse shim leases a real linked
@@ -207,10 +210,10 @@ Describe 'Get-MemberBriefing' {
     BeforeAll {
         $common = @{ Task = 'Fix the flaky auth test'; Worktree = 'C:\pool\1\app' }
         $script:common = $common
-        $script:noMistakes = Get-MemberBriefing -Kind ship -Delivery 'no-mistakes' -Branch 'deputy/posse-20261110-120000-abc' -BaseBranch 'main' @common
+        $script:gated = Get-MemberBriefing -Kind ship -Delivery 'gated' -Branch 'deputy/posse-20261110-120000-abc' -BaseBranch 'main' @common
         $script:directPr = Get-MemberBriefing -Kind ship -Delivery 'direct-pr' -Branch 'deputy/posse-20261110-120000-abc' -BaseBranch 'release/2' @common
         $script:scout = Get-MemberBriefing -Kind scout -ReportPath 'C:\deputy\state\posse-20261110-120000-abc-report.md' -BaseBranch 'main' @common
-        $script:all = @($script:noMistakes, $script:directPr, $script:scout)
+        $script:all = @($script:gated, $script:directPr, $script:scout)
     }
 
     It 'opens every briefing with who the member reports to, and its task' {
@@ -229,20 +232,24 @@ Describe 'Get-MemberBriefing' {
     }
 
     It 'puts a ship member on the branch it is already on, and never asks it to create one' {
-        foreach ($briefing in $script:noMistakes, $script:directPr) {
+        foreach ($briefing in $script:gated, $script:directPr) {
             $briefing | Should -Match 'already on your own branch deputy/posse-20261110-120000-abc'
             $briefing | Should -Match 'do not switch branches'
             $briefing | Should -Not -Match '(?i)create and switch|first create'
         }
-        $script:noMistakes | Should -Match 'cut from main'
+        $script:gated | Should -Match 'cut from main'
         $script:directPr | Should -Match 'cut from release/2'
     }
 
-    It 'gives a no-mistakes member its definition of done: committed and clean, not pushed' {
-        $script:noMistakes | Should -Match 'Definition of done \(no-mistakes delivery\)'
-        $script:noMistakes | Should -Match 'git status is clean'
-        $script:noMistakes | Should -Match 'Do NOT push and do NOT open a pull request'
-        $script:noMistakes | Should -Not -Match 'prUrl'
+    It 'gives a gated member its definition of done: committed and clean, not pushed' {
+        $script:gated | Should -Match 'Definition of done \(gated delivery\)'
+        $script:gated | Should -Match 'git status is clean'
+        $script:gated | Should -Match 'Do NOT push and do NOT open a pull request'
+        $script:gated | Should -Match ([regex]::Escape("validates your branch with its own gate (the repo's test and lint commands)"))
+        $script:gated | Should -Not -Match 'prUrl'
+        # The old name made the member, and everyone reading its briefing,
+        # think the no-mistakes tool was going to run.
+        foreach ($briefing in $script:all) { $briefing | Should -Not -Match 'no-mistakes' }
     }
 
     It 'gives a direct-pr member its definition of done: a pull request against its base branch' {
@@ -270,15 +277,21 @@ Describe 'Get-MemberBriefing' {
 
     It 'names the default branch generically when the base is not known' {
         $common = $script:common
-        Get-MemberBriefing -Kind ship -Delivery 'no-mistakes' -Branch 'deputy/x' @common |
+        Get-MemberBriefing -Kind ship -Delivery 'gated' -Branch 'deputy/x' @common |
             Should -Match 'cut from the default branch'
     }
 
     It 'refuses a ship briefing with no branch or an unknown delivery mode' {
         $common = $script:common
-        { Get-MemberBriefing -Kind ship -Delivery 'no-mistakes' @common } | Should -Throw '*branch*'
+        { Get-MemberBriefing -Kind ship -Delivery 'gated' @common } | Should -Throw '*branch*'
         { Get-MemberBriefing -Kind ship -Delivery 'yolo' -Branch 'deputy/x' @common } | Should -Throw '*yolo*'
         { Get-MemberBriefing -Kind scout @common } | Should -Throw '*report path*'
+    }
+
+    It 'takes the delivery mode by its current name only: the old one is read where config and records are' {
+        $common = $script:common
+        { Get-MemberBriefing -Kind ship -Delivery 'no-mistakes' -Branch 'deputy/x' @common } |
+            Should -Throw "*Delivery 'no-mistakes' is not one of: gated, direct-pr*"
     }
 }
 
@@ -302,6 +315,14 @@ Describe 'dep-spawn.ps1' {
             Get-CurrentBranch $script:ship.Slot | Should -Be $script:shipBranch
             $script:shipSpawn.State.branch | Should -Be $script:shipBranch
             $script:shipSpawn.Run.Output | Should -Match ([regex]::Escape("branch:   $script:shipBranch"))
+        }
+
+        It 'says gated on the spawn line, records it, and briefs the member for it, with no warning' {
+            $script:shipSpawn.Run.Output | Should -Match ([regex]::Escape("spawned $($script:shipSpawn.Id) (ship, gated) pid="))
+            $script:shipSpawn.State.delivery | Should -BeExactly 'gated'
+            $script:shipSpawn.Call.stdin | Should -Match 'Definition of done \(gated delivery\)'
+            $script:shipSpawn.Call.stdin | Should -Not -Match 'no-mistakes'
+            $script:shipSpawn.Run.Output | Should -Not -Match 'WARNING'
         }
 
         It 'records no base branch for a task cut from the default branch' {
@@ -383,6 +404,67 @@ Describe 'dep-spawn.ps1' {
             $spawn.State.branch | Should -BeNullOrEmpty
             $spawn.State.baseBranch | Should -Be 'release'
             $spawn.Call.stdin | Should -Match ([regex]::Escape($script:MemberRoleSentence))
+        }
+    }
+
+    Context 'a projects file that still says no-mistakes' {
+        BeforeAll {
+            function Invoke-AliasSpawn([string]$Tracked, [string]$Local, [string[]]$Extra = @()) {
+                # Spawn with exactly these projects files, as JSON text.
+                $s = New-SpawnScenario
+                $config = Join-Path $s.Install 'config'
+                Remove-Item (Join-Path $config 'projects*.json') -Force
+                if ($Tracked) { Set-Content -Path (Join-Path $config 'projects.json') -Value $Tracked -Encoding utf8 }
+                if ($Local) { Set-Content -Path (Join-Path $config 'projects.local.json') -Value $Local -Encoding utf8 }
+                $spawn = Invoke-Spawn $s (@('-Task', 'Fix the flaky auth test') + $Extra)
+                $spawn | Add-Member -NotePropertyName Scenario -NotePropertyValue $s
+                $spawn
+            }
+
+            function Get-WarningCount($Spawn) { [regex]::Matches($Spawn.Run.Output, 'WARNING:').Count }
+        }
+
+        It 'reads it as gated from the tracked file, and warns once, naming the file' {
+            # The old name twice in one file: still one warning.
+            $spawn = Invoke-AliasSpawn -Tracked '{ "default": { "delivery": "no-mistakes" }, "projects": [ { "match": "repo", "delivery": "no-mistakes", "validate": [] } ] }'
+            $spawn.Run.ExitCode | Should -Be 0 -Because $spawn.Run.Output
+            $spawn.Run.Output | Should -Match ([regex]::Escape("spawned $($spawn.Id) (ship, gated) pid="))
+            $spawn.State.delivery | Should -BeExactly 'gated'
+            $spawn.Call.stdin | Should -Match 'Definition of done \(gated delivery\)'
+            Get-WarningCount $spawn | Should -Be 1
+            $spawn.Flat | Should -Match ([regex]::Escape('WARNING: config\projects.json still uses the delivery mode "no-mistakes"'))
+            $spawn.Flat | Should -Match 'reserved for the real no-mistakes pipeline'
+        }
+
+        It 'reads it as gated from the local file, and warns once, naming the file' {
+            $spawn = Invoke-AliasSpawn -Local '{ "projects": [ { "match": "repo", "delivery": "no-mistakes" } ] }'
+            $spawn.Run.ExitCode | Should -Be 0 -Because $spawn.Run.Output
+            $spawn.State.delivery | Should -BeExactly 'gated'
+            Get-WarningCount $spawn | Should -Be 1
+            $spawn.Flat | Should -Match ([regex]::Escape('WARNING: config\projects.local.json still uses the delivery mode "no-mistakes"'))
+        }
+
+        It 'warns once for both files' {
+            $spawn = Invoke-AliasSpawn -Tracked '{ "default": { "delivery": "no-mistakes" } }' `
+                -Local '{ "default": { "delivery": "no-mistakes" } }'
+            $spawn.Run.ExitCode | Should -Be 0 -Because $spawn.Run.Output
+            Get-WarningCount $spawn | Should -Be 1
+            $spawn.Flat | Should -Match ([regex]::Escape('config\projects.json, config\projects.local.json still use the delivery mode'))
+        }
+
+        It 'warns a scout spawn too: the file is the same' {
+            $spawn = Invoke-AliasSpawn -Tracked '{ "default": { "delivery": "no-mistakes" } }' -Extra @('-Kind', 'scout')
+            $spawn.Run.ExitCode | Should -Be 0 -Because $spawn.Run.Output
+            $spawn.Run.Output | Should -Match ([regex]::Escape("spawned $($spawn.Id) (scout) pid="))
+            Get-WarningCount $spawn | Should -Be 1
+        }
+
+        It 'still refuses an unknown delivery mode before leasing anything' {
+            $spawn = Invoke-AliasSpawn -Local '{ "projects": [ { "match": "repo", "delivery": "no-mistake" } ] }'
+            $spawn.Run.ExitCode | Should -Not -Be 0
+            $spawn.Flat | Should -Match "delivery 'no-mistake', which is not one of: gated, direct-pr"
+            @(Get-LeaseCalls $spawn.Scenario) | Should -HaveCount 0
+            (Get-MemberShimCalls -Path $spawn.Scenario.Shims).Count | Should -Be 0
         }
     }
 
